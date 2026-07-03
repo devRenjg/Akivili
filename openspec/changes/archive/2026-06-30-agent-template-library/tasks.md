@@ -1,6 +1,6 @@
 ## 1. 后端：模版扫描与解析
 
-- [x] 1.1 `config.py` 增 `agent_library_dir`，默认 `C:\Code\Agents`
+- [x] 1.1 `config.py` 增 `agent_library_dir`，默认 Agent 库目录
 - [x] 1.2 `agents.py`：递归扫描库目录下 `.md`，解析 frontmatter（name/description/emoji/color）+ 正文 body
 - [x] 1.3 排除非角色目录：examples / integrations / strategy / assets / scripts / .git
 - [x] 1.4 slug 取自相对路径（去扩展名、目录分隔转 `-`），division 取顶层目录名

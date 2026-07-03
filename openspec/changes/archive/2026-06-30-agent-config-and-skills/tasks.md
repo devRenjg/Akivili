@@ -6,7 +6,7 @@
 
 ## 2. 后端：Skill 库
 
-- [x] 2.1 `config.py` 增 `skills_dir`，默认 `C:\Code\JianAgency\skills`
+- [x] 2.1 `config.py` 增 `skills_dir`，默认 项目内 `skills/`
 - [x] 2.2 `skills.py`：扫描目录下 `.md`，解析 frontmatter(name/description)+body，幂等 upsert（仿 agents.py）
 - [x] 2.3 `routes/skills.py`：GET 列表（关键词过滤）、GET 详情、POST 重扫、POST 新建/PUT 编辑（写 `<slug>.md`，防穿越）
 - [x] 2.4 startup 建 skills_dir + README + 空库自动扫描；main.py 注册

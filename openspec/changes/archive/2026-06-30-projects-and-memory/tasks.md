@@ -15,7 +15,7 @@
 
 ## 3. 后端：Agent 记忆基础设施
 
-- [x] 3.1 `config.py` 增 `memory_dir`，默认 `C:\Code\JianAgency\memory`
+- [x] 3.1 `config.py` 增 `memory_dir`，默认 项目内 `memory/`
 - [x] 3.2 `memory.py`：read(slug) / write(slug, content) / append(slug, text)；路径用 slug 拼接并校验 resolve 后仍在 memory_dir 内（防穿越）
 - [x] 3.3 read 不存在时返回空串（不报错），write 自动建目录
 - [x] 3.4 `routes/memory.py`：GET 读取某 Agent 记忆、PUT 覆盖写、POST 追加

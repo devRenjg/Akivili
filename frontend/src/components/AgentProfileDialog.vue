@@ -17,7 +17,7 @@
             <span class="cell-label">{{ ic.replace(/\.[^.]+$/, '') }}</span>
           </div>
         </div>
-        <div class="icon-hint">已被其他人才占用的头像不显示。往 C:\Code\JianAgency\icon 放图后点「刷新图库」可见新图。</div>
+        <div class="icon-hint">已被其他人才占用的头像不显示。往项目根目录的 icon/ 文件夹放图后点「刷新图库」可见新图。</div>
         <el-button text size="small" @click="loadIcons">刷新图库</el-button>
       </el-form-item>
     </el-form>

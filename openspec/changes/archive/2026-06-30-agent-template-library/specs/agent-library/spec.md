@@ -2,7 +2,7 @@
 
 ## Purpose
 
-把本地 `C:\Code\Agents` 的 Agent 人格模版扫描登记进系统，让用户能在库界面浏览、搜索、查看每个 Agent 的人格详情，作为后续在项目中选用 Agent 的来源。
+把本地 Agent 库目录 的 Agent 人格模版扫描登记进系统，让用户能在库界面浏览、搜索、查看每个 Agent 的人格详情，作为后续在项目中选用 Agent 的来源。
 
 ## Requirements
 

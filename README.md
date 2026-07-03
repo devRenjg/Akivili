@@ -165,7 +165,7 @@ JianAgency/
 |------|------|------|
 | **P0** | 脚手架：README、OpenSpec 骨架、目录结构、start.ps1、config、gitignore | ✅ 已完成 |
 | **P1** | 地基：后端 config + 设置页多供应商 Tab + DB 初始化 | ✅ 已完成 |
-| **P2** | 数字人才库：从 `C:\Code\Agents` 导入 / 注册 + 库浏览 UI | ✅ 已完成 |
+| **P2** | 数字人才库：从 Agent 库目录 导入 / 注册 + 库浏览 UI | ✅ 已完成 |
 | **P3** | 项目：CRUD + 本地文件夹绑定 + 主页 Dashboard | ✅ 已完成 |
 | **P3.5** | Agent 配置：接入模型 + Skills 库 + 按 Agent 身份跨项目共享 | ✅ 已完成 |
 | **P4** | Agent 对话：CLI 执行器跑通，单 Agent 任务安排 + SSE 流式 | ✅ 已完成 |
@@ -179,7 +179,7 @@ JianAgency/
 - 项目脚手架与规格驱动开发基线（OpenSpec）
 - 大模型 / CLI 多供应商配置（设置页）：API（Deepseek/OpenAI/Anthropic/通义/智谱/Moonshot/Ollama）+ CLI（Claude Code / Codex），含密钥脱敏、连通性测试、默认供应商
 - 后端地基：FastAPI 入口 + SQLite 建库 + CORS 白名单
-- Agent 模版库：扫描 `C:\Code\Agents`（268 个中文 Agent）入库，按分类/关键词浏览、搜索、查看人格详情、幂等重扫
+- Agent 模版库：扫描 Agent 库目录（268 个中文 Agent）入库，按分类/关键词浏览、搜索、查看人格详情、幂等重扫
 - 项目管理：项目 CRUD + 绑定本地文件夹（工作边界）+ 主页 Dashboard 卡片总览；项目内 Agent 团队（从库导入 / 自建 / 改造人格 / 移除）
 - Agent 记忆：每个 Agent 在 `memory/<slug>.md` 拥有跨项目共用的持久记忆，可在项目内查看/编辑；加入项目 / 配置 Skills 时自动写入🗂️工作区路径约束与🧩Skills 使用说明（受管段落，不影响手写内容）
 - Agent 配置：每个 Agent 可接入大模型（从供应商选）+ 启用 Skills；模型/记忆/Skills 按 Agent 身份（slug）跨项目共享，人格各项目独立
@@ -276,7 +276,7 @@ JianAgency/
 - 🪪 数字人才昵称 + 自定义头像（按身份 slug 跨项目共享，仅管理员可编辑）
   - 数据：`agent_profiles` 加 `nickname` / `avatar`（_migrate 平滑升级）
   - 后端：`agent-config/{slug}/profile` 设昵称头像（require_admin）；新增 `/api/icons` 列图 + 取图（路径穿越防护）；人才库/团队列表 join 出 nickname/avatar
-  - 头像来源：`C:\Code\JianAgency\icon` 文件夹，放图即可在资料弹窗里选（含默认 emoji 选项）
+  - 头像来源：项目根目录的 `icon/` 文件夹，放图即可在资料弹窗里选（含默认 emoji 选项）
   - 显示：全局统一「昵称（名字）」格式（无昵称只显名字）+ 圆形头像组件（无头像回退 emoji）；人才库、项目团队、任务面板、@选择器、对话角色全部接入
   - 前端：`AgentAvatar` / `AgentProfileDialog` 组件 + `displayName`/`avatarUrl` 辅助；修复弹窗首次打开 visible 不同步的时序 bug
 
@@ -356,7 +356,7 @@ JianAgency/
 ### v0.4.1 — 2026-06-30
 - 🪐 项目正式定名 **Akivili（阿基维利）**，Slogan：**愿此行，终抵群星！**
   - 首页新增星空 Hero 横幅（深空渐变 + 星点 + 金色流光 Slogan）；侧边栏品牌、页面标题、后端 app title、启动脚本、OpenSpec 文档同步更名
-  - 物理标识保持不变（数据库文件 `jianagency.db`、`C:\Code\JianAgency` 目录路径、`JIANAGENCY_RELOAD` 环境变量），仅更新展示层与文档，避免数据/路径迁移风险
+  - 物理标识保持不变（数据库文件 `jianagency.db`、`JIANAGENCY_RELOAD` 环境变量），仅更新展示层与文档，避免数据/路径迁移风险
 
 ### v0.4.0 — 2026-06-30
 - ✅ 完成 P3 项目管理 + Agent 记忆机制（OpenSpec change：`2026-06-30-projects-and-memory`）
@@ -367,7 +367,7 @@ JianAgency/
 
 ### v0.3.0 — 2026-06-30
 - ✅ 完成 P2 Agent 模版库（OpenSpec change：`2026-06-30-agent-template-library`）
-  - 后端：`agents.py`（扫描 `C:\Code\Agents`、手解析 frontmatter + 正文、排除 examples/integrations/strategy 等非角色目录、幂等 upsert）、`routes/agents.py`（列表 + division/关键词过滤、详情含 body、分类统计、重新扫描）；`config.py` 增 `agent_library_dir`；`main.py` startup 空库自动扫描
+  - 后端：`agents.py`（扫描 Agent 库目录、手解析 frontmatter + 正文、排除 examples/integrations/strategy 等非角色目录、幂等 upsert）、`routes/agents.py`（列表 + division/关键词过滤、详情含 body、分类统计、重新扫描）；`config.py` 增 `agent_library_dir`；`main.py` startup 空库自动扫描
   - 前端：`Agents.vue` 库浏览页（搜索 + 分类筛选 + 卡片网格 + 人格详情抽屉 + 重新扫描）
   - 验证通过：扫描入库 268 个 Agent（19 分类，跳过 6 个非角色文件）、搜到「项目负责人」「测试专员」并查看完整人格正文、分类筛选数量正确、幂等重扫（updated=268 总数不变）、前后端代理链路打通、build 成功
 
@@ -376,7 +376,7 @@ JianAgency/
   - 后端：`config.py`（多供应商模型 + config.json 持久化 + 密钥脱敏）、`database.py`（SQLite 7 张基线表）、`main.py`（FastAPI + CORS 白名单 + 启动建库）、`routes/settings.py`（读取/保存/连通性测试）
   - 前端：Vue3 + Vite + Element Plus 骨架（侧边导航、路由、API 封装），`Settings.vue` 多供应商配置页（API + CLI 两类、7 个 API 预设、密钥 password、连通测试、默认供应商）
   - 验证通过：保存→读回脱敏、Claude Code CLI 检测到 `claude 2.1.170`、API 连通测试返回真实状态码、前端构建成功、前后端代理链路（3100→8100）打通
-- 🧭 确立首批 Agent 团队（模版位于 `C:\Code\Agents`）
+- 🧭 确立首批 Agent 团队（模版位于 Agent 库目录）
   - 新造「项目负责人」（顶层管理者，为结果负责，可调度下属 Agent 协同）
   - 新造「测试专员」（验收 + 接口测试 + 代码/业务/风控安全把控与兜底，证据驱动、默认不通过）
   - 研发角色用库内现成中文版：前端开发者、后端架构师、软件架构师、高级开发者、代码审查员
@@ -384,11 +384,16 @@ JianAgency/
 ### v0.1.0 — 2026-06-30
 - 🎉 项目初始化：确立项目定位、技术方案与四项地基决策
   - 执行引擎：CLI 执行器（Claude Code / Codex）+ 纯 LLM API 三选一
-  - Agent 来源：从 `C:\Code\Agents` 中文 Agent 库导入
+  - Agent 来源：从 Agent 库目录 中文 Agent 库导入
   - 工作流形态：可视化展示 + 配置编排
   - 技术栈：FastAPI + Vue3 + Element Plus + SQLite
 - 📁 创建项目骨架：README、OpenSpec 目录、前后端目录结构
 - 📋 建立 OpenSpec 基线与首个变更提案（P1 地基）
+
+## 许可与安全
+
+- 许可协议：[MIT License](./LICENSE)。
+- 安全策略与部署须知：见 [SECURITY.md](./SECURITY.md)。⚠️ 本平台 Agent 以放开权限执行，**仅限可信内网/本机**运行，切勿暴露公网。
 
 ---
 
