@@ -15,7 +15,14 @@ async def list_templates(division: str = "", q: str = ""):
     默认按「已加入的项目数」降序排（热门人才在前），其次分类、名字。"""
     sql = ("SELECT t.id, t.slug, t.name, t.division, t.description, t.emoji, t.color, "
            "p.nickname AS nickname, p.avatar AS avatar, "
-           "(SELECT COUNT(DISTINCT pa.project_id) FROM project_agents pa WHERE pa.slug = t.slug) AS project_count "
+           "(SELECT COUNT(DISTINCT pa.project_id) FROM project_agents pa WHERE pa.slug = t.slug) AS project_count, "
+           # 已解决任务数：该身份(slug)在「已完成(done)」任务里有过成功执行(succeeded run)，按任务去重。
+           # 排除：① 已删除的任务卡片（JOIN tasks 天然排除）；② 孤儿子任务——父任务已被删、
+           # 子任务残留的不算（要求顶层任务，或其父任务仍存在）。
+           "(SELECT COUNT(DISTINCT tr.task_id) FROM task_runs tr JOIN tasks tk ON tk.id = tr.task_id "
+           " WHERE tr.agent_slug = t.slug AND tr.status = 'succeeded' AND tk.status = 'done' "
+           " AND (tk.parent_task_id IS NULL OR EXISTS "
+           "      (SELECT 1 FROM tasks pt WHERE pt.id = tk.parent_task_id))) AS solved_tasks "
            "FROM agent_templates t LEFT JOIN agent_profiles p ON p.slug = t.slug WHERE 1=1")
     params: list = []
     if division:

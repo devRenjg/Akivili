@@ -48,7 +48,11 @@ async def list_project_agents(pid: int):
     db = await get_connection()
     try:
         cur = await db.execute(
-            """SELECT pa.*, p.nickname AS nickname, p.avatar AS avatar
+            """SELECT pa.*, p.nickname AS nickname, p.avatar AS avatar,
+               (SELECT COUNT(DISTINCT tr.task_id) FROM task_runs tr JOIN tasks tk ON tk.id = tr.task_id
+                WHERE tr.agent_slug = pa.slug AND tr.status = 'succeeded' AND tk.status = 'done'
+                  AND (tk.parent_task_id IS NULL OR EXISTS
+                       (SELECT 1 FROM tasks pt WHERE pt.id = tk.parent_task_id))) AS solved_tasks
                FROM project_agents pa
                LEFT JOIN agent_profiles p ON p.slug = pa.slug
                WHERE pa.project_id=? ORDER BY pa.is_leader DESC, pa.id""", (pid,))

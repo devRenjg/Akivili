@@ -36,6 +36,7 @@
           <el-tag v-if="a.is_leader" size="small" type="warning" effect="dark" class="leader-tag">👑 总负责人</el-tag>
           <el-tag v-if="a.template_id" size="small" effect="plain">通用人才</el-tag>
           <el-tag v-else size="small" type="warning" effect="plain">自建</el-tag>
+          <span class="solved-count" title="已完成任务数">✅ {{ a.solved_tasks || 0 }}</span>
         </div>
 
         <div class="ac-config">
@@ -368,6 +369,7 @@ onMounted(() => {
 .cfg-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
 .agent-card.is-leader { border: 1px solid #f0c000; box-shadow: 0 0 0 2px rgba(240,192,0,0.12); }
 .leader-tag { margin-right: 4px; }
+.solved-count { font-size: 12px; color: #67c23a; margin-left: auto; align-self: center; }
 .cfg-row:last-child { margin-bottom: 0; }
 .cfg-label { font-size: 12px; color: #909399; width: 42px; flex-shrink: 0; }
 .cfg-model { flex: 1; }

@@ -166,6 +166,8 @@ async def delete_task(pid: int, task_id: int):
     await _ensure_project(pid)
     db = await get_connection()
     try:
+        # 级联删除子任务：删父任务时一并删其子任务，避免子任务变孤儿（父已删、子残留）
+        await db.execute("DELETE FROM tasks WHERE parent_task_id=? AND project_id=?", (task_id, pid))
         cur = await db.execute("DELETE FROM tasks WHERE id=? AND project_id=?", (task_id, pid))
         await db.commit()
         if cur.rowcount == 0:

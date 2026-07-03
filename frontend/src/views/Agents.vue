@@ -26,6 +26,7 @@
         <div class="card-foot">
           <el-tag size="small" effect="plain">{{ t.division || '其他' }}</el-tag>
           <span v-if="t.project_count > 0" class="proj-count">🗂 {{ t.project_count }} 个项目</span>
+          <span class="solved-count" :title="'已完成任务数'">✅ {{ t.solved_tasks || 0 }} 个任务</span>
         </div>
       </el-card>
       <el-empty v-if="!loading && templates.length === 0" description="没有匹配的 Agent" />
@@ -207,8 +208,9 @@ onMounted(() => {
 .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .emoji { font-size: 22px; }
 .name { font-weight: 600; font-size: 17px; }
-.card-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.card-foot { display: flex; align-items: center; gap: 8px; }
 .proj-count { font-size: 12px; color: #e6a23c; }
+.solved-count { font-size: 12px; color: #67c23a; margin-left: auto; }
 .desc {
   color: #606266; font-size: 13px; line-height: 1.5; margin-bottom: 10px;
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
