@@ -9,7 +9,7 @@
 Akivili 是一个**本地优先（local-first）**的多 Agent 编排平台：
 
 - **CLI 执行引擎**：后端调用本地 `claude -p` / `codex exec`（或 API）跑 Agent，能读写文件、执行命令、操作你指向的本地项目文件夹——能力天然对齐真实开发工作流。
-- **可导入的数字人才库**：从 `C:\Code\Agents`（312 个中文 Agent 人格定义）挑选导入，平台内也能新建/改造自己的 Agent。
+- **可导入的数字人才库**：从 Agent 人格库目录（默认项目内 `agents/`，可用环境变量 `AKIVILI_AGENT_LIBRARY_DIR` 指向外部库）挑选导入，平台内也能新建/改造自己的 Agent。
 - **项目即工作区**：每个项目自起标题、绑定一个本地文件夹，作为 Agent 的工作边界。
 - **看板式任务体系**：Trello 式看板 + 细粒度状态 / 优先级 / 子任务 / 活动时间线；任务详情两栏布局。
 - **多 Agent 协同**：Team Leader 统筹调度——读任务、按成员技能 @mention/建子任务委派、成员执行回报、汇总收尾；事件驱动并发池调度（多成员可同时开工、跨供应商混编）+ 父子任务闭环（子任务不全完成父任务不收尾）+ 卡死超时兜底 + 多层防死循环（含防层层派生）。
@@ -41,7 +41,7 @@ Akivili 是一个**本地优先（local-first）**的多 Agent 编排平台：
 | 后端 | Python 3.12 + FastAPI + Uvicorn |
 | 存储 | SQLite（项目 / Agent / 会话 / 工作流元数据）+ 本地文件系统（项目工作区） |
 | 执行引擎 | Claude Code CLI（`claude -p`）/ Codex CLI（`codex exec`）/ 纯 LLM API |
-| LLM | OpenAI Chat Completions / Anthropic Messages（双格式兼容，复用 Qlipoth 模式） |
+| LLM | OpenAI Chat Completions / Anthropic Messages（双格式兼容） |
 | 规格管理 | OpenSpec（specs 已实现能力 / changes 待实现提案） |
 
 ## 执行引擎设计
@@ -53,10 +53,10 @@ ExecutorBackend.run(agent, prompt, project_dir, on_event) → 流式事件(SSE)
 ├── ClaudeCodeBackend   claude -p --output-format stream-json --add-dir <项目文件夹>
 │                       --append-system-prompt-file <agent.md> --model <模型>
 ├── CodexBackend        codex exec（codex-cli）
-└── ApiLlmBackend       httpx 流式，OpenAI/Anthropic 双格式（复用 Qlipoth llm.py）
+└── ApiLlmBackend       httpx 流式，OpenAI/Anthropic 双格式
 ```
 
-**安全约定**（吸取 Qlipoth 代码审查教训）：
+**安全约定**：
 
 - 子进程一律**列表传参**、绝不 `shell=True`，杜绝参数/命令注入
 - 默认用 `--add-dir` 把 Agent 工作目录**限定到当前项目文件夹**，不默认开启 `--dangerously-skip-permissions`
@@ -202,7 +202,7 @@ JianAgency/
 # 前端 http://localhost:3100   后端 http://localhost:8100
 ```
 
-> 端口选用 3100 / 8100，与 Qlipoth（3000 / 8000）错开，便于两个项目同时运行。
+> 端口选用 3100 / 8100，便于与本机其它常用开发端口（如 3000 / 8000）错开。
 
 ## 内网访问
 
@@ -311,7 +311,7 @@ JianAgency/
 
 ### v0.7.0 — 2026-06-30
 - 🔐 内网访问 + 登录鉴权（OpenSpec change：`2026-06-30-intranet-auth-rbac`，能力 `auth-rbac`）
-  - 认证借鉴 Qlipoth：PBKDF2 加盐哈希（改进为 hmac.compare_digest 常量时间校验）、token + httponly cookie；新增 `auth.py` / `routes/auth.py`（login/logout/me）；`users` 表 + startup 播种管理员
+  - 认证：PBKDF2 加盐哈希（hmac.compare_digest 常量时间校验）、token + httponly cookie；新增 `auth.py` / `routes/auth.py`（login/logout/me）；`users` 表 + startup 播种管理员
   - 管理员账号：环境变量 `AKIVILI_ADMIN_USER` / `AKIVILI_ADMIN_PASSWORD`（role=admin，缺省占位 `admin` / `changeme`）
   - 权限：管理员可写可执行（全部 POST/PUT/DELETE 加 `Depends(require_admin)`）；匿名/其他用户只读浏览项目空间、数字人才库、Skills，看不到设置，不能安排任务、不能增改 Agent/Skill
   - 前端：登录态全局注入（provide currentUser/isAdmin），按角色 v-if 隐藏设置 Tab 与所有写按钮；右上角身份与登录/退出；axios withCredentials
@@ -386,7 +386,7 @@ JianAgency/
   - 执行引擎：CLI 执行器（Claude Code / Codex）+ 纯 LLM API 三选一
   - Agent 来源：从 `C:\Code\Agents` 中文 Agent 库导入
   - 工作流形态：可视化展示 + 配置编排
-  - 技术栈：沿用 Qlipoth（FastAPI + Vue3 + Element Plus + SQLite）
+  - 技术栈：FastAPI + Vue3 + Element Plus + SQLite
 - 📁 创建项目骨架：README、OpenSpec 目录、前后端目录结构
 - 📋 建立 OpenSpec 基线与首个变更提案（P1 地基）
 

@@ -1,4 +1,4 @@
-"""认证与角色权限（借鉴 Qlipoth/backend/auth.py，精简为单管理员 + 匿名只读）。
+"""认证与角色权限（单管理员 + 匿名只读）。
 
 - 密码 PBKDF2-HMAC-SHA256 加盐哈希，绝不存明文；校验用 hmac.compare_digest 常量时间比较。
 - token 存 httponly cookie。

@@ -2,7 +2,7 @@
 
 要把 Akivili 开放给公司同事内网访问（`http://<your-lan-ip>:3100`）。但当前无登录、Agent 执行放开权限（能在主机改文件跑命令），直接暴露风险极高。需要一层轻量认证 + 角色权限：管理员可写可执行，匿名/其他用户只读浏览。
 
-认证实现借鉴同机的 Qlipoth（`backend/auth.py`）已验证的模式（PBKDF2 加盐哈希、token + httponly cookie、require_admin 依赖、前端 provide('currentUser') + v-if 角色控制），但精简为「单管理员 + 匿名只读」，并改进密码比较为常量时间（hmac.compare_digest）。
+认证采用成熟模式：PBKDF2 加盐哈希、token + httponly cookie、require_admin 依赖、前端 provide('currentUser') + v-if 角色控制，精简为「单管理员 + 匿名只读」，密码比较用常量时间（hmac.compare_digest）。
 
 ## What Changes
 

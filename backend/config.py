@@ -1,11 +1,12 @@
 """Akivili 配置：多供应商（CLI / API）配置 + config.json 持久化。
 
-参照 Qlipoth 的 config.py 模式，但配置面更宽：
+支持三类供应商：
 - type=api      纯 LLM API（Deepseek / OpenAI / Anthropic / Ollama），含 api_format 双格式
 - type=claude-cli  本地 Claude Code CLI 执行器（claude -p）
 - type=codex-cli   本地 Codex CLI 执行器（codex exec）
 
 api_key 仅存本地 config.json（已被 git 忽略），读取给前端时应脱敏。
+目录类配置（Agent 库 / 记忆 / Skills）支持环境变量覆盖，默认相对项目根目录。
 """
 import json
 import os
@@ -33,11 +34,15 @@ class Provider(BaseModel):
     executable: str = ""                      # CLI 类型可选：自定义可执行文件路径，空=按 PATH 探测
 
 
+_ROOT = Path(__file__).parent.parent   # 项目根目录（backend 的上一级）
+
+
 class Settings(BaseSettings):
     db_path: str = str(Path(__file__).parent / "jianagency.db")
-    agent_library_dir: str = r"C:\Code\Agents"   # Agent 模版库根目录
-    memory_dir: str = r"C:\Code\JianAgency\memory"   # Agent 记忆目录（每个 slug.md 一份）
-    skills_dir: str = r"C:\Code\JianAgency\skills"   # Skill 库目录（每个 slug.md 一个能力指令）
+    # Agent 模版库根目录：默认项目内 agents/，可用环境变量 AKIVILI_AGENT_LIBRARY_DIR 指向外部库
+    agent_library_dir: str = os.environ.get("AKIVILI_AGENT_LIBRARY_DIR", str(_ROOT / "agents"))
+    memory_dir: str = os.environ.get("AKIVILI_MEMORY_DIR", str(_ROOT / "memory"))   # Agent 记忆目录（每个 slug.md 一份）
+    skills_dir: str = os.environ.get("AKIVILI_SKILLS_DIR", str(_ROOT / "skills"))   # Skill 库目录（每个 slug.md 一个能力指令）
     host: str = "0.0.0.0"                     # 内网开放：绑所有网卡（仅内网可达；外网需防火墙）
     port: int = 8100
     providers: list[Provider] = []            # 多供应商列表
