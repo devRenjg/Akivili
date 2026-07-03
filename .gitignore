@@ -1,0 +1,50 @@
+# 配置与密钥（含 api_key，绝不入仓）
+backend/config.json
+
+# Agent 记忆与角色头像（含真实业务经验 / 角色形象，属本地运行数据，不入公开仓）
+memory/*.md
+!memory/README.md
+icon/
+
+# 内部取数 skill（含内部接口地址与凭证、内部数据表名，绝不公开）
+skills/narya-data/
+
+# TestReport 生成产物（运行时报告，含运行数据）
+TestReport/*_results_*.json
+TestReport/*_results_*.md
+TestReport/codex_cli_smoke_*.json
+TestReport/codex_cli_smoke_*.md
+TestReport/collab_scenario_*.md
+
+# SQLite 数据库（含备份，含真实数据/凭证，绝不入仓）
+*.db
+*.db.bak*
+*.db.bak_*
+*.db-journal
+*.db-wal
+*.bak
+*.bak_*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Node / 前端
+node_modules/
+frontend/dist/
+.vite/
+
+# 日志与临时
+*.log
+.reimport_*.json
+_tmp_*
+
+# 环境与编辑器
+.env
+.env.local
+.DS_Store
+.idea/
+.vscode/

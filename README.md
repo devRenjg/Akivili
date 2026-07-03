@@ -1,0 +1,396 @@
+# Akivili（阿基维利）— 本地优先的多 Agent 工作平台
+
+> **愿此行，终抵群星！** 构建属于你自己的星穹列车，从这里出发，亲手去开拓每一个目标！
+>
+> 把你日常工作的 Agent 组装成可视化工作流。既能在终端、也能在网页发号施令；Agent 之间还能协同完成任务。每个项目自起标题、绑定一个本地文件夹，Agent 在该文件夹的边界内干活。
+
+## 项目定位
+
+Akivili 是一个**本地优先（local-first）**的多 Agent 编排平台：
+
+- **CLI 执行引擎**：后端调用本地 `claude -p` / `codex exec`（或 API）跑 Agent，能读写文件、执行命令、操作你指向的本地项目文件夹——能力天然对齐真实开发工作流。
+- **可导入的数字人才库**：从 `C:\Code\Agents`（312 个中文 Agent 人格定义）挑选导入，平台内也能新建/改造自己的 Agent。
+- **项目即工作区**：每个项目自起标题、绑定一个本地文件夹，作为 Agent 的工作边界。
+- **看板式任务体系**：Trello 式看板 + 细粒度状态 / 优先级 / 子任务 / 活动时间线；任务详情两栏布局。
+- **多 Agent 协同**：Team Leader 统筹调度——读任务、按成员技能 @mention/建子任务委派、成员执行回报、汇总收尾；事件驱动并发池调度（多成员可同时开工、跨供应商混编）+ 父子任务闭环（子任务不全完成父任务不收尾）+ 卡死超时兜底 + 多层防死循环（含防层层派生）。
+- **多模型配置化**：Claude Code / Codex / API（Anthropic / OpenAI 格式）等多供应商，在设置页配置切换。
+- **内网协作**：可开放给内网同事访问，管理员可写可执行、其他人只读浏览。
+
+## 能力概览
+
+已实现（P0–P6）：
+- 主页 Dashboard + 项目空间：项目卡片总览、状态、成员数
+- 数字人才库：312 个中文 Agent，浏览 / 搜索 / 导入 / 新建 / 改造人格
+- 项目与团队：项目绑定本地文件夹；团队组建、Team Leader、成员配模型 + Skills
+- Agent 记忆：每个 Agent 跨项目共用持久记忆，自动写入工作区约束与 Skills 说明；分「近期动态」滚动段落与「Know-how」经验段落
+- Skills 库：能力指令文本库，可导入 / 新建 / 下载，Agent 按需启用
+- 工作区看板：Trello 式任务看板，细粒度状态 + 优先级 + 子任务 + 活动时间线（两栏详情）
+- Agent 真实执行：@ 分派，CLI 在项目目录真实改文件跑命令 / API 对话，流式输出，可 Kill / 查日志
+- 多 Agent 协同：Team Leader 统筹调度、@mention/子任务委派、成员执行回报、并发池调度（多成员并行、跨供应商）、父子任务闭环收尾、卡死超时兜底（按角色可配）、多层防死循环
+- 任务完成经验反思：任务进入「已完成」时，参与角色各自用自身模型复盘、沉淀可迁移 Know-how 到记忆，越做越会做
+- 大模型 / CLI 多供应商配置（设置页）
+- 内网访问 + 登录鉴权：管理员可写可执行，匿名只读
+
+规划中：可视化工作流编排（P5）、终端 CLI 入口、OpenSpec 看板（P7）。
+
+## 技术栈
+
+| 层级 | 技术选型 |
+|------|----------|
+| 前端 | Vue 3 + Vite + Element Plus + Vue Router |
+| 后端 | Python 3.12 + FastAPI + Uvicorn |
+| 存储 | SQLite（项目 / Agent / 会话 / 工作流元数据）+ 本地文件系统（项目工作区） |
+| 执行引擎 | Claude Code CLI（`claude -p`）/ Codex CLI（`codex exec`）/ 纯 LLM API |
+| LLM | OpenAI Chat Completions / Anthropic Messages（双格式兼容，复用 Qlipoth 模式） |
+| 规格管理 | OpenSpec（specs 已实现能力 / changes 待实现提案） |
+
+## 执行引擎设计
+
+平台核心是一个统一的执行器抽象 `ExecutorBackend`，三种实现：
+
+```
+ExecutorBackend.run(agent, prompt, project_dir, on_event) → 流式事件(SSE)
+├── ClaudeCodeBackend   claude -p --output-format stream-json --add-dir <项目文件夹>
+│                       --append-system-prompt-file <agent.md> --model <模型>
+├── CodexBackend        codex exec（codex-cli）
+└── ApiLlmBackend       httpx 流式，OpenAI/Anthropic 双格式（复用 Qlipoth llm.py）
+```
+
+**安全约定**（吸取 Qlipoth 代码审查教训）：
+
+- 子进程一律**列表传参**、绝不 `shell=True`，杜绝参数/命令注入
+- 默认用 `--add-dir` 把 Agent 工作目录**限定到当前项目文件夹**，不默认开启 `--dangerously-skip-permissions`
+- 阻塞型子进程调用用 `asyncio.to_thread` 卸载，避免冻结事件循环
+- SSE 生成器检测客户端断开，及时终止子进程，避免空转烧 token
+
+## 多 Agent 协同设计
+
+协同引擎 `backend/collab.py`——把**调度决策外包给 LLM**（给 Leader 注入协作协议 + 团队花名册），用 **@mention 作为 Agent 间唯一通信原语**，配合**事件驱动队列 + 并发池**推进。
+
+```
+任务唤醒 Leader
+   └─(注入 协作协议 TEAM_LEADER_PROTOCOL + 团队花名册 build_roster)
+      └─ Leader 发言：@后端开发者 @测试专员 …（LLM 自主决策派给谁）
+          └─ parse_and_enqueue_mentions：解析 @成员 → 各入队一个 run（run_queue）
+              └─ 并发池 _loop：填满空闲槽（MAX_CONCURRENCY 个成员同时开工）
+                  └─ 每个 run：runner.execute_dispatch 跑到底 → 落库消息/活动
+                      └─ 成员发言里的 @ → 继续入队（事件驱动，直到无人再被 @）
+```
+
+**并发池调度**（取代早期「串行单并发」）：
+
+- 后台循环 `_loop` 一次性把空闲槽填满，最多 `MAX_CONCURRENCY`（默认 3）个 Agent **同时执行**——一个任务被 @ 到的多名成员可并行开工，慢成员不阻塞快成员。
+- `_claim_one` 原子领取 queued run 并标 `running`；`_process_one` 执行完落库终态并释放并发槽；`_tick` 为确定性单步原语（测试用），与并发池共用同一套 claim/process。
+
+**卡死兜底**（保障 Agent「持续工作不卡壳」）：
+
+- 单个 Agent 执行设超时，**按角色可配**：默认 30 分钟，数据类等长耗时角色（如经外部取数服务拉数）放宽到 60 分钟。超时即 `runner.kill_run` 杀**整棵进程树**（Windows `taskkill /F /T`，非仅父进程，否则子进程成孤儿继续跑）+ `runner.finalize_run` 主动把 `task_runs` 落成终态（生成器被取消时收尾代码跑不到，需外部补落库，杜绝孤儿 `running`）+ 记 `task_failed` 活动（以角色昵称呈现）+ 释放并发槽。卡死成员只占一个槽、到点清理，**绝不拖垮队列或留僵尸**。
+- CLI 执行供应商默认全权限放开（跳过授权/沙箱确认、`stdin` 关交互），从源头避免 Agent 因交互提示挂起。
+
+**多层防死循环**：
+
+- 协议教育：Leader 收尾总结不 @ 任何人；能自己答的不硬委派。
+- Leader 自触发守卫：Leader 刚以 Leader 身份发言，不因自身发言再唤醒自己。
+- pending 去重：同一 `(task, agent)` 已有 queued/running 的不重复入队。
+- 深度上限：单任务累计运行数达 `MAX_RUNS_PER_TASK`（默认 20）即停止入队并记活动，防失控烧钱。
+- **防层层派生（cascade）**：只有**顶层任务**（`parent_task_id` 为空）才注入"负责人派活"指令，子任务一律叶子工作；**子任务内 @负责人不唤醒**（否则成员在子任务里 @Leader → Leader 又在子任务里派活 → 无限派生）；带完整指令的收尾 run 不再追加派活指令。
+
+**父子任务闭环**（`backend/progress.py`）：
+
+- **子任务不结束，父任务不能结束**：父任务若有未完成子任务，`jian status done`（成员）被拦截、`PUT /status`（管理员）返回 409（管理员可 `force:true` 覆盖）。
+- **全部完成→负责人汇总收尾**：最后一个子任务 `done` 时，`maybe_advance_parent` 把父任务置 `reviewing`，并**自动入队一条负责人总结 run**（带汇总指令：查看各子任务成果 → `jian comment` 统一汇报 → `jian status done`）。幂等，`reviewing` 后不重复触发。
+- `task_progress` 聚合父 + 全部子任务的 run_queue（哪些成员在跑/排队、`sub_done/sub_total`），供任务详情右侧「执行日志」区实时展示"还有谁在干活"。
+
+**CLI 执行隔离**（保障协同 Agent 只走平台、不被宿主环境污染）：
+
+- **prompt 走 stdin**：`claude -p` 的 prompt 经 stdin 传入，不作命令行参数——避免 Windows 超长 argv 被截断（截断会让 Claude 收到残缺 prompt、输出降级成非 JSON、解析不到事件）。
+- **禁用内置编排工具**：`--disallowed-tools Task,Workflow,SendMessage,TaskCreate,…,TodoWrite`，逼 Agent 用平台的 `jian` CLI 真实建卡/派活，而非用 Claude 自带的 Task/Workflow 工具"模拟"协同（那样成员不会被平台真正唤醒）。
+- **隔离宿主全局定制**：子进程 `CLAUDE_CONFIG_DIR` 指向空目录，不加载宿主 `~/.claude/CLAUDE.md`、hooks、skills（避免其它全局人格污染 Akivili Agent）；认证走 `~/.claude.json` 不受影响。（注：不能用 `--safe-mode`，它会把 stream-json 输出降级成纯文本。）
+
+> 复用现有 `project_agents.is_leader`（Team Leader）与 `agent_skills`（成员技能）——**项目团队即 squad**，不另建表。成员可跨供应商（Claude CLI / Codex CLI / API 混编），同项目成员经花名册默认互相认识、都能被协同唤醒。
+
+> ⚠️ **已知**：协同调度依赖 Leader（LLM）对注入的协作协议 + 花名册的遵循程度，存在 run-to-run 波动（偶尔会探索工作区后自由发挥、不建子任务）。人格/协议提示仍在打磨中。
+
+## 任务完成经验反思
+
+`backend/reflect.py`——让 Agent「越做越会做」。任务进入 `done` 时，对真正参与执行的角色各自触发一次复盘，把经验沉淀进记忆。**与 per-run 归档区分**：per-run 只记流水（最近做过啥），反思才是提炼可迁移的 Know-how。
+
+```
+任务 done（拖入已完成 / jian status done）
+   └─ reflect_on_task_done（后台异步，不阻塞）
+       ├─ _participants：以 task_runs 为准，收集本任务+子任务里真正跑过的角色
+       └─ 每个角色并发复盘（runner.run_oneshot：借其模型+人格想一段，不建 run/不落会话）
+           └─ 产出 3-5 条 Know-how（聚焦方法/坑/诀窍，非复述结论）
+               └─ 写入记忆受管段落 knowhow：去重合并；超上限再调模型压缩成 Top-N
+```
+
+- **只沉淀真参与者**：以 `task_runs` 为准（有 run = 真干过、有产出），未参与的角色不写。
+- **产出是要领不是存档**：prompt 明确"提炼方法/坑/诀窍/判断依据，不要复述结论数字"；无可沉淀时不写。
+- **治理**：Know-how 存独立受管段落，去重合并；超 `KNOWHOW_MAX`（默认 30）条时压缩成 Top-N，不撑爆人格上下文。per-run 的「近期动态」段落也滚动保留最新 N 条。
+- **测试项目跳过**，不污染真实身份记忆。
+
+## 目录结构
+
+```
+JianAgency/
+├── README.md                  # 版本记录 / 技术方案 / 功能列表（唯一事实源）
+├── start.ps1                  # 一键启动
+├── memory/                    # Agent 记忆：每个 <agent-slug>.md 是一个 Agent 的跨项目持久记忆
+├── skills/                    # Skill 库：每个 <skill-slug>.md 是一段能力指令文本
+├── icon/                      # 人才头像图库
+├── openspec/                  # 规格驱动：specs（已实现）/ changes（待实现）
+├── TestReport/                # QA 套件 + 关键协同案例 + 报告
+├── backend/                   # FastAPI（Python 3.12）
+│   ├── main.py config.py auth.py database.py
+│   ├── collab.py              # ★ 多 Agent 协同引擎（队列/并发池/@解析/协议花名册）
+│   ├── progress.py            # ★ 父子任务进度聚合 + 闭环联动
+│   ├── reflect.py             # ★ 任务完成经验反思（参与者复盘 → 沉淀 Know-how）
+│   ├── activity.py            # 活动时间线（含北京时间转换）
+│   ├── timeutil.py            # UTC→北京时间
+│   ├── agent_memory_sync.py   # Agent 记忆受管段落同步
+│   ├── executor/              # ★ 执行器抽象：base / claude_code / codex / api_llm / runner
+│   ├── cli/                   # jian CLI（Agent 在平台上真实建卡/发言/派活的入口）
+│   ├── agents.py projects.py memory.py skills.py
+│   └── routes/                # agents projects project_agents tasks runs agent_cli agent_config skills memory settings auth icons fs
+└── frontend/src/              # Vue 3
+    ├── views/                 # Dashboard / Agents / Skills / ProjectDetail / Workspace / TaskDetail / Settings
+    └── components/            # AgentAvatar / AgentProfileDialog / DirectoryPicker …
+```
+
+## 开发路线图
+
+每个阶段对应一个 OpenSpec change 提案。
+
+| 阶段 | 目标 | 状态 |
+|------|------|------|
+| **P0** | 脚手架：README、OpenSpec 骨架、目录结构、start.ps1、config、gitignore | ✅ 已完成 |
+| **P1** | 地基：后端 config + 设置页多供应商 Tab + DB 初始化 | ✅ 已完成 |
+| **P2** | 数字人才库：从 `C:\Code\Agents` 导入 / 注册 + 库浏览 UI | ✅ 已完成 |
+| **P3** | 项目：CRUD + 本地文件夹绑定 + 主页 Dashboard | ✅ 已完成 |
+| **P3.5** | Agent 配置：接入模型 + Skills 库 + 按 Agent 身份跨项目共享 | ✅ 已完成 |
+| **P4** | Agent 对话：CLI 执行器跑通，单 Agent 任务安排 + SSE 流式 | ✅ 已完成 |
+| **P5** | 可视化工作流：配置编排 + 节点/状态可视化 + 运行 | ⏳ 计划中 |
+| **P6** | 多 Agent 协同：Team Leader 调度 + @mention/子任务委派 + 并发池执行 + 父子闭环 + 卡死兜底 | ✅ 已完成（Leader 提示遵循性打磨中） |
+| **P7** | OpenSpec 看板 + 整体打磨 | ⏳ 计划中 |
+
+## 功能列表
+
+### 已实现
+- 项目脚手架与规格驱动开发基线（OpenSpec）
+- 大模型 / CLI 多供应商配置（设置页）：API（Deepseek/OpenAI/Anthropic/通义/智谱/Moonshot/Ollama）+ CLI（Claude Code / Codex），含密钥脱敏、连通性测试、默认供应商
+- 后端地基：FastAPI 入口 + SQLite 建库 + CORS 白名单
+- Agent 模版库：扫描 `C:\Code\Agents`（268 个中文 Agent）入库，按分类/关键词浏览、搜索、查看人格详情、幂等重扫
+- 项目管理：项目 CRUD + 绑定本地文件夹（工作边界）+ 主页 Dashboard 卡片总览；项目内 Agent 团队（从库导入 / 自建 / 改造人格 / 移除）
+- Agent 记忆：每个 Agent 在 `memory/<slug>.md` 拥有跨项目共用的持久记忆，可在项目内查看/编辑；加入项目 / 配置 Skills 时自动写入🗂️工作区路径约束与🧩Skills 使用说明（受管段落，不影响手写内容）
+- Agent 配置：每个 Agent 可接入大模型（从供应商选）+ 启用 Skills；模型/记忆/Skills 按 Agent 身份（slug）跨项目共享，人格各项目独立
+- Skills 库：能力指令文本库（`skills/<slug>.md`），可导入/新建，浏览搜索；Agent 按需勾选启用
+- 工作区看板：项目下 Trello 式任务看板，5 态流转（规划中→进行中→验证中→已完成，可归档）
+- Agent 真实执行：任务内对话终端 @ 分派负责人，Agent 按接入模型真实执行（CLI 在项目目录改文件跑命令 / API 对话），SSE 流式输出，执行前读记忆+会话历史、执行后写回记忆，可 Kill、可查日志
+- 多 Agent 协同：Team Leader 统筹——读任务、按成员技能 @mention/建子任务委派、成员执行后回报、Leader 汇总收尾；事件驱动 + 并发池调度（多成员并行、跨 Claude/Codex/API 供应商混编）、父子任务闭环（子任务不全完成父任务不收尾、全完成自动唤醒负责人汇总）、卡死超时兜底、多层防死循环（含防层层派生）、CLI 执行隔离（stdin 传 prompt / 禁内置编排工具 / 隔离宿主全局定制）
+- 时间与身份细节：全平台北京时间展示；活动时间线显示真实操作者（登录用户名 / Agent 昵称）；测试项目数据不写入 Agent 记忆
+
+### 规划中
+- [ ] 可视化工作流编排与运行
+- [ ] 终端 CLI 入口
+- [ ] OpenSpec 看板
+
+## 快速开始
+
+```powershell
+# 一键启动（安装依赖 + 起前后端）
+./start.ps1
+# 前端 http://localhost:3100   后端 http://localhost:8100
+```
+
+> 端口选用 3100 / 8100，与 Qlipoth（3000 / 8000）错开，便于两个项目同时运行。
+
+## 内网访问
+
+服务已绑定到 `0.0.0.0`，同一内网的同事可访问：
+
+- **访问地址：`http://<your-lan-ip>:3100`**（本机内网 IP，随网络环境变化）；通过环境变量 `AKIVILI_EXTRA_ORIGINS=http://<your-lan-ip>:3100` 加入 CORS 白名单
+- 管理员账号：由环境变量 `AKIVILI_ADMIN_USER` / `AKIVILI_ADMIN_PASSWORD` 在首次启动时设置（缺省占位 `admin` / `changeme`，**部署务必改掉**）
+- 匿名/其他同事：只读浏览项目空间、数字人才库、Skills；看不到设置，不能安排任务或改动
+
+> ⚠️ **安全提醒**：管理员触发 Agent 执行时为放开权限模式，Agent 能在本机改文件、跑命令。请仅在可信内网开放，妥善设置并保管管理员密码。如需真正的域名，请让内网 DNS 把名称解析到本机 IP。
+
+## 版本记录
+
+### v0.12.0 — 2026-07-03
+- 🧠 **任务完成经验反思**（OpenSpec change：`2026-07-03-task-completion-reflection`，能力 `agent-reflection`）——让 Agent「越做越会做」
+  - 新增 `backend/reflect.py`：任务进入 `done`（拖入已完成 / `jian status done`）时，对本任务+子任务里**真正跑过 run 的每个角色**触发一次复盘，用其**自身模型+人格**提炼 3-5 条可迁移 Know-how，写入记忆受管段落 `knowhow`
+  - 新增 `runner.run_oneshot`：一次性模型调用（不建 run / 不落 messages / 不碰会话），供反思、总结等"借模型想一段"的场景；超时/异常返回空串、不影响主流程
+  - 产出是**要领非存档**：prompt 明确"聚焦方法/坑/诀窍/判断依据、不要复述结论数字"，无可沉淀时不写；Know-how 去重合并，超 `KNOWHOW_MAX=30` 条时调模型压缩成 Top-N，防膨胀污染人格
+  - per-run 记忆职责调整：`_persist_memory` 从"无限 append 结论存档"改为滚动受管段落 `recent`（保留最新 8 条），只做轻量近期动态；学习交给反思
+  - 触发点：`routes/tasks.py` + `routes/agent_cli.py` 的 `set_status(done)`，`asyncio.create_task` 后台异步不阻塞；测试项目跳过
+  - 验证：新增 `TestReport/run_reflect_probe.py` 6/6（参与者写入 / 未参与不写 / 超限压缩 / 测试项目跳过）；并发探针 7/7、隔离主套件 30/30 保持通过；**真实 Claude 端到端**：完成任务后参与角色产出 5 条真实 Know-how（做事要领，非报告复述）
+
+### v0.11.3 — 2026-07-03
+- 🐛 **收工写记忆修复 + 弹窗昵称 + 看板精简 + 前端缓存自愈**
+  - **做完任务不写记忆**：`append_memory` 原挂在执行生成器尾部，超时取消时收尾跑不到；且原来只记流式 stdout（过程碎语），而 CLI Agent 真实结论走 `jian comment` 落 messages 表。抽出 `runner._persist_memory`：优先取本轮 messages 里该 agent 的发言（真实交付），无则回退 stdout；`finalize_run`（超时兜底）也调它，做完的任务也能沉淀
+  - **弹窗标题显示昵称**：ProjectDetail 的 Skills/人格/记忆弹窗标题从纯角色名改用 `#header` slot + 头像 + 「昵称（角色）」
+  - **看板精简**：工作区去掉「验证中/阻塞」两列（暂无用，以后扩展）；后端状态机不动，前端把这两态任务并入「进行中」显示，防任务无列可显而消失
+  - **前端资源缓存自愈**：`main.py` 加缓存头中间件（`/assets/*` 长缓存 immutable、index.html `no-cache`）+ `router.js` 捕获 chunk 加载失败强制整页重载一次——根治 build 后旧 index.html 引用已删 hash chunk → 404 → 点 Tab 无反应
+  - 取消任务详情右上角"团队协同进行中/拖入即协同"文案（单人任务不协同、需协同时负责人自动拉人，措辞无意义）
+
+### v0.11.2 — 2026-07-03
+- ⏱️ **执行超时体系重构 + kill 竞争修复**（`collab.py` / `executor/runner.py`）
+  - **超时按角色可配**：默认 360s → **1800s（30 分钟）**，数据类等长耗时角色（经外部取数服务拉数）放宽到 **3600s（60 分钟）**；`RUN_TIMEOUT_OVERRIDES` + `_run_timeout(slug)` 管理
+  - **修 kill 竞争**：Windows `os.kill(SIGTERM)` 只杀父进程、子进程成孤儿继续跑 → 改用 `taskkill /F /T` 杀**整棵进程树**（POSIX 用 `killpg`）
+  - **修孤儿 running**：超时时执行生成器被 `wait_for` 取消、收尾落库跑不到 → 新增 `runner.finalize_run` 主动把 `task_runs` 落成终态，杜绝永久 `running` 孤儿
+  - **超时活动显示昵称**：`task_failed` 的 `actor_name` 从 slug 改用角色名，前端时间线显示「昵称（角色）执行超时…」
+  - 验证：并发探针 7/7、隔离主套件 30/30
+
+### v0.11.1（追加）— 2026-07-02
+- 🔗 **父子任务闭环 + 协同健壮性**（`progress.py` / `collab.py` / `executor/claude_code.py`）
+  - **子任务不结束，父任务不能结束**：`blocking_subtasks` 守卫——父任务有未完成子任务时，`jian status done`（成员）被拦截、管理员 `PUT /status` 返回 409（可 `force:true` 覆盖）
+  - **全部完成→负责人汇总收尾**：`maybe_advance_parent` 在最后一个子任务 done 时把父任务置 `reviewing`，并**自动入队一条负责人总结 run**（带指令：看各子任务成果 → `jian comment` 统一汇报 → `jian status done`），幂等不重复触发
+  - **防层层派生（cascade）**：只有顶层任务注入"派活"指令、子任务一律叶子工作；子任务内 @负责人不唤醒；收尾 run 不再追加派活指令。修复了「成员在子任务 @Leader → Leader 又派活 → 派生出一堆子子任务」的失控
+  - **CLI 执行隔离三件套**：① `claude -p` 的 prompt 走 **stdin**（避免 Windows 超长 argv 截断致输出降级/解析不到事件，这是"负责人秒完成却啥也没干"的真根因）；② `--disallowed-tools Task,Workflow,SendMessage,TaskCreate…`（禁内置编排工具，逼走 `jian`，否则成员不被平台真正唤醒）；③ 子进程 `CLAUDE_CONFIG_DIR` 指向空目录（隔离宿主 `~/.claude/CLAUDE.md` 等全局人格污染；不用 `--safe-mode`，它会把 stream-json 降级成纯文本）
+  - **跨供应商协同验证**：新增关键案例 `TestReport/run_collab_scenario.py`（真实 CLI 端到端、镜像真实团队 8 人跨 Claude+Codex 双供应商），验证 Codex 成员也能被真实唤醒、成员以昵称示人、无级联、父任务闭环
+  - 验证：隔离主套件 30/30、并发探针 7/7、闭环单测（未完成不推进/全完成→reviewing+唤醒负责人/幂等）、防级联单测（子任务@负责人不唤醒/顶层@成员正常）全通过
+  - ⚠️ **已知**：协同调度依赖 Leader（LLM）对协作协议+花名册的遵循程度，run-to-run 有波动（偶尔探索工作区后自由发挥、不建子任务）；负责人人格/协议提示仍在打磨
+
+### v0.11.1 — 2026-07-02
+- 🐛 验收修复（8 项）：
+  - 🕐 **统一北京时间**：新增 `timeutil.to_beijing`，数据库仍存 UTC，API 边界（时间线/消息/执行日志/任务卡片）统一转 Asia/Shanghai 返回，历史数据一并正确
+  - 🧹 **测试数据不入记忆**：`config.is_test_project` 判定（`__test__`/`__qa`/`__conc` 前缀）；runner 收工写记忆、`agent_memory_sync` 工作区段落均过滤测试项目；清理了负责人「星」及成员被污染的记忆文件
+  - 👤 **动态显示登录用户名**：人类操作活动落库带用户名（`require_admin` 注入），旧空记录回退「管理员」；前端消息/活动统一用 `actor_display`/当前登录名，不再写死「我」
+  - 📜 **修滚动条弹回**：任务详情时间线改「粘性底部」——仅当用户停在底部才自动跟随，向上翻阅时不再被 3 秒轮询强制拽回
+  - 🏷️ **卡片「活动/对话」改「动态」**：字体加大加粗（16px/700）
+  - 🚫 **Leader 不再 @ 自己 / 编造成员**：协作协议加铁律（只 @ 花名册真实成员、绝不 @ 自己、绝不杜撰）；`parse_and_enqueue_mentions` 强化自触发守卫，@ 不存在成员时记「⚠️ 无人被唤醒」活动（不再静默丢弃）；Leader 默认 prompt 先 `jian roster` 看真实成员
+  - 🧩 **子任务联动父任务**：新增 `progress.py`——所有子任务完成后父任务自动进 `reviewing`（等负责人汇总收尾），未完成则保持进行中；新增 `GET /tasks/{id}/progress` 聚合父+子任务在跑/排队的 Agent，任务详情右侧执行日志区显示「执行中·子任务 N/M·哪些子 Agent 在跑」
+  - 🗑️ 删除无引用的死代码 `TaskThread.vue`（实际生效的是 `TaskDetail.vue`）
+- 验证：隔离主套件 30/30、并发探针 7/7 保持通过；新增进度聚合/父任务联动/时区/测试过滤隔离验证全通过
+
+### v0.11.0 — 2026-07-02
+- ⚡ 多 Agent 协同并发池 + 卡死兜底（`collab.py`）——取代原「单并发串行」循环
+  - 并发池：`_loop` 一次性把空闲槽填满（`MAX_CONCURRENCY=3` 上限），短任务也能真正并行；慢 Agent 不再阻塞快 Agent
+  - 卡死兜底：单个 Agent 执行超时（`RUN_TIMEOUT_SEC=360`，抽成模块常量）→ `runner.kill_run` 杀子进程 + 记 `task_failed` 活动 + 释放并发槽，卡死不再拖垮整条队列或留僵尸
+  - 保留 `_tick()` 作为确定性单步原语（与生产 `_loop` 共用 `_claim_one`/`_process_one`），供测试逐步驱动队列
+  - **修复 bug**：旧 `_loop` 每 claim 一个 run 就 `sleep(0.3)`，短任务永远填不满并发池（峰值卡在 2/3）；改为连续补槽
+  - 验证：新增 `TestReport/run_concurrency_probe.py`（隔离临时库 + 假执行器）7/7 通过——超时 kill、run 落库 done、task_failed 活动、峰值达 3、并行快于串行、慢 Agent 不饿死快 Agent；隔离主套件 30/30 保持通过
+  - OpenSpec：新增 change 提案 `2026-07-02-collab-concurrency-pool`，更新 `agent-collaboration` 规格（串行 → 并发池 + 卡死兜底）
+
+### v0.10.0 — 2026-07-01
+- 🪪 数字人才昵称 + 自定义头像（按身份 slug 跨项目共享，仅管理员可编辑）
+  - 数据：`agent_profiles` 加 `nickname` / `avatar`（_migrate 平滑升级）
+  - 后端：`agent-config/{slug}/profile` 设昵称头像（require_admin）；新增 `/api/icons` 列图 + 取图（路径穿越防护）；人才库/团队列表 join 出 nickname/avatar
+  - 头像来源：`C:\Code\JianAgency\icon` 文件夹，放图即可在资料弹窗里选（含默认 emoji 选项）
+  - 显示：全局统一「昵称（名字）」格式（无昵称只显名字）+ 圆形头像组件（无头像回退 emoji）；人才库、项目团队、任务面板、@选择器、对话角色全部接入
+  - 前端：`AgentAvatar` / `AgentProfileDialog` 组件 + `displayName`/`avatarUrl` 辅助；修复弹窗首次打开 visible 不同步的时序 bug
+
+### v0.9.2 — 2026-07-01
+- 🔓 CLI 执行供应商默认全权限放开（效率优先，仅可信内网）——保障 Agent 不因授权/沙箱卡死
+  - Claude CLI：加 `--permission-mode bypassPermissions`（与 `--dangerously-skip-permissions` 双保险）
+  - Codex CLI：加 `--dangerously-bypass-approvals-and-sandbox` + `--cd`/`--add-dir`（Windows 下 Codex 沙箱会因 `CreateProcessWithLogonW failed:1385` 无法写文件，必须 bypass）
+  - Codex 三处根因修复后**经 Akivili 完整跑通、真实写文件**：① 模型名对齐网关（gpt-5 → gpt-5.5）；② prompt 改用 stdin 传入（命令行传长 prompt 会被截断致 codex 只复述不执行）；③ 指令前置 + 子进程 NO_PROXY 兜底
+  - 已沉淀为全局规范：新增任何 CLI 供应商默认全放开、无需授权、防卡死
+
+### v0.9.1 — 2026-07-01
+- 🐛 修复测试专员 QA 报告发现的 3 个 Bug（QA 套件从 35/38 → 38/38，协同实测得分 80 → 100）
+  - P0：CLI 执行后端（claude/codex）此前忽略 `ctx.history`，协同中被 @ 的成员看不到负责人的委派与任务上下文、无法完成工作。新增 `executor.base.build_cli_prompt` 把会话历史+本轮指令拼进 CLI prompt；collab 成员 prompt 带上任务标题/描述。实测：成员现能按委派真实创建文件
+  - P1：未知 `/api/*` 被 SPA 兜底返回 200 HTML → 改为返回 404 JSON（非 API 路径仍走 SPA）
+  - P1：memory / skills 的 slug 含 `..` 未被拒绝 → 显式拒绝，符合 OpenSpec 安全契约
+  - 回归：`py -3.12 TestReport/run_qa_suite.py --live --keep` 全绿 38/38
+
+### v0.9.0 — 2026-06-30
+- 🤝 多 Agent 协同（OpenSpec change：`2026-06-30-multi-agent-collaboration`，能力 `agent-collaboration`）——Team Leader 调度机制
+  - 核心思想：调度智能外包给 LLM（注入协作协议+团队花名册）；@mention 是 Agent 间唯一通信原语；事件驱动队列串行调度；多层防死循环
+  - 后端：新增 `run_queue` 表 + `collab.py`（asyncio 后台循环串行领取执行 + @mention 解析入队 + pending 去重 + Leader 自触发守卫 + 协同深度上限 20）；`TEAM_LEADER_PROTOCOL` 协作协议 + 动态团队花名册（成员名/技能/@语法）注入 Leader 系统提示；复用 is_leader（Team Leader 即 squad leader）与 agent_skills
+  - 触发：任务拖到「进行中」/「▶ 启动团队协同」按钮 → 唤醒团队负责人统筹；负责人 @mention 委派 → 成员入队执行 → 完成回报 → 负责人汇总收尾
+  - 前端：任务详情右栏加「启动团队协同」按钮；协同全过程经活动时间线/执行日志区/对话区实时呈现（3 秒轮询）
+  - 验证通过（真实 Claude + 无头环境）：run_queue 串行、Leader 读任务后 @前端开发者 委派（未自己动手）、@解析自动触发成员执行、成员被唤醒干活、活动时间线完整记录 task_started/completed 与委派
+
+### v0.8.0 — 2026-06-30
+- 📋 升级任务体系（OpenSpec change：`2026-06-30-task-system-upgrade`，能力 `task-system`）——看板式两栏布局，配色沿用 Akivili 星穹风
+  - 数据：tasks 加 `priority`（紧急/高/中/低/无）、`parent_task_id`（子任务）；状态扩展 待办(backlog)/阻塞(blocked)；新增 `activities` 表（活动时间线）
+  - 后端：关键动作埋点写活动（created/status_changed/priority_changed/task_started·completed·failed/commented）；新增 activities（活动+对话合并时间线）/subtasks/priority 接口；看板列表带子任务 done/total 进度
+  - 前端：TaskThread 重构为**两栏大弹窗**——中间（描述 + 子任务区 + 活动/对话时间线 + @输入）+ 右侧属性栏（状态/优先级/负责人 picker + 执行日志区可展开每次 run 的日志）；看板卡片加优先级圆点 + 子任务进度；看板列适配 待办/阻塞
+  - 验证通过（无头 Chrome 自测）：两栏布局渲染、时间线混排、右栏状态/优先级 picker、子任务进度、执行日志区、活动埋点全部正常
+
+### v0.7.0 — 2026-06-30
+- 🔐 内网访问 + 登录鉴权（OpenSpec change：`2026-06-30-intranet-auth-rbac`，能力 `auth-rbac`）
+  - 认证借鉴 Qlipoth：PBKDF2 加盐哈希（改进为 hmac.compare_digest 常量时间校验）、token + httponly cookie；新增 `auth.py` / `routes/auth.py`（login/logout/me）；`users` 表 + startup 播种管理员
+  - 管理员账号：环境变量 `AKIVILI_ADMIN_USER` / `AKIVILI_ADMIN_PASSWORD`（role=admin，缺省占位 `admin` / `changeme`）
+  - 权限：管理员可写可执行（全部 POST/PUT/DELETE 加 `Depends(require_admin)`）；匿名/其他用户只读浏览项目空间、数字人才库、Skills，看不到设置，不能安排任务、不能增改 Agent/Skill
+  - 前端：登录态全局注入（provide currentUser/isAdmin），按角色 v-if 隐藏设置 Tab 与所有写按钮；右上角身份与登录/退出；axios withCredentials
+  - 内网开放：后端 host=0.0.0.0，前端 vite host=true，CORS 加内网 IP
+  - 验证通过：播种管理员、登录拿 cookie、管理员可写、登出/匿名写 401、匿名 GET 只读 200，经内网 IP 全链路验证
+  - ⚠️ 安全提醒：管理员 @ Agent 仍是放开权限执行（能在主机改文件跑命令），管理员账号权限大，密码请妥善保管；仅限可信内网使用
+
+### v0.6.0 — 2026-06-30
+- ✅ 完成 P4 工作区看板 + 单 Agent 真实执行（OpenSpec change：`2026-06-30-task-board-and-execution`）
+  - 数据：新增 `tasks` / `task_runs` / `run_logs` 三表；复用 `conversations`/`messages` 作任务对话 Thread
+  - 执行引擎 `executor/`：`base`（抽象+流式事件）、`claude_code`（claude -p stream-json，放开权限+--add-dir 锁目录）、`codex`（codex exec --json）、`api_llm`（httpx 流式双格式）、`runner`（组装人格+记忆+Skills+会话历史→选后端→PID 注册表→收工写记忆）
+  - 子进程列表传参防注入、stdin=DEVNULL、to_thread 卸载阻塞、SSE 检测断开
+  - 后端：`routes/tasks.py`（CRUD+状态流转+看板分组）、`routes/runs.py`（@分派 SSE、kill、日志、消息历史）
+  - 前端：`Workspace.vue`（5 列看板+新建+移动）、`TaskThread.vue`（任务内对话终端：@选择器、流式输出、Kill、日志面板）；项目页加「进入工作区」入口
+  - 验证通过：任务 CRUD+5 态流转+看板分组、@分派流式执行（自动 Leader 用人格回复）、消息落库、run 状态、54 条日志、收工写记忆、kill 真实终止子进程；错误流（如 codex 网关断连）如实呈现不崩溃
+  - 说明：codex-cli 连 B 站网关有环境问题（模型元数据/流式断连），非 Akivili bug；执行引擎正确捕获展示其错误
+
+### v0.5.2 — 2026-06-30
+- 👑 团队总负责人（Team Leader）角色
+  - 新建项目时自动把「项目负责人」拉入团队并设为 Team Leader，排序置顶
+  - 可手动把任意成员「设为负责人」，自动取消原负责人（每项目至多一个）
+  - Leader 卡片金色高亮 + 👑标识，团队列表 Leader 始终排第一位；Leader 负责调度顶层任务与分发
+  - 后端：`project_agents` 增 `is_leader` 列（含轻量迁移 ALTER）；列表按 `is_leader DESC, id` 排序；新增 `PUT /projects/{pid}/agents/{id}/leader`；创建项目时 `_seed_leader` 自动配置
+  - 措辞：「Agent 库」→「数字人才库」；项目内「Agent 团队」→「团队」；空状态「还没有人才加入」
+
+### v0.5.1 — 2026-06-30
+- ✨ Agent 记忆自动同步「工作区」与「Skills 使用说明」（受管段落机制）
+  - 加入项目时，自动在该 Agent 记忆里写入🗂️工作区段落：列出其所在的**所有**项目（项目名→本地路径）并约束「只在对应项目路径内操作、不得越界」；多项目累加，移除项目自动回退
+  - 配置 Skills 时，自动写入🧩可用 Skills 段落：每个启用 Skill 的名称、描述、使用要领，提示 Agent「遇到对应场景主动调用」
+  - 受管段落用锚点（`<!-- akivili:managed:* -->`）包裹，从数据库真实状态实时重建，幂等；**完全不影响用户手写的记忆内容**
+  - 后端：新增 `agent_memory_sync.py`；`memory.py` 增 `upsert_managed_section`；在 project_agents 的导入/自建/移除、agent_config 的设置 Skills 处触发同步
+  - 修复 `upsert_managed_section` 用 `re.sub` 替换时，Windows 路径反斜杠被当正则转义导致的崩溃（改用函数式替换）
+
+### v0.5.0 — 2026-06-30
+- ✅ 完成 P3.5 Agent 配置 + Skills（OpenSpec change：`2026-06-30-agent-config-and-skills`）
+  - 数据：新增 `agent_profiles`（按 slug 存接入模型）/ `skills` / `agent_skills`（按 slug 存启用技能）三表
+  - 后端：`skills.py`（扫描 `skills/` 目录入库，仿 agents.py）+ `routes/skills.py`（列表/详情/重扫/新建）；`routes/agent_config.py`（读写某 slug 的接入模型与启用 Skills，upsert）；`config.py` 增 `skills_dir`；startup 建目录+扫描
+  - 前端：新增「Skills」导航与 `Skills.vue`（库浏览/搜索/详情/新建/重扫）；`ProjectDetail.vue` 的 Agent 卡片增「接入模型」下拉 +「Skills」勾选弹窗 + 跨项目共享提示
+  - 核心机制：模型 / 记忆 / Skills 均绑定在 Agent 身份（slug）上 → 同一 Agent 无论进哪个项目都互通；人格（persona）仍各项目独立可改造
+  - 验证通过：skill 扫描入库、选模型勾 Skills 保存、**跨项目互通**（项目甲配、项目乙读到一致）、不同 Agent 配置独立、新建 skill 落盘、路径穿越拦截、前后端代理打通、build 成功
+
+### v0.4.1 — 2026-06-30
+- 🪐 项目正式定名 **Akivili（阿基维利）**，Slogan：**愿此行，终抵群星！**
+  - 首页新增星空 Hero 横幅（深空渐变 + 星点 + 金色流光 Slogan）；侧边栏品牌、页面标题、后端 app title、启动脚本、OpenSpec 文档同步更名
+  - 物理标识保持不变（数据库文件 `jianagency.db`、`C:\Code\JianAgency` 目录路径、`JIANAGENCY_RELOAD` 环境变量），仅更新展示层与文档，避免数据/路径迁移风险
+
+### v0.4.0 — 2026-06-30
+- ✅ 完成 P3 项目管理 + Agent 记忆机制（OpenSpec change：`2026-06-30-projects-and-memory`）
+  - 后端：`projects.py` + `routes/projects.py`（项目 CRUD，创建/更新校验 local_path 为已存在目录）；`routes/project_agents.py`（从模版导入 / 列表 / 自建 / 改造 persona / 移除，导入继承模版 slug 使同一 Agent 跨项目共用记忆，自建生成全局唯一 slug）；`memory.py` + `routes/memory.py`（读/写/追加，白名单正则防路径穿越）；`config.py` 增 `memory_dir`；startup 建 memory 目录 + README
+  - 前端：重写 `Dashboard.vue`（项目卡片网格 + 统计 + 新建对话框）；新增 `ProjectDetail.vue`（项目信息 + Agent 团队管理 + 改造人格抽屉 + 记忆查看/编辑抽屉）
+  - 验证通过：项目 CRUD（无效路径 400）、导入两个新 Agent、改造 persona 持久化、**同一 Agent 跨项目共用记忆**（项目甲写、项目乙读到）、自建 Agent 独立且唯一 slug、路径穿越拦截（`../`/绝对路径/子目录全拒绝）、前后端代理打通、build 成功
+  - 记忆约定：`memory/<agent-slug>.md` 每个文件是一个 Agent 的跨项目持久记忆；Agent 开工先读、收工写回（自动闭环 P4 落地）
+
+### v0.3.0 — 2026-06-30
+- ✅ 完成 P2 Agent 模版库（OpenSpec change：`2026-06-30-agent-template-library`）
+  - 后端：`agents.py`（扫描 `C:\Code\Agents`、手解析 frontmatter + 正文、排除 examples/integrations/strategy 等非角色目录、幂等 upsert）、`routes/agents.py`（列表 + division/关键词过滤、详情含 body、分类统计、重新扫描）；`config.py` 增 `agent_library_dir`；`main.py` startup 空库自动扫描
+  - 前端：`Agents.vue` 库浏览页（搜索 + 分类筛选 + 卡片网格 + 人格详情抽屉 + 重新扫描）
+  - 验证通过：扫描入库 268 个 Agent（19 分类，跳过 6 个非角色文件）、搜到「项目负责人」「测试专员」并查看完整人格正文、分类筛选数量正确、幂等重扫（updated=268 总数不变）、前后端代理链路打通、build 成功
+
+### v0.2.0 — 2026-06-30
+- ✅ 完成 P1 地基（OpenSpec change：`2026-06-30-foundation-config-settings`）
+  - 后端：`config.py`（多供应商模型 + config.json 持久化 + 密钥脱敏）、`database.py`（SQLite 7 张基线表）、`main.py`（FastAPI + CORS 白名单 + 启动建库）、`routes/settings.py`（读取/保存/连通性测试）
+  - 前端：Vue3 + Vite + Element Plus 骨架（侧边导航、路由、API 封装），`Settings.vue` 多供应商配置页（API + CLI 两类、7 个 API 预设、密钥 password、连通测试、默认供应商）
+  - 验证通过：保存→读回脱敏、Claude Code CLI 检测到 `claude 2.1.170`、API 连通测试返回真实状态码、前端构建成功、前后端代理链路（3100→8100）打通
+- 🧭 确立首批 Agent 团队（模版位于 `C:\Code\Agents`）
+  - 新造「项目负责人」（顶层管理者，为结果负责，可调度下属 Agent 协同）
+  - 新造「测试专员」（验收 + 接口测试 + 代码/业务/风控安全把控与兜底，证据驱动、默认不通过）
+  - 研发角色用库内现成中文版：前端开发者、后端架构师、软件架构师、高级开发者、代码审查员
+
+### v0.1.0 — 2026-06-30
+- 🎉 项目初始化：确立项目定位、技术方案与四项地基决策
+  - 执行引擎：CLI 执行器（Claude Code / Codex）+ 纯 LLM API 三选一
+  - Agent 来源：从 `C:\Code\Agents` 中文 Agent 库导入
+  - 工作流形态：可视化展示 + 配置编排
+  - 技术栈：沿用 Qlipoth（FastAPI + Vue3 + Element Plus + SQLite）
+- 📁 创建项目骨架：README、OpenSpec 目录、前后端目录结构
+- 📋 建立 OpenSpec 基线与首个变更提案（P1 地基）
+
+---
+
+> 本 README 是项目的唯一事实源，记录版本记录、技术方案与功能列表。功能迭代与需求澄清由 `openspec/` 管理。
+
