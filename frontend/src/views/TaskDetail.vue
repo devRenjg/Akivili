@@ -158,17 +158,25 @@
           </div>
           <div v-for="r in runs" :key="r.id" class="run-item">
             <div class="run-head">
-              <!-- 执行中：红色圆形按钮，点击终止；其余状态为对应图标标记 -->
-              <button v-if="r.status === 'running'" class="run-ctrl running"
+              <!-- 执行状态图标：执行中/失败/终止可点（终止/重跑），完成仅展示 -->
+              <button v-if="r.status === 'running'" class="run-ico running"
                       :title="isAdmin ? '点击终止执行' : '执行中'"
-                      :disabled="!isAdmin" @click.stop="isAdmin && onRunDot(r)">▶</button>
-              <button v-else-if="r.status === 'failed'" class="run-ctrl failed"
-                      :title="isAdmin ? '点击重新执行' : '执行失败'"
-                      :disabled="!isAdmin" @click.stop="isAdmin && onRunDot(r)">✗</button>
-              <button v-else-if="r.status === 'killed'" class="run-ctrl killed"
+                      :disabled="!isAdmin" @click.stop="isAdmin && onRunDot(r)">
+                <el-icon><VideoPause /></el-icon>
+              </button>
+              <button v-else-if="r.status === 'failed'" class="run-ico failed"
+                      :title="isAdmin ? '执行失败 · 点击重新执行' : '执行失败'"
+                      :disabled="!isAdmin" @click.stop="isAdmin && onRunDot(r)">
+                <el-icon><CircleCloseFilled /></el-icon>
+              </button>
+              <button v-else-if="r.status === 'killed'" class="run-ico killed"
                       :title="isAdmin ? '已终止 · 点击重新执行' : '已终止'"
-                      :disabled="!isAdmin" @click.stop="isAdmin && onRunDot(r)">■</button>
-              <span v-else class="run-ctrl succeeded" title="已完成">✓</span>
+                      :disabled="!isAdmin" @click.stop="isAdmin && onRunDot(r)">
+                <el-icon><RemoveFilled /></el-icon>
+              </button>
+              <span v-else class="run-ico succeeded" title="已完成">
+                <el-icon><SuccessFilled /></el-icon>
+              </span>
               <span class="run-agent" @click="openTranscript(r)">{{ agentDisplayBySlug(r.agent_slug) }}</span>
               <span class="run-detail-btn" title="查看所有命令与运行时详情"
                     @click.stop="openTranscript(r)">日志详情</span>
@@ -221,7 +229,7 @@
 import { ref, computed, nextTick, inject, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { ArrowLeft, VideoPause } from '@element-plus/icons-vue'
+import { ArrowLeft, VideoPause, CircleCloseFilled, RemoveFilled, SuccessFilled } from '@element-plus/icons-vue'
 import { tasksApi, runsApi, projectAgentsApi } from '../api'
 import { displayName } from '../utils/agentDisplay'
 import AgentAvatar from '../components/AgentAvatar.vue'
@@ -579,19 +587,25 @@ onUnmounted(stopPolling)
 .side-val { font-size: 13px; color: #303133; }
 .run-item { border: 1px solid #ebeef5; border-radius: 8px; margin-bottom: 8px; background: #fff; }
 .run-head { display: flex; align-items: center; gap: 8px; padding: 9px 12px; font-size: 12px; }
-/* 执行状态标记：统一 18px 圆形 */
-.run-ctrl { width: 14px; height: 14px; flex-shrink: 0; border: none; border-radius: 50%;
-  display: inline-flex; align-items: center; justify-content: center; font-size: 13px;
-  line-height: 1; padding: 0; color: #fff; }
-.run-ctrl.running { background: #f56c6c; cursor: pointer; padding-left: 1px; /* ▶ 视觉居中 */ }
-.run-ctrl.running:hover { background: #f23c3c; box-shadow: 0 0 0 3px rgba(245,108,108,.2); }
-.run-ctrl.running:disabled { cursor: default; box-shadow: none; }
-.run-ctrl.killed { background: #303133; border-radius: 3px; cursor: pointer; font-size: 12px; }
-.run-ctrl.killed:hover { background: #000; }
-.run-ctrl.failed { background: #f56c6c; cursor: pointer; }
-.run-ctrl.failed:hover { background: #f23c3c; }
-.run-ctrl.succeeded { background: #67c23a; }
-.run-ctrl:disabled { cursor: default; }
+/* 执行状态图标（Element Plus 图标）：填充图标自带形状，仅上色；执行中另加红色圆底 */
+.run-ico { flex-shrink: 0; border: none; background: none; padding: 0; display: inline-flex;
+  align-items: center; justify-content: center; font-size: 16px; line-height: 1; }
+.run-ico .el-icon { font-size: 16px; }
+.run-ico.succeeded { color: #67c23a; }
+.run-ico.failed { color: #f56c6c; cursor: pointer; }
+.run-ico.failed:hover { color: #f23c3c; }
+.run-ico.killed { color: #909399; cursor: pointer; }
+.run-ico.killed:hover { color: #606266; }
+/* 执行中：红色圆底 + 白色停止图标，脉冲呼吸提示「可点击终止」 */
+.run-ico.running { width: 18px; height: 18px; border-radius: 50%; background: #f56c6c;
+  color: #fff; cursor: pointer; animation: run-pulse 1.6s ease-in-out infinite; }
+.run-ico.running .el-icon { font-size: 11px; }
+.run-ico.running:hover { background: #f23c3c; animation: none; }
+.run-ico.running:disabled { cursor: default; }
+@keyframes run-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(245,108,108,.5); }
+  50% { box-shadow: 0 0 0 4px rgba(245,108,108,0); }
+}
 .run-agent { flex: 1; color: #606266; cursor: pointer; }
 .run-detail-btn { font-size: 11px; color: #409eff; cursor: pointer; padding: 1px 6px;
   border: 1px solid #d9ecff; border-radius: 4px; background: #ecf5ff; flex-shrink: 0; }
