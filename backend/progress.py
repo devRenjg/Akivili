@@ -119,6 +119,48 @@ async def _set_done(task_id: int, note: str) -> bool:
     return True
 
 
+async def _advance_and_summarize_parent(parent_id: int) -> None:
+    """父任务全部子任务完成时调用：置 reviewing（幂等，作为一次性闸门）并唤醒负责人做统一汇总汇报。
+
+    只有当 _set_reviewing 真正发生状态迁移（in_progress→reviewing）时才唤醒负责人，
+    保证汇总只触发一次；若父任务已是 reviewing/done（人工已推进或已汇报过），不重复唤醒。
+    """
+    changed = await _set_reviewing(
+        parent_id, "全部子任务已完成，自动进入验证中，唤醒负责人汇总收尾")
+    if not changed:
+        return  # 已 reviewing/done：不重复唤醒汇总
+
+    db = await get_connection()
+    try:
+        parent = await (await db.execute(
+            "SELECT title, assignee_slug FROM tasks WHERE id=?", (parent_id,))).fetchone()
+        subs = await (await db.execute(
+            "SELECT id, title, assignee_slug FROM tasks WHERE parent_task_id=?", (parent_id,))).fetchall()
+    finally:
+        await db.close()
+    leader_slug = parent["assignee_slug"] if parent else ""
+    if not leader_slug:
+        return  # 无负责人（历史任务）：仅置 reviewing，不唤醒
+    parent_title = parent["title"] if parent else ""
+    sub_list = [dict(s) for s in subs]
+
+    import collab  # 延迟导入避免循环依赖
+    done_lines = "\n".join(
+        f"- 子任务#{s['id']}「{s['title']}」（负责人 {s['assignee_slug']}）：已完成"
+        for s in sub_list)
+    summary_prompt = (
+        f"任务：{parent_title}\n\n"
+        f"【收尾汇报环节】本任务的全部 {len(sub_list)} 个子任务都已完成，现在轮到你（负责人）做总结汇报。\n"
+        f"各子任务成果如下：\n{done_lines}\n\n"
+        f"请你：\n"
+        f"1) 逐个查看各子任务的成果（成员都已完成，**无需再派活/@任何人**）；\n"
+        f"2) 用 `jian comment` 写一段**统一汇总汇报**，把各成员的产出整合成一份完整交付"
+        f"（内容较长时先写入 .md 文件再用 `jian comment --body-file <文件>` 发，避免多行被截断）；\n"
+        f"3) 汇总汇报完成即可，**不要再 @ 任何人、不要再建子任务**——这是收尾，不是重新分配。")
+    # is_leader=True：注入协作协议+花名册；trigger=collaborate 表明是统筹收尾环节
+    await collab.enqueue_run(parent_id, leader_slug, summary_prompt, "collaborate", is_leader=True)
+
+
 async def on_execution_complete(task_id: int) -> None:
     """某任务的 run 执行成功后调用，处理执行完成后的状态流转（**绝不触发经验沉淀**）：
 
@@ -150,7 +192,8 @@ async def on_execution_complete(task_id: int) -> None:
         sub_ids = [r["id"] for r in subs]
         all_done = all(r["status"] == "done" for r in subs)
         if all_done and not await _has_pending_run([parent_id] + sub_ids):
-            await _set_reviewing(parent_id, "全部子任务已完成，自动进入验证中，等待人工验收")
+            # 父任务进「验证中」并唤醒负责人做统一汇总汇报（协同闭环收尾）
+            await _advance_and_summarize_parent(parent_id)
     else:
         # 顶层任务：有子任务的由子任务分支推进；此处只处理无子任务的独立任务
         db = await get_connection()
