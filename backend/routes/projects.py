@@ -17,6 +17,7 @@ class CreateProjectRequest(BaseModel):
     title: str
     local_path: str
     description: str = ""
+    git_url: str = ""
 
 
 class UpdateProjectRequest(BaseModel):
@@ -24,6 +25,7 @@ class UpdateProjectRequest(BaseModel):
     local_path: str | None = None
     description: str | None = None
     status: str | None = None
+    git_url: str | None = None
 
 
 @router.post("", dependencies=[Depends(require_admin)])
@@ -32,7 +34,8 @@ async def create_project(req: CreateProjectRequest):
         raise HTTPException(400, "项目标题不能为空")
     if not projects_mod.path_exists_dir(req.local_path):
         raise HTTPException(400, f"本地文件夹不存在：{req.local_path}")
-    proj = await projects_mod.create_project(req.title.strip(), req.local_path, req.description)
+    proj = await projects_mod.create_project(
+        req.title.strip(), req.local_path, req.description, req.git_url.strip())
     await _seed_leader(proj["id"])
     return proj
 

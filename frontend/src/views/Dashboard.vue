@@ -30,7 +30,8 @@
             {{ p.status === 'active' ? '进行中' : '已归档' }}
           </el-tag>
         </div>
-        <div class="proj-path" :title="p.local_path">📁 {{ p.local_path }}</div>
+        <a v-if="p.git_url" class="proj-git" :href="p.git_url" target="_blank" rel="noopener"
+           :title="p.git_url" @click.stop>🔗 {{ gitLabel(p.git_url) }}</a>
         <div class="proj-desc">{{ p.description || '（无描述）' }}</div>
         <div class="proj-foot">
           <span>👥 {{ p.agent_count }} 个 Agent</span>
@@ -51,6 +52,9 @@
                       placeholder="点右侧「浏览」选择一个已存在的文件夹" />
             <el-button class="akivili-ghost" :icon="FolderOpened" @click="pickerVisible = true">浏览</el-button>
           </div>
+        </el-form-item>
+        <el-form-item label="仓库链接（可选，展示用）">
+          <el-input v-model="form.git_url" placeholder="如 https://github.com/xxx/yyy" />
         </el-form-item>
         <el-form-item label="描述">
           <el-input v-model="form.description" type="textarea" :rows="2" placeholder="可选" />
@@ -79,10 +83,14 @@ const loading = ref(false)
 const createVisible = ref(false)
 const creating = ref(false)
 const pickerVisible = ref(false)
-const form = ref({ title: '', local_path: '', description: '' })
+const form = ref({ title: '', local_path: '', description: '', git_url: '' })
 
 function onPicked(path) {
   form.value.local_path = path
+}
+// 仓库链接精简显示：去协议、留 host/owner/repo
+function gitLabel(url) {
+  return (url || '').replace(/^https?:\/\//, '').replace(/\.git$/, '').replace(/\/$/, '')
 }
 
 const totalAgents = computed(() => projects.value.reduce((s, p) => s + (p.agent_count || 0), 0))
@@ -107,7 +115,7 @@ async function doCreate() {
     await projectsApi.create(form.value)
     ElMessage.success('已创建')
     createVisible.value = false
-    form.value = { title: '', local_path: '', description: '' }
+    form.value = { title: '', local_path: '', description: '', git_url: '' }
     await load()
   } catch (e) {
     ElMessage.error(e?.response?.data?.detail || e.message)
@@ -165,7 +173,9 @@ onMounted(load)
 .proj-card { cursor: pointer; }
 .proj-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
 .proj-title { font-weight: 600; font-size: 16px; }
-.proj-path { color: #909399; font-size: 12px; margin-bottom: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-git { display: block; color: #409eff; font-size: 12px; margin-bottom: 8px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; text-decoration: none; }
+.proj-git:hover { text-decoration: underline; }
 .proj-desc { color: #606266; font-size: 13px; min-height: 20px; margin-bottom: 10px; }
 .proj-foot { color: #606266; font-size: 13px; border-top: 1px solid #f0f0f0; padding-top: 8px; }
 .path-row { display: flex; gap: 8px; width: 100%; }

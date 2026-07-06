@@ -4,12 +4,12 @@ from pathlib import Path
 from database import get_connection
 
 
-async def create_project(title: str, local_path: str, description: str = "") -> dict:
+async def create_project(title: str, local_path: str, description: str = "", git_url: str = "") -> dict:
     db = await get_connection()
     try:
         cur = await db.execute(
-            "INSERT INTO projects (title, local_path, description) VALUES (?,?,?)",
-            (title, local_path, description),
+            "INSERT INTO projects (title, local_path, description, git_url) VALUES (?,?,?,?)",
+            (title, local_path, description, git_url),
         )
         await db.commit()
         pid = cur.lastrowid
@@ -42,7 +42,7 @@ async def get_project(pid: int) -> dict | None:
 
 
 async def update_project(pid: int, fields: dict) -> dict | None:
-    allowed = {"title", "local_path", "description", "status"}
+    allowed = {"title", "local_path", "description", "status", "git_url"}
     sets = {k: v for k, v in fields.items() if k in allowed and v is not None}
     if not sets:
         return await get_project(pid)

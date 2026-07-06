@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS projects (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     title       TEXT NOT NULL,
     local_path  TEXT NOT NULL,
+    git_url     TEXT DEFAULT '',            -- 仓库链接（展示用；本地目录仍是真实工作目录）
     description TEXT DEFAULT '',
     status      TEXT DEFAULT 'active',      -- active / archived
     created_at  TEXT DEFAULT (datetime('now')),
@@ -209,6 +210,11 @@ async def init_db() -> None:
 
 async def _migrate(db) -> None:
     """轻量迁移：为已存在的旧表补新列（CREATE TABLE IF NOT EXISTS 不会加列）。"""
+    # projects.git_url（仓库链接，展示用）
+    cur = await db.execute("PRAGMA table_info(projects)")
+    pjcols = {row[1] for row in await cur.fetchall()}
+    if "git_url" not in pjcols:
+        await db.execute("ALTER TABLE projects ADD COLUMN git_url TEXT DEFAULT ''")
     cur = await db.execute("PRAGMA table_info(project_agents)")
     cols = {row[1] for row in await cur.fetchall()}
     if "is_leader" not in cols:
