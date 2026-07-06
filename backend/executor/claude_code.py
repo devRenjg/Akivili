@@ -102,11 +102,14 @@ class ClaudeCodeBackend(ExecutorBackend):
                 proc.stdin.close()
             except (OSError, ValueError):
                 pass
+            # 本次 run 内维护 tool_use_id → 工具名 的映射：
+            # Claude 的 tool_result 块只带 tool_use_id、不带工具名，靠它回填出「Bash」等标签。
+            tool_names: dict[str, str] = {}
             for line in proc.stdout:
                 line = line.strip()
                 if not line:
                     continue
-                for ev in _parse_line(line):
+                for ev in _parse_line(line, tool_names):
                     loop.call_soon_threadsafe(queue.put_nowait, ev)
             err = proc.stderr.read()
             proc.wait()
@@ -131,14 +134,20 @@ class ClaudeCodeBackend(ExecutorBackend):
         yield ExecEvent("done")
 
 
-def _parse_line(line: str) -> list[ExecEvent]:
+def _parse_line(line: str, tool_names: dict | None = None) -> list[ExecEvent]:
     """解析一行 stream-json，返回 0..N 个 ExecEvent（一条消息可含文本+多次工具调用）。
 
     - assistant 消息：content[] 里 text→text 事件、thinking→thinking 事件、
       tool_use→tool 事件（保留工具名 + 完整 input，含 Bash 的实际命令）。
     - user 消息：content[] 里 tool_result→tool_result 事件（保留工具执行输出）。
     - result：结束标记。
+
+    tool_names: 跨行维护的 tool_use_id → 工具名 映射。tool_use 时登记，
+    tool_result 时按其 tool_use_id 回填工具名（Claude 的 tool_result 只带 id、
+    不带名字），使结果行也能显示「Bash」而非笼统的「结果」。
     """
+    if tool_names is None:
+        tool_names = {}
     try:
         obj = json.loads(line)
     except json.JSONDecodeError:
@@ -160,6 +169,9 @@ def _parse_line(line: str) -> list[ExecEvent]:
             elif ptype == "tool_use":
                 name = p.get("name", "") or "Tool"
                 inp = p.get("input") if isinstance(p.get("input"), dict) else {}
+                tid = p.get("id")
+                if tid:
+                    tool_names[tid] = name   # 登记 id→名，供后续 tool_result 回填
                 events.append(ExecEvent(
                     "tool", _tool_summary(name, inp), tool=name, tool_input=inp))
     elif t == "user":
@@ -170,7 +182,9 @@ def _parse_line(line: str) -> list[ExecEvent]:
                 if isinstance(p, dict) and p.get("type") == "tool_result":
                     out = _tool_result_text(p.get("content"))
                     if out:
-                        events.append(ExecEvent("tool_result", "", tool_output=out))
+                        # 按 tool_use_id 回填工具名（拿不到则留空，前端回退「结果」）
+                        name = tool_names.get(p.get("tool_use_id"), "")
+                        events.append(ExecEvent("tool_result", "", tool=name, tool_output=out))
     elif t == "result":
         events.append(ExecEvent("system", "执行完成"))
     return events
