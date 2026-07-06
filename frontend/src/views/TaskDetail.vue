@@ -27,12 +27,12 @@
             <el-button v-if="isAdmin && !isSubtask" text size="small" @click="openAddSub">+ 新增</el-button>
           </div>
           <div v-for="s in subtasks" :key="s.id" class="td-sub-row" @click="openTask(s.id)">
-            <span class="sub-dot" :class="`st-${s.status}`"
+            <span class="sub-dot" :class="`st-${subEffectiveStatus(s)}`"
                   :title="isAdmin ? '点击控制（暂停/重跑）' : ''"
                   @click.stop="isAdmin && onDotClick(s)">●</span>
             <AgentAvatar :agent="subAgent(s)" :size="20" class="sub-av" />
             <span class="sub-title">{{ s.title }}</span>
-            <span class="sub-status">{{ statusLabel(s.status) }}</span>
+            <span class="sub-status">{{ statusLabel(subEffectiveStatus(s)) }}</span>
             <span class="sub-arrow">›</span>
           </div>
           <div v-if="subtasks.length === 0" class="td-empty">暂无子任务</div>
@@ -300,6 +300,16 @@ function msgName(it) {
 
 function dName(a) { return displayName(a) }
 function statusLabel(s) { return STATUS_LABEL[s] || s }
+// 子任务有效状态：若其在 run_queue 里还有 running/queued 的 run（正在执行/重跑），
+// 一律按「进行中」展示，而非其残留的 done/失败旧状态。
+function subEffectiveStatus(s) {
+  const running = progress.value.running || []
+  const queued = progress.value.queued || []
+  if (running.some((r) => r.task_id === s.id) || queued.some((r) => r.task_id === s.id)) {
+    return 'in_progress'
+  }
+  return s.status
+}
 function priorityLabel(p) { return PRIORITY_LABEL[p] || p }
 function shortTime(t) { return (t || '').slice(5, 16) }
 function assigneeName() {
@@ -346,13 +356,15 @@ function toggleFoldAll() {
 function openTask(id) { if (id && id !== taskId) router.push(`/projects/${pid}/tasks/${id}`) }
 
 // 子任务状态点：进行中→暂停(kill该任务在跑的run)；失败/阻塞→重跑(唤醒owner)
+// 用有效状态：正在跑/重跑（含 done 后被重新触发）一律按进行中处理，可暂停。
 async function onDotClick(s) {
-  if (s.status === 'in_progress') {
+  const st = subEffectiveStatus(s)
+  if (st === 'in_progress') {
     await pauseTask(s.id)
-  } else if (s.status === 'failed' || s.status === 'blocked' || s.status === 'backlog') {
+  } else if (st === 'failed' || st === 'blocked' || st === 'backlog') {
     await rerunTask(s.id)
   } else {
-    ElMessage.info(`子任务当前为「${statusLabel(s.status)}」，无需操作`)
+    ElMessage.info(`子任务当前为「${statusLabel(st)}」，无需操作`)
   }
 }
 async function pauseTask(tid) {
@@ -364,8 +376,12 @@ async function pauseTask(tid) {
   } catch (e) { ElMessage.error('暂停失败：' + e.message) }
 }
 async function rerunTask(tid) {
-  try { await runsApi.autoDispatch(tid); ElMessage.success('已重新触发执行'); await refreshLite() }
-  catch (e) { ElMessage.error(e?.response?.data?.detail || '重跑失败') }
+  try {
+    await runsApi.autoDispatch(tid)
+    ElMessage.success('已重新触发执行')
+    await refreshLite()
+    startPolling()   // 重跑后开始轮询，子任务状态实时刷新为「进行中」直至完成
+  } catch (e) { ElMessage.error(e?.response?.data?.detail || '重跑失败') }
 }
 // 执行日志区 run 状态点
 async function onRunDot(r) {
