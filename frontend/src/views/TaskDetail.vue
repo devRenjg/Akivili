@@ -57,7 +57,7 @@
             </div>
             <!-- 消息：聊天气泡（头像 + 昵称 + 可折叠内容） -->
             <div v-else class="chat-row" :class="{ mine: it.role === 'user' }">
-              <AgentAvatar :agent="msgAgent(it)" :size="34" class="chat-av" />
+              <AgentAvatar :agent="msgAgent(it)" :size="26" class="chat-av" />
               <div class="chat-main">
                 <div class="chat-name" @click="toggleFold(i)">
                   <span class="fold-caret">{{ isFolded(i) ? '▸' : '▾' }}</span>
@@ -70,7 +70,7 @@
           </template>
           <!-- 流式执行中气泡 -->
           <div v-if="streaming" class="chat-row">
-            <AgentAvatar :agent="currentAgent" :size="34" class="chat-av" />
+            <AgentAvatar :agent="currentAgent" :size="26" class="chat-av" />
             <div class="chat-main">
               <div class="chat-name">{{ currentAgentName }} <span class="running">⚙️ 执行中…</span></div>
               <div class="chat-bubble">{{ streamText || '思考中…' }}</div>
@@ -591,10 +591,12 @@ onUnmounted(stopPolling)
 .chat-name { font-size: 12px; color: #909399; margin-bottom: 4px; }
 .chat-row.mine .chat-name { text-align: right; }
 .chat-time { color: #c0c4cc; margin-left: 8px; font-size: 11px; }
-.chat-bubble { white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 14px;
-  padding: 10px 14px; border-radius: 10px; background: #f5f7fa; color: #303133; }
+.chat-bubble { white-space: pre-wrap; word-break: break-word; line-height: 1.65; font-size: 13px;
+  padding: 8px 12px; border-radius: 10px; background: #f5f7fa; color: #303133; }
 /* 含 Markdown 渲染时由 MarkdownView 自行排版，取消父级 pre-wrap 以免多余空白 */
 .chat-bubble:has(.md-body) { white-space: normal; }
+/* 气泡内 Markdown 字号与气泡一致（组件默认 14px，这里统一到 13px） */
+.chat-bubble :deep(.md-body) { font-size: 13px; }
 .chat-row.mine .chat-bubble { background: #ecf3ff; }
 .running { color: #e6a23c; margin-left: 6px; }
 .tools { margin-top: 6px; }
