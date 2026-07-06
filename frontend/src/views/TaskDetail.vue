@@ -555,9 +555,9 @@ onUnmounted(stopPolling)
 .td-main { flex: 1; min-width: 0; }
 .td-side { width: 300px; flex-shrink: 0; }
 .td-title { font-size: 24px; font-weight: 700; margin: 0 0 12px; }
-.td-desc { background: #f5f7fa; border-radius: 8px; padding: 14px 16px; font-size: 16px;
+.td-desc { background: #f5f7fa; border-radius: 8px; padding: 14px 16px; font-size: 14px;
   line-height: 1.7; color: #303133; margin-bottom: 20px; }
-.td-desc :deep(.md-body) { font-size: 16px; }
+.td-desc :deep(.md-body) { font-size: 14px; }
 .td-section { margin-bottom: 20px; }
 .td-sec-head { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; margin-bottom: 10px; }
 .td-sub-progress { font-size: 12px; color: #909399; }
@@ -592,12 +592,12 @@ onUnmounted(stopPolling)
 .chat-name { font-size: 12px; color: #909399; margin-bottom: 4px; }
 .chat-row.mine .chat-name { text-align: right; }
 .chat-time { color: #c0c4cc; margin-left: 8px; font-size: 11px; }
-.chat-bubble { white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 16px;
+.chat-bubble { white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 14px;
   padding: 10px 14px; border-radius: 10px; background: #f5f7fa; color: #303133; }
 /* 含 Markdown 渲染时由 MarkdownView 自行排版，取消父级 pre-wrap 以免多余空白 */
 .chat-bubble:has(.md-body) { white-space: normal; }
-/* 气泡内正文（含 Markdown）字号：正文是阅读主体，16px；头像/昵称保持小 */
-.chat-bubble :deep(.md-body) { font-size: 16px; }
+/* 气泡内正文（含 Markdown）字号与气泡一致 14px；头像/昵称保持小 */
+.chat-bubble :deep(.md-body) { font-size: 14px; }
 .chat-row.mine .chat-bubble { background: #ecf3ff; }
 .running { color: #e6a23c; margin-left: 6px; }
 .tools { margin-top: 6px; }
