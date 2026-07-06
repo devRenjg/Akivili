@@ -50,17 +50,22 @@ async def _load_task_and_agent(task_id: int, override_slug: str):
         await db.close()
 
 
-@router.post("/tasks/{task_id}/dispatch", dependencies=[Depends(require_admin)])
-async def dispatch(task_id: int, req: DispatchRequest, request: Request):
+@router.post("/tasks/{task_id}/dispatch")
+async def dispatch(task_id: int, req: DispatchRequest, request: Request,
+                   user: dict = Depends(require_admin)):
     task, agent = await _load_task_and_agent(task_id, req.assignee_slug)
     if not task:
         raise HTTPException(404, "任务不存在")
     if not agent:
         raise HTTPException(400, "任务未指定有效负责人，请先 @ 一位团队成员或为任务设负责人")
 
+    # thread 里人手输入的指令：落成 user 消息，署当前登录用户名
+    user_name = user.get("username", "")
+
     async def event_stream():
         try:
-            async for ev in runner.execute_dispatch(task, agent, req.prompt):
+            async for ev in runner.execute_dispatch(task, agent, req.prompt,
+                                                     persist_user_msg=True, user_name=user_name):
                 if await request.is_disconnected():
                     break
                 payload = {"type": ev.type, "text": ev.text, "meta": ev.meta}
@@ -133,7 +138,8 @@ async def auto_dispatch(task_id: int):
 
     async def _run_bg():
         try:
-            async for _ in runner.execute_dispatch(task, agent, prompt):
+            # prompt 来自任务描述（非真人在 thread 输入），不落 user 消息避免以「我」复述任务
+            async for _ in runner.execute_dispatch(task, agent, prompt, persist_user_msg=False):
                 pass
         except Exception:  # noqa: BLE001
             pass

@@ -57,8 +57,14 @@ async def timeline(task_id: int) -> list[dict]:
         msgs = []
         if conv and conv["conversation_id"]:
             msgs = await (await db.execute(
-                "SELECT role, content, author_slug, created_at FROM messages WHERE conversation_id=? ORDER BY id",
+                "SELECT role, content, author_slug, author_name, created_at FROM messages "
+                "WHERE conversation_id=? ORDER BY id",
                 (conv["conversation_id"],))).fetchall()
+        # 任务创建者名（供无 author_name 的历史 user 消息回退显示）
+        crow = await (await db.execute(
+            "SELECT actor_name FROM activities WHERE task_id=? AND action='created' AND actor_type='user' "
+            "ORDER BY id LIMIT 1", (task_id,))).fetchone()
+        creator_name = (crow["actor_name"] if crow else "") or ""
     finally:
         await db.close()
 
@@ -79,10 +85,13 @@ async def timeline(task_id: int) -> list[dict]:
         })
     for m in msgs:
         author = member_author(slug=m["author_slug"] or "") if m["role"] != "user" else None
+        # user 消息的发送者名：优先存的 author_name，其次回退任务创建者
+        user_name = (m["author_name"] or "").strip() or creator_name if m["role"] == "user" else ""
         items.append({
             "kind": "message",
             "role": m["role"], "content": m["content"],
             "author_slug": m["author_slug"] or "", "author": author,
+            "user_name": user_name,
             "created_at": to_beijing(m["created_at"]),
         })
     # 按时间排序（created_at 已转北京时间，同格式字符串，可直接比较）

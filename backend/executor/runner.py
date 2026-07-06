@@ -280,11 +280,19 @@ async def run_oneshot(provider_id: str, system_prompt: str, prompt: str,
     return "".join(collected).strip()
 
 
-async def execute_dispatch(task: dict, agent: dict, prompt: str):
+async def execute_dispatch(task: dict, agent: dict, prompt: str,
+                           persist_user_msg: bool = True, user_name: str = ""):
     """完整执行闭环，异步生成器逐个 yield ExecEvent。
 
     task: tasks 行；agent: project_agents 行（含 slug/persona/provider 解析）。
     落库：user 消息、assistant 消息、run、run_logs；收工写记忆；维护 run 状态。
+
+    persist_user_msg: 是否把 prompt 作为一条「用户消息」落库并进时间线。
+      - True（默认）：thread 里人手输入的 @ 指令 —— 是真人说的话，应展示。
+      - False：auto-dispatch / 协同唤醒时，prompt 是**机器合成的派活指令**
+        （任务简报/成员指令），不是人说的；落成 user 消息会变成「以我的名义
+        重复复述任务」的噪声，故不落库（仍作为本轮 prompt 喂给 Agent 执行）。
+    user_name: 落 user 消息时记录的发送者名（登录用户名），供时间线按人显示。
     """
     from executor.base import ExecEvent
 
@@ -295,15 +303,25 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str):
 
     db = await get_connection()
     try:
-        # 落库用户指令
-        ucur = await db.execute(
-            "INSERT INTO messages (conversation_id, role, content) VALUES (?,?,?)",
-            (conv_id, "user", prompt))
-        user_msg_id = ucur.lastrowid   # 本轮起点：之后该 Agent 的发言才算本轮产出
-        # 取会话历史（回灌，恢复上下文）
-        rows = await (await db.execute(
-            "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id", (conv_id,))).fetchall()
-        history = [{"role": r["role"], "content": r["content"]} for r in rows[:-1]]  # 不含刚插入的本轮
+        if persist_user_msg:
+            # 人手输入的指令：落成 user 消息（带发送者名），进时间线展示
+            ucur = await db.execute(
+                "INSERT INTO messages (conversation_id, role, content, author_name) VALUES (?,?,?,?)",
+                (conv_id, "user", prompt, user_name or ""))
+            user_msg_id = ucur.lastrowid   # 本轮起点：之后该 Agent 的发言才算本轮产出
+            # 取会话历史（回灌，恢复上下文），不含刚插入的本轮
+            rows = await (await db.execute(
+                "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id", (conv_id,))).fetchall()
+            history = [{"role": r["role"], "content": r["content"]} for r in rows[:-1]]
+        else:
+            # 机器合成的派活指令：不落 user 消息（否则时间线会以「我」名义重复复述任务）。
+            # 本轮起点取当前最大消息 id，之后该 Agent 的发言才算本轮产出。
+            rows = await (await db.execute(
+                "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id", (conv_id,))).fetchall()
+            history = [{"role": r["role"], "content": r["content"]} for r in rows]
+            mrow = await (await db.execute(
+                "SELECT COALESCE(MAX(id), 0) AS mid FROM messages WHERE conversation_id=?", (conv_id,))).fetchone()
+            user_msg_id = mrow["mid"]
         # 建 run
         cur = await db.execute(
             "INSERT INTO task_runs (task_id, conversation_id, agent_slug, provider_id, status) VALUES (?,?,?,?, 'running')",

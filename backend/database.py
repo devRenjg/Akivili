@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS messages (
     conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     role            TEXT NOT NULL,          -- user / assistant / system / tool
     content         TEXT DEFAULT '',
-    author_slug     TEXT DEFAULT '',        -- 发言作者的成员 slug（assistant 消息用；user 消息为空=管理员）
+    author_slug     TEXT DEFAULT '',        -- 发言作者的成员 slug（assistant 消息用）
+    author_name     TEXT DEFAULT '',        -- user 消息的发送者名（登录用户名，供时间线按人显示）
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -239,6 +240,8 @@ async def _migrate(db) -> None:
     mcols = {row[1] for row in await cur.fetchall()}
     if "author_slug" not in mcols:
         await db.execute("ALTER TABLE messages ADD COLUMN author_slug TEXT DEFAULT ''")
+    if "author_name" not in mcols:
+        await db.execute("ALTER TABLE messages ADD COLUMN author_name TEXT DEFAULT ''")
     # run_logs 结构化工具字段（用于「日志详情」还原命令与运行时详情）
     cur = await db.execute("PRAGMA table_info(run_logs)")
     rlcols = {row[1] for row in await cur.fetchall()}

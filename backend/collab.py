@@ -380,7 +380,8 @@ async def _run_one(item: dict) -> None:
     had_error = {"v": False}
 
     async def _consume():
-        async for ev in runner.execute_dispatch(task, agent, prompt):
+        # prompt 是机器合成的派活/统筹指令（非真人输入），不落 user 消息，避免时间线以「我」复述任务
+        async for ev in runner.execute_dispatch(task, agent, prompt, persist_user_msg=False):
             if ev.type == "system" and ev.meta.get("run_id"):
                 run_id_box["id"] = ev.meta["run_id"]
             elif ev.type == "text":

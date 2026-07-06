@@ -276,13 +276,14 @@ const currentAgentName = computed(() => {
   return a ? dName(a) : '负责人'
 })
 
-// 聊天气泡：解析一条消息的发言人（后端已带 author；user 消息=当前登录管理员）
+// 聊天气泡：解析一条消息的发言人。user 消息用后端返回的实际发送者名（user_name，
+// 即当时发消息的人/任务创建者），而非当前查看者登录名；缺省回退「用户」。
 function msgAgent(it) {
-  if (it.role === 'user') return { name: userName.value, emoji: '👤' }
+  if (it.role === 'user') return { name: it.user_name || userName.value || '用户', emoji: '👤' }
   return it.author || team.value.find((x) => x.slug === it.author_slug) || { name: 'Agent', emoji: '🤖' }
 }
 function msgName(it) {
-  if (it.role === 'user') return userName.value
+  if (it.role === 'user') return it.user_name || userName.value || '用户'
   const a = it.author || team.value.find((x) => x.slug === it.author_slug)
   return a ? displayName(a) : '成员'
 }
