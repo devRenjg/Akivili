@@ -57,7 +57,7 @@
           <el-button v-if="isAdmin" text size="small" @click="openProfile(a)">资料</el-button>
           <el-button v-if="isAdmin && !a.is_leader" text size="small" @click="makeLeader(a)">设为负责人</el-button>
           <el-button text size="small" @click="openPersona(a)">{{ isAdmin ? '改造人格' : '查看人格' }}</el-button>
-          <el-button text size="small" @click="openMemory(a)">{{ isAdmin ? '记忆' : '查看记忆' }}</el-button>
+          <el-button v-if="isAdmin" text size="small" @click="openMemory(a)">记忆</el-button>
         </div>
       </el-card>
       <el-empty v-if="!loading && team.length === 0" description="还没有人才加入，从库导入或自建" />

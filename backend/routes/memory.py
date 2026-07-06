@@ -17,8 +17,9 @@ class AppendMemoryRequest(BaseModel):
     text: str
 
 
-@router.get("/{slug}")
+@router.get("/{slug}", dependencies=[Depends(require_admin)])
 async def read_memory(slug: str):
+    # 记忆含角色沉淀的工作经验与上下文，仅管理员可见；访客/非管理员一律 403（守卫在装饰器）
     try:
         return {"slug": slug, "content": memory_mod.read_memory(slug)}
     except ValueError as e:
