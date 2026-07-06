@@ -158,9 +158,17 @@
           </div>
           <div v-for="r in runs" :key="r.id" class="run-item">
             <div class="run-head">
-              <span class="run-status" :class="`rs-${r.status}`"
-                    :title="runDotTitle(r)"
-                    @click.stop="isAdmin && onRunDot(r)">{{ runStatusLabel(r.status) }}</span>
+              <!-- 执行中：红色圆形按钮，点击终止；其余状态为对应图标标记 -->
+              <button v-if="r.status === 'running'" class="run-ctrl running"
+                      :title="isAdmin ? '点击终止执行' : '执行中'"
+                      :disabled="!isAdmin" @click.stop="isAdmin && onRunDot(r)">▶</button>
+              <button v-else-if="r.status === 'failed'" class="run-ctrl failed"
+                      :title="isAdmin ? '点击重新执行' : '执行失败'"
+                      :disabled="!isAdmin" @click.stop="isAdmin && onRunDot(r)">✗</button>
+              <button v-else-if="r.status === 'killed'" class="run-ctrl killed"
+                      :title="isAdmin ? '已终止 · 点击重新执行' : '已终止'"
+                      :disabled="!isAdmin" @click.stop="isAdmin && onRunDot(r)">■</button>
+              <span v-else class="run-ctrl succeeded" title="已完成">✓</span>
               <span class="run-agent" @click="openTranscript(r)">{{ agentDisplayBySlug(r.agent_slug) }}</span>
               <span class="run-detail-btn" title="查看所有命令与运行时详情"
                     @click.stop="openTranscript(r)">日志详情</span>
@@ -284,9 +292,6 @@ function msgName(it) {
 function dName(a) { return displayName(a) }
 function statusLabel(s) { return STATUS_LABEL[s] || s }
 function priorityLabel(p) { return PRIORITY_LABEL[p] || p }
-function runStatusLabel(s) {
-  return { running: '⚙️ 执行中', succeeded: '✓ 完成', failed: '✗ 失败', killed: '■ 终止' }[s] || s
-}
 function shortTime(t) { return (t || '').slice(5, 16) }
 function assigneeName() {
   const a = team.value.find((x) => x.slug === task.value?.assignee_slug)
@@ -354,14 +359,8 @@ async function rerunTask(tid) {
   catch (e) { ElMessage.error(e?.response?.data?.detail || '重跑失败') }
 }
 // 执行日志区 run 状态点
-function runDotTitle(r) {
-  if (!isAdmin) return ''
-  if (r.status === 'running') return '点击暂停此次执行'
-  if (r.status === 'failed' || r.status === 'killed') return '点击在该任务上重新执行'
-  return ''
-}
 async function onRunDot(r) {
-  if (r.status === 'running') { await runsApi.kill(r.id); ElMessage.info('已发送暂停信号') }
+  if (r.status === 'running') { await runsApi.kill(r.id); ElMessage.info('已发送终止信号') }
   else if (r.status === 'failed' || r.status === 'killed') { await rerunTask(r.task_id || taskId) }
 }
 async function onPauseAgent(r) {
@@ -579,9 +578,20 @@ onUnmounted(stopPolling)
 .side-ctrl { flex: 1; }
 .side-val { font-size: 13px; color: #303133; }
 .run-item { border: 1px solid #ebeef5; border-radius: 8px; margin-bottom: 8px; background: #fff; }
-.run-head { display: flex; align-items: center; gap: 8px; padding: 9px 12px; cursor: pointer; font-size: 12px; }
-.run-status { font-weight: 600; cursor: pointer; }
-.rs-running { color: #e6a23c; } .rs-succeeded { color: #67c23a; } .rs-failed { color: #f56c6c; } .rs-killed { color: #909399; }
+.run-head { display: flex; align-items: center; gap: 8px; padding: 9px 12px; font-size: 12px; }
+/* 执行状态标记：统一 18px 圆形 */
+.run-ctrl { width: 18px; height: 18px; flex-shrink: 0; border: none; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 10px;
+  line-height: 1; padding: 0; color: #fff; }
+.run-ctrl.running { background: #f56c6c; cursor: pointer; padding-left: 1px; /* ▶ 视觉居中 */ }
+.run-ctrl.running:hover { background: #f23c3c; box-shadow: 0 0 0 3px rgba(245,108,108,.2); }
+.run-ctrl.running:disabled { cursor: default; box-shadow: none; }
+.run-ctrl.killed { background: #303133; border-radius: 3px; cursor: pointer; font-size: 9px; }
+.run-ctrl.killed:hover { background: #000; }
+.run-ctrl.failed { background: #f56c6c; cursor: pointer; }
+.run-ctrl.failed:hover { background: #f23c3c; }
+.run-ctrl.succeeded { background: #67c23a; }
+.run-ctrl:disabled { cursor: default; }
 .run-agent { flex: 1; color: #606266; cursor: pointer; }
 .run-detail-btn { font-size: 11px; color: #409eff; cursor: pointer; padding: 1px 6px;
   border: 1px solid #d9ecff; border-radius: 4px; background: #ecf5ff; flex-shrink: 0; }
