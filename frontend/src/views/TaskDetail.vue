@@ -49,15 +49,15 @@
           <template v-for="(it, i) in timeline" :key="i">
             <!-- 活动：细行 + 小头像 -->
             <div v-if="it.kind === 'activity'" class="tl-activity">
-              <AgentAvatar v-if="it.author" :agent="it.author" :size="18" class="tl-av" />
-              <AgentAvatar v-else-if="it.actor_type === 'user'" :agent="activityUserAvatar(it)" :size="18" class="tl-av" />
+              <AgentAvatar v-if="it.author" :agent="it.author" :size="20" class="tl-av" />
+              <AgentAvatar v-else-if="it.actor_type === 'user'" :agent="activityUserAvatar(it)" :size="20" class="tl-av" />
               <span v-else class="tl-actor-ic">⚙️</span>
               <span class="tl-text">{{ activityText(it) }}</span>
               <span class="tl-time">{{ shortTime(it.created_at) }}</span>
             </div>
             <!-- 消息：聊天气泡（头像 + 昵称 + 可折叠内容） -->
             <div v-else class="chat-row" :class="{ mine: it.role === 'user' }">
-              <AgentAvatar :agent="msgAgent(it)" :size="26" class="chat-av" />
+              <AgentAvatar :agent="msgAgent(it)" :size="20" class="chat-av" />
               <div class="chat-main">
                 <div class="chat-name" @click="toggleFold(i)">
                   <span class="fold-caret">{{ isFolded(i) ? '▸' : '▾' }}</span>
@@ -70,7 +70,7 @@
           </template>
           <!-- 流式执行中气泡 -->
           <div v-if="streaming" class="chat-row">
-            <AgentAvatar :agent="currentAgent" :size="26" class="chat-av" />
+            <AgentAvatar :agent="currentAgent" :size="20" class="chat-av" />
             <div class="chat-main">
               <div class="chat-name">{{ currentAgentName }} <span class="running">⚙️ 执行中…</span></div>
               <div class="chat-bubble">{{ streamText || '思考中…' }}</div>
@@ -580,7 +580,7 @@ onUnmounted(stopPolling)
 .chat-bubble.folded { color: #909399; font-style: italic; cursor: pointer; background: #fafafa; }
 .tl-activity { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 12px; color: #909399; }
 .tl-av { flex-shrink: 0; }
-.tl-actor-ic { width: 18px; text-align: center; flex-shrink: 0; font-size: 13px; }
+.tl-actor-ic { width: 20px; text-align: center; flex-shrink: 0; font-size: 13px; }
 .tl-text { flex: 1; }
 .tl-time { font-size: 11px; color: #c0c4cc; }
 /* 聊天气泡 */
