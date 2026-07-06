@@ -11,7 +11,9 @@
         <div class="tr-actions">
           <el-select v-if="toolOptions.length" v-model="selectedTools" multiple collapse-tags
                      collapse-tags-tooltip placeholder="筛选" size="small" class="tr-filter">
-            <el-option v-for="o in toolOptions" :key="o.value" :value="o.value" :label="o.label" />
+            <el-option v-for="o in toolOptions" :key="o.value" :value="o.value" :label="o.label">
+              <span class="tr-opt"><span class="tr-opt-dot" :class="`seg-${o.color}`"></span>{{ o.label }}</span>
+            </el-option>
           </el-select>
           <el-button size="small" text @click="toggleSort">
             {{ sortDir === 'asc' ? '⬇ 时间正序' : '⬆ 最新在上' }}
@@ -127,7 +129,11 @@ function labelOf(it) {
   if (it.channel === 'thinking') return '思考'
   if (it.channel === 'stderr') return '错误'
   if (it.channel === 'system') return '系统'
-  return ''   // 助手发言：不加标签（正文即内容，无需「发言」赘字）
+  return ''   // 助手发言：行内不加标签（正文即内容，无需「发言」赘字）
+}
+// 筛选下拉用：所有类型都要有名字（助手发言→「发言」），避免出现空名选项
+function filterLabel(it) {
+  return labelOf(it) || '发言'
 }
 function summaryOf(it) {
   if (it.channel === 'tool') {
@@ -184,14 +190,10 @@ function detailOf(it) {
 const toolOptions = computed(() => {
   const seen = new Map()
   for (const it of items.value) {
-    if (it.channel === 'tool' || it.channel === 'tool_result') {
-      const v = `tool:${it.tool || ''}`
-      if (!seen.has(v)) seen.set(v, `${labelOf(it)}`)
-    } else if (!seen.has(it.channel)) {
-      seen.set(it.channel, labelOf(it))
-    }
+    const v = (it.channel === 'tool' || it.channel === 'tool_result') ? `tool:${it.tool || ''}` : it.channel
+    if (!seen.has(v)) seen.set(v, { value: v, label: filterLabel(it), color: colorOf(it) })
   }
-  return Array.from(seen.entries()).map(([value, label]) => ({ value, label }))
+  return Array.from(seen.values())
 })
 function keyOf(it) {
   return (it.channel === 'tool' || it.channel === 'tool_result') ? `tool:${it.tool || ''}` : it.channel
@@ -285,6 +287,9 @@ function copyAll() {
 .tr-badge { flex-shrink: 0; min-width: 64px; text-align: center; font-size: 11px; font-weight: 600;
   padding: 2px 6px; border-radius: 4px; margin-top: 1px; }
 .tr-caret { flex-shrink: 0; width: 12px; color: #c0c4cc; margin-top: 2px; font-size: 11px; }
+/* 筛选下拉选项：左侧色点 + 名称 */
+.tr-opt { display: inline-flex; align-items: center; gap: 7px; }
+.tr-opt-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .badge-agent { background: #f0f9eb; color: #529b2e; }
 .badge-thinking { background: #f3e8ff; color: #7c3aed; }
 .badge-tool { background: #ecf5ff; color: #2563eb; }
