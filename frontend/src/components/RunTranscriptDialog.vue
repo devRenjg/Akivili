@@ -1,5 +1,5 @@
 <template>
-  <el-dialog v-model="visible" class="transcript-dialog akivili-dialog" append-to-body
+  <el-dialog v-model="visible" class="transcript-dialog" append-to-body
              :width="'90%'" top="4vh" :show-close="false" @open="onOpen">
     <template #header>
       <div class="tr-header">
@@ -221,21 +221,30 @@ function copyAll() {
 </script>
 
 <style scoped>
+/* 明亮主题弹窗：头部浅灰底、深色文字，保证标题栏清晰可读 */
+.transcript-dialog :deep(.el-dialog) { border-radius: 12px; overflow: hidden; }
+.transcript-dialog :deep(.el-dialog__header) {
+  margin: 0; padding: 14px 20px; background: #f5f7fa; border-bottom: 1px solid #e4e7ed;
+}
+.transcript-dialog :deep(.el-dialog__body) { padding: 16px 20px; }
 .tr-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .tr-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.tr-bot { font-size: 16px; }
-.tr-name { font-weight: 600; font-size: 15px; color: #303133; }
-.tr-status { font-size: 12px; padding: 1px 8px; border-radius: 10px; background: #f0f2f5; }
+.tr-bot { font-size: 18px; }
+.tr-name { font-weight: 700; font-size: 16px; color: #1d2129; }
+.tr-status { font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 10px;
+  background: #e9ebf0; color: #4e5969; }
 .trs-running { color: #e6a23c; background: #fdf6ec; }
 .trs-succeeded { color: #67c23a; background: #f0f9eb; }
 .trs-failed { color: #f56c6c; background: #fef0f0; }
 .trs-killed { color: #909399; }
 .tr-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
+.tr-actions :deep(.el-button) { color: #4e5969; }
+.tr-actions :deep(.el-button:hover) { color: #2563eb; }
 .tr-filter { width: 160px; }
 .tr-body { height: 78vh; display: flex; flex-direction: column; }
 .tr-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-.tr-chip { font-size: 11px; color: #909399; background: #f5f7fa; border: 1px solid #ebeef5;
-  border-radius: 6px; padding: 1px 8px; }
+.tr-chip { font-size: 12px; color: #4e5969; background: #f0f2f5; border: 1px solid #e4e7ed;
+  border-radius: 6px; padding: 2px 9px; }
 .tr-bar { display: flex; gap: 2px; height: 18px; border-radius: 4px; overflow: hidden; margin-bottom: 12px; }
 .tr-seg { height: 100%; border: none; cursor: pointer; min-width: 3px; transition: opacity .15s; }
 .tr-seg:hover { opacity: .75; }
@@ -257,7 +266,7 @@ function copyAll() {
 .badge-result { background: #f4f4f5; color: #909399; }
 .badge-error { background: #fef0f0; color: #f56c6c; }
 .badge-system { background: #fdf6ec; color: #b88230; }
-.tr-summary { flex: 1; font-size: 12px; color: #606266; min-width: 0; word-break: break-word;
+.tr-summary { flex: 1; font-size: 12.5px; color: #4e5969; min-width: 0; word-break: break-word;
   font-family: 'Consolas', monospace; line-height: 1.5; }
 .tr-summary.err { color: #f56c6c; }
 .tr-seq { flex-shrink: 0; font-size: 10px; color: #c0c4cc; margin-top: 2px; }
