@@ -140,8 +140,12 @@ function summaryOf(it) {
   return firstLine.length > 140 ? firstLine.slice(0, 140) + '…' : firstLine
 }
 function hasDetail(it) {
-  // tool：展开看完整入参 JSON（与命令行摘要不同，保留）
-  if (it.channel === 'tool') return it.tool_input && Object.keys(it.tool_input).length > 0
+  // tool：展开看完整入参（命令/参数）+ 运行结果（codex 把输出挂在同一事件上）。
+  // 摘要只显示命令行首段，展开能看到完整参数与输出 → 有额外信息就展开。
+  if (it.channel === 'tool') {
+    const hasInput = it.tool_input && Object.keys(it.tool_input).length > 0
+    return hasInput || !!(it.tool_output || '').trim()
+  }
   // tool_result：仅当完整输出比摘要更长（多行/被截断）才值得展开
   if (it.channel === 'tool_result') {
     const o = it.tool_output || ''
@@ -153,7 +157,20 @@ function hasDetail(it) {
   return c.length > 0 && c.trim() !== (summaryOf(it) || '').trim()
 }
 function detailOf(it) {
-  if (it.channel === 'tool') return redactSecrets(JSON.stringify(it.tool_input || {}, null, 2))
+  if (it.channel === 'tool') {
+    // 命令/参数 + 运行结果 都展示（缺哪块跳过哪块），别漏掉工具的输出
+    const blocks = []
+    const inp = it.tool_input || {}
+    if (Object.keys(inp).length > 0) {
+      blocks.push('▸ 命令 / 参数\n' + redactSecrets(JSON.stringify(inp, null, 2)))
+    }
+    const out = (it.tool_output || '').trim()
+    if (out) {
+      const clipped = out.length > 8000 ? out.slice(0, 8000) + '\n… (已截断)' : out
+      blocks.push('▸ 运行结果\n' + redactSecrets(clipped))
+    }
+    return blocks.join('\n\n')
+  }
   if (it.channel === 'tool_result') {
     const o = it.tool_output || ''
     return o.length > 8000 ? redactSecrets(o.slice(0, 8000)) + '\n… (已截断)' : redactSecrets(o)
