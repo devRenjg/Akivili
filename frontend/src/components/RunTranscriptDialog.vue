@@ -50,7 +50,7 @@
             <span v-if="hasDetail(it)" class="tr-caret">{{ open[it.seq] ? '▾' : '▸' }}</span>
             <span v-if="labelOf(it)" class="tr-badge" :class="`badge-${colorOf(it)}`">{{ labelOf(it) }}</span>
             <span class="tr-summary" :class="{ err: it.channel === 'stderr' }">{{ summaryOf(it) || '（空）' }}</span>
-            <span class="tr-seq">#{{ it.seq }}</span>
+            <span class="tr-time" :title="it.ts">{{ clockTime(it.ts) }}</span>
           </div>
           <div v-if="open[it.seq] && hasDetail(it)" class="tr-detail">
             <pre class="tr-pre" :class="{ err: it.channel === 'stderr' }">{{ detailOf(it) }}</pre>
@@ -92,6 +92,8 @@ const rowRefs = new Map()
 const STATUS_LABEL = { running: '⚙️ 执行中', succeeded: '✓ 完成', failed: '✗ 失败', killed: '■ 终止' }
 function statusLabel(s) { return STATUS_LABEL[s] || s || '' }
 function shortTime(t) { return (t || '').slice(5, 16) }
+// 每条事件的执行时刻（北京时间 HH:MM:SS）；ts 形如 'YYYY-MM-DD HH:MM:SS'
+function clockTime(t) { return (t || '').slice(11, 19) }
 
 async function onOpen() {
   if (!props.runId) return
@@ -292,7 +294,8 @@ function copyAll() {
 .tr-summary { flex: 1; font-size: 12.5px; color: #4e5969; min-width: 0; word-break: break-word;
   font-family: 'Consolas', monospace; line-height: 1.5; }
 .tr-summary.err { color: #f56c6c; }
-.tr-seq { flex-shrink: 0; font-size: 10px; color: #c0c4cc; margin-top: 2px; }
+.tr-time { flex-shrink: 0; font-size: 11px; color: #909399; margin-top: 2px;
+  font-family: 'Consolas', monospace; font-variant-numeric: tabular-nums; }
 .tr-detail { padding: 0 12px 10px 84px; }
 .tr-pre { max-height: 320px; overflow: auto; margin: 0; padding: 10px 12px; background: #1e1e1e;
   color: #d4d4d4; border-radius: 6px; font-size: 11px; line-height: 1.55; white-space: pre-wrap;
