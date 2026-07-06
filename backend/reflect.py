@@ -85,13 +85,19 @@ async def _task_context(task_id: int, slug: str) -> str:
 
 
 def _extract_bullets(section_body: str) -> list[str]:
-    """从受管段落正文里抽出已有的 know-how 条目（以 - 开头的行）。"""
+    """从受管段落正文里抽出已有的 know-how 条目（以 - 开头的行）。保留行内任务标记。"""
     out = []
     for ln in (section_body or "").splitlines():
         s = ln.strip()
         if s.startswith("- "):
             out.append(s[2:].strip())
     return out
+
+
+def _bullet_text(bullet: str) -> str:
+    """剥掉条目尾部的任务归属标记 <!-- akivili:task:ID -->，返回纯经验正文（用于去重/压缩/喂模型）。"""
+    import re
+    return re.sub(r"\s*<!-- akivili:task:\d+ -->\s*$", "", bullet).strip()
 
 
 def _current_knowhow(slug: str) -> list[str]:
@@ -147,22 +153,26 @@ async def _reflect_one(task_id: int, member: dict) -> int:
     if not new_bullets or (len(new_bullets) == 0 and text.strip() in ("无", "无。")):
         return 0
 
+    from memory import task_marker
+    marker = task_marker(task_id)
     existing = _current_knowhow(slug)
-    # 去重（按去空白后的文本）合并
-    seen = {b.strip() for b in existing}
-    merged = existing + [b for b in new_bullets if b.strip() and b.strip() not in seen]
+    # 去重（按去空白后的“正文”，即剥掉尾部任务标记后比较）合并；
+    # 新条目带上本任务标记，供任务删除时精准清理。
+    seen = {_bullet_text(b) for b in existing}
+    merged = existing + [f"{b.strip()} {marker}" for b in new_bullets
+                         if b.strip() and _bullet_text(b) not in seen]
 
-    # 超上限 → 让模型压缩合并
+    # 超上限 → 让模型压缩合并（喂给模型的是纯正文，压缩后条目视为源自本任务、统一带本任务标记）
     if len(merged) > KNOWHOW_MAX:
-        bullets_text = "\n".join(f"- {b}" for b in merged)
+        bullets_text = "\n".join(f"- {_bullet_text(b)}" for b in merged)
         compacted = await runner.run_oneshot(
             member["provider_id"], sys_prompt,
             COMPACT_PROMPT.format(cap=KNOWHOW_MAX, bullets=bullets_text), timeout_sec=180)
         c = _extract_bullets(compacted)
         if c:
-            merged = c[:KNOWHOW_MAX]
+            merged = [f"{b} {marker}" for b in c[:KNOWHOW_MAX]]
         else:
-            merged = merged[-KNOWHOW_MAX:]   # 压缩失败兜底：留最近的
+            merged = merged[-KNOWHOW_MAX:]   # 压缩失败兜底：留最近的（保留其原标记）
 
     body = ("## 🧠 工作经验与 Know-how（做同类任务前先看）\n\n"
             + "\n".join(f"- {b}" for b in merged))

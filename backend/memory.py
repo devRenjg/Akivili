@@ -95,3 +95,75 @@ def upsert_managed_section(slug: str, key: str, body: str) -> None:
     else:
         return  # 无该段落、也无内容可写
     write_memory(slug, new)
+
+
+# ── 任务级记忆标记与清理 ────────────────────────────────────────────────
+# 记忆里与某个任务/卡片绑定的条目，统一用不可见的 HTML 注释标记归属其任务 ID，
+# 便于任务删除时精准剔除对应记忆（任务没了 → 沉淀的东西也无效）。
+#   - 「近期动态」recent 条目：紧跟 ### 标题后写 <!-- akivili:task:ID -->
+#   - 「Know-how」knowhow 条目：行尾写 <!-- akivili:task:ID -->
+# 标记是 Markdown 注释，Agent 阅读时不可见、不干扰理解。
+
+def task_marker(task_id: int) -> str:
+    """生成某任务的记忆归属标记（HTML 注释，渲染时不可见）。"""
+    return f"<!-- akivili:task:{int(task_id)} -->"
+
+
+def _managed_body(mem: str, key: str) -> str | None:
+    """取出某受管段落的正文（不含锚点）；无则 None。"""
+    import re
+    start = f"<!-- akivili:managed:{key}:start -->"
+    end = f"<!-- akivili:managed:{key}:end -->"
+    m = re.search(re.escape(start) + r"(.*?)" + re.escape(end), mem, re.DOTALL)
+    return m.group(1).strip() if m else None
+
+
+def purge_task_memory(slug: str, task_ids: list[int]) -> int:
+    """从该 Agent 记忆里删除属于给定任务的条目（recent 块 + knowhow 条目）。
+
+    按 <!-- akivili:task:ID --> 标记匹配。返回删除的条目总数。
+    段落被删空时一并移除。不影响用户手写内容与其它任务的条目。
+    """
+    if not task_ids:
+        return 0
+    import re
+    mem = read_memory(slug)
+    if not mem:
+        return 0
+    markers = {task_marker(t) for t in task_ids}
+    removed = 0
+
+    # 1) recent：以 ### 分块，丢弃含目标标记的块
+    recent_body = _managed_body(mem, "recent")
+    if recent_body:
+        # 保留段落标题行（## 开头），仅对 ### 任务块过滤
+        head_m = re.match(r"(##[^\n]*\n+)?(.*)", recent_body, re.DOTALL)
+        head = head_m.group(1) or ""
+        rest = head_m.group(2) or ""
+        blocks = re.findall(r"### .*?(?=\n### |\Z)", rest, re.DOTALL)
+        kept = []
+        for b in blocks:
+            if any(mk in b for mk in markers):
+                removed += 1
+            else:
+                kept.append(b.strip())
+        new_body = (head.strip() + "\n\n" + "\n\n".join(kept)).strip() if kept else ""
+        upsert_managed_section(slug, "recent", new_body)
+
+    # 2) knowhow：逐条 bullet 过滤（行尾带标记的删掉）
+    mem = read_memory(slug)  # recent 可能已改，重读
+    know_body = _managed_body(mem, "knowhow")
+    if know_body:
+        lines = know_body.splitlines()
+        kept_lines = []
+        for ln in lines:
+            if ln.strip().startswith("- ") and any(mk in ln for mk in markers):
+                removed += 1
+                continue
+            kept_lines.append(ln)
+        # 若过滤后已无任何 bullet，则整段清空
+        has_bullet = any(l.strip().startswith("- ") for l in kept_lines)
+        new_body = "\n".join(kept_lines).strip() if has_bullet else ""
+        upsert_managed_section(slug, "knowhow", new_body)
+
+    return removed

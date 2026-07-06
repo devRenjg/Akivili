@@ -131,7 +131,10 @@ async def _persist_memory(run_id: int) -> None:
                    mem, _re.DOTALL)
     entries = _re.findall(r"(?m)^### .+?(?=\n### |\Z)", m.group(1), _re.DOTALL) if m else []
     entries = [e.strip() for e in entries if e.strip()]
-    entry = (f"### {ctx.get('task_title','(无标题)')}\n"
+    # 条目带任务归属标记（HTML 注释、渲染不可见），供任务删除时精准清理
+    from memory import task_marker
+    marker = task_marker(ctx["task_id"]) if ctx.get("task_id") else ""
+    entry = (f"### {ctx.get('task_title','(无标题)')} {marker}\n"
              f"- 指令：{ctx.get('prompt','')[:100]}\n"
              f"- 我的产出：{conclusion[:300]}")
     entries.append(entry)
@@ -313,6 +316,7 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str):
     # 登记写记忆上下文：正常收尾与超时兜底(finalize_run)共用，谁先写谁 pop，幂等不重复
     _RUN_CTX[run_id] = {
         "slug": slug, "conv_id": conv_id, "since_msg_id": user_msg_id,
+        "task_id": task.get("id", 0),
         "task_title": task.get("title", ""), "prompt": prompt, "stream_text": "",
     }
 

@@ -173,18 +173,42 @@ async def set_status(pid: int, task_id: int, req: StatusRequest, user: dict = De
 
 @router.delete("/{pid}/tasks/{task_id}", dependencies=[Depends(require_admin)])
 async def delete_task(pid: int, task_id: int):
+    """删除任务：连同子任务一并删除，并清除各参与成员记忆里属于这些任务的条目。
+
+    任务删了意味着其沉淀的记忆也失效（近期动态 + Know-how），故删库后按任务 ID
+    从参与过执行的成员记忆里精准剔除对应条目。清理失败不影响删除主流程。
+    """
     await _ensure_project(pid)
     db = await get_connection()
     try:
-        # 级联删除子任务：删父任务时一并删其子任务，避免子任务变孤儿（父已删、子残留）
+        # 本任务 + 其子任务的 id 集合（先收集，供删库与清记忆共用）
+        srows = await (await db.execute(
+            "SELECT id FROM tasks WHERE parent_task_id=? AND project_id=?", (task_id, pid))).fetchall()
+        all_ids = [task_id] + [r["id"] for r in srows]
+        # 这些任务里真正跑过 run 的成员 slug（有 run = 有记忆沉淀），删库前查出（task_runs 会级联删）
+        ph = ",".join("?" for _ in all_ids)
+        arows = await (await db.execute(
+            f"SELECT DISTINCT agent_slug FROM task_runs WHERE task_id IN ({ph}) AND agent_slug<>''",
+            all_ids)).fetchall()
+        slugs = [r["agent_slug"] for r in arows]
+        # 级联删除子任务 + 本任务（task_runs/run_logs 经外键 ON DELETE CASCADE 一并清）
         await db.execute("DELETE FROM tasks WHERE parent_task_id=? AND project_id=?", (task_id, pid))
         cur = await db.execute("DELETE FROM tasks WHERE id=? AND project_id=?", (task_id, pid))
         await db.commit()
         if cur.rowcount == 0:
             raise HTTPException(404, "任务不存在")
-        return {"ok": True}
     finally:
         await db.close()
+
+    # 清各成员记忆里属于这些任务的条目（任务没了，沉淀也失效）
+    purged = 0
+    try:
+        from memory import purge_task_memory
+        for slug in slugs:
+            purged += purge_task_memory(slug, all_ids)
+    except Exception:  # noqa: BLE001 — 清记忆失败不该让删除失败
+        pass
+    return {"ok": True, "memory_purged": purged}
 
 
 @router.get("/{pid}/tasks/{task_id}/activities")
