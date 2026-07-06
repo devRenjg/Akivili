@@ -30,6 +30,8 @@ JIAN_CLI_USAGE = """## 平台操作：jian CLI（唯一有效方式）
 
 - `jian roster` —— 查看团队花名册（本项目里真实有哪些成员、各自职责/技能、@ 名字）。
 - `jian comment "内容"` —— 在当前任务里发言（结论、汇报、追问）。发言里写 `@成员名` 会真正触发那个成员来接力。
+  - 🔴 **多行 / 长内容（如自我介绍、方案、报告）必须先写进一个 .md 文件，再用 `jian comment --body-file <文件>` 发**，
+    绝不要用 `jian comment "$(cat 文件)"` 或直接把大段多行文本塞进引号——那样在 Windows 下会被截断成只剩第一行，你的正文会大部分丢失。
 - `jian status <backlog|in_progress|reviewing|done|blocked>` —— 改当前任务状态。
 - `jian subtask --title "标题" [--owner <成员名>] [--assign] --body-file <文件>` —— 创建子任务卡片并挂到当前任务。
   - 不加 `--assign`：记录你自己的产出（Owner=你，卡片直接标记完成）。
@@ -40,7 +42,7 @@ JIAN_CLI_USAGE = """## 平台操作：jian CLI（唯一有效方式）
 - **绝对不要用 Bash / 脚本 / SQL 直接读写平台数据库或伪造数据**（不要去找 .db 文件、不要 INSERT/UPDATE tasks 表、不要自己模拟"成员"）。要让某个成员真正干活，**只能** `jian subtask --owner <成员名> --assign`，由平台真实唤醒他本人来执行——你替他写的内容不算他的产出。
 - 需要知道团队成员时，**看本系统提示里的「你的团队」花名册即可**（已给全，无需 `jian roster`、更不用探索文件系统），只与花名册里真实列出的成员协作，**绝不凭想象编造成员**。
 - 你的最终产出/结论**必须通过 `jian comment` 或 `jian subtask` 落到平台上**；光在终端打印或用内置工具，等于没做。
-- 需要写长正文时，先把内容写进一个 .md 文件，再用 `--body-file` 传给 `jian subtask`（避免命令行转义问题）。
+- 需要写长正文时，先把内容写进一个 .md 文件，再用 `--body-file` 传给 `jian subtask` 或 `jian comment`（避免命令行转义/多行截断问题）。
 - 请用**中文**作答与操作。
 """
 

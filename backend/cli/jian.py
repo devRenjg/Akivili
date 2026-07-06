@@ -58,7 +58,10 @@ def main():
     sub.add_parser("roster")
 
     pc = sub.add_parser("comment")
-    pc.add_argument("body")
+    pc.add_argument("body", nargs="?", default="")   # 短内容可直接传；多行长内容请用 --body-file
+    pc.add_argument("--body-file", default="",
+                    help="从文件读发言正文（多行/长内容推荐，避免命令行参数被截断）")
+    pc.add_argument("--stdin", action="store_true", help="从标准输入读发言正文")
 
     ps = sub.add_parser("status")
     ps.add_argument("status")
@@ -77,7 +80,16 @@ def main():
     if args.cmd == "roster":
         print(_get(f"/api/agent-cli/roster/{tid}")["roster"])
     elif args.cmd == "comment":
-        _post("/api/agent-cli/comment", {"task_id": tid, "agent_slug": AGENT_SLUG, "body": args.body})
+        body = args.body
+        if args.body_file:
+            with open(args.body_file, encoding="utf-8") as f:
+                body = f.read()
+        elif args.stdin:
+            body = sys.stdin.read()
+        if not body.strip():
+            sys.stderr.write("[jian] 发言内容为空：请传入内容，或用 --body-file <文件> / --stdin\n")
+            sys.exit(1)
+        _post("/api/agent-cli/comment", {"task_id": tid, "agent_slug": AGENT_SLUG, "body": body})
         print("[jian] 已发言")
     elif args.cmd == "status":
         r = _post("/api/agent-cli/status", {"task_id": tid, "agent_slug": AGENT_SLUG, "status": args.status})
