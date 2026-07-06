@@ -129,9 +129,9 @@ function labelOf(it) {
   if (it.channel === 'thinking') return '思考'
   if (it.channel === 'stderr') return '错误'
   if (it.channel === 'system') return '系统'
-  return ''   // 助手发言：行内不加标签（正文即内容，无需「发言」赘字）
+  return '发言'   // 助手发言：绿色「发言」标签（colorOf 返回 agent=绿）
 }
-// 筛选下拉用：所有类型都要有名字（助手发言→「发言」），避免出现空名选项
+// 筛选下拉用（与行内一致；保留以便将来两者需分开）
 function filterLabel(it) {
   return labelOf(it) || '发言'
 }
