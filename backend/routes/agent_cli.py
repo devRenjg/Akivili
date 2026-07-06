@@ -165,26 +165,39 @@ async def set_status(req: StatusReq):
     if req.status not in STATUSES:
         raise HTTPException(400, f"非法状态：{req.status}")
 
+    db = await get_connection()
+    try:
+        row = await (await db.execute(
+            "SELECT status, parent_task_id FROM tasks WHERE id=?", (req.task_id,))).fetchone()
+        old_status = row["status"] if row else ""
+        is_subtask = bool(row["parent_task_id"]) if row else False
+    finally:
+        await db.close()
+
     target = req.status
     downgraded = False
-    # 拦截 Agent 标 done → 降级为 reviewing（执行完成、待人工验收）
-    if target == "done":
+    # 拦截 Agent 标 done → 降级为 reviewing（执行完成、待人工验收）。
+    # 但**子任务没有"验证中"概念**：子任务执行完就直接 done，随父任务整体验收，
+    # 故仅对顶层任务降级；子任务 done 正常放行。
+    if target == "done" and not is_subtask:
         target = "reviewing"
         downgraded = True
 
     db = await get_connection()
     try:
-        old = await (await db.execute("SELECT status FROM tasks WHERE id=?", (req.task_id,))).fetchone()
         await db.execute("UPDATE tasks SET status=?, updated_at=datetime('now') WHERE id=?",
                          (target, req.task_id))
         await db.commit()
-        old_status = old["status"] if old else ""
     finally:
         await db.close()
     if old_status != target:
         note = "执行完成，进入验证中，等待人工验收（Agent 不能直接标记完成）" if downgraded else ""
         await log_activity(req.task_id, "status_changed", "agent", req.agent_slug,
                            {"from": old_status, "to": target, **({"note": note} if note else {})})
+    # 子任务被标 done：若父任务全部子任务已完成，自动把父任务推进到「验证中」等人工验收
+    if is_subtask and target == "done":
+        import progress as _progress
+        await _progress.on_execution_complete(req.task_id)
     return {"ok": True, "status": target,
             **({"note": "任务需人工验收，已置为 reviewing（验证中），不能由 Agent 直接完成"} if downgraded else {})}
 
