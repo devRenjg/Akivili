@@ -47,10 +47,8 @@
         <div v-for="it in displayItems" :key="it.seq" :ref="(el) => setRef(it.seq, el)"
              class="tr-row" :class="{ sel: selectedSeq === it.seq }">
           <div class="tr-row-head" :class="{ clickable: hasDetail(it) }" @click="hasDetail(it) && toggle(it.seq)">
-            <span class="tr-badge" :class="`badge-${colorOf(it)}`">
-              <span v-if="hasDetail(it)" class="tr-caret">{{ open[it.seq] ? '▾' : '▸' }}</span>
-              {{ labelOf(it) }}
-            </span>
+            <span v-if="hasDetail(it)" class="tr-caret">{{ open[it.seq] ? '▾' : '▸' }}</span>
+            <span v-if="labelOf(it)" class="tr-badge" :class="`badge-${colorOf(it)}`">{{ labelOf(it) }}</span>
             <span class="tr-summary" :class="{ err: it.channel === 'stderr' }">{{ summaryOf(it) || '（空）' }}</span>
             <span class="tr-seq">#{{ it.seq }}</span>
           </div>
@@ -127,7 +125,7 @@ function labelOf(it) {
   if (it.channel === 'thinking') return '思考'
   if (it.channel === 'stderr') return '错误'
   if (it.channel === 'system') return '系统'
-  return '发言'
+  return ''   // 助手发言：不加标签（正文即内容，无需「发言」赘字）
 }
 function summaryOf(it) {
   if (it.channel === 'tool') {
@@ -142,9 +140,17 @@ function summaryOf(it) {
   return firstLine.length > 140 ? firstLine.slice(0, 140) + '…' : firstLine
 }
 function hasDetail(it) {
+  // tool：展开看完整入参 JSON（与命令行摘要不同，保留）
   if (it.channel === 'tool') return it.tool_input && Object.keys(it.tool_input).length > 0
-  if (it.channel === 'tool_result') return !!it.tool_output
-  return (it.content || '').length > 0
+  // tool_result：仅当完整输出比摘要更长（多行/被截断）才值得展开
+  if (it.channel === 'tool_result') {
+    const o = it.tool_output || ''
+    return o.length > 0 && o !== summaryOf(it)
+  }
+  // text/thinking/system/error：外层摘要与展开内容一致（短文本）时无需下拉框，
+  // 仅当正文比摘要更长（被截断或多行）才提供展开。
+  const c = it.content || ''
+  return c.length > 0 && c.trim() !== (summaryOf(it) || '').trim()
 }
 function detailOf(it) {
   if (it.channel === 'tool') return redactSecrets(JSON.stringify(it.tool_input || {}, null, 2))
@@ -259,7 +265,7 @@ function copyAll() {
 .tr-row-head.clickable:hover { background: #f5f7fa; }
 .tr-badge { flex-shrink: 0; min-width: 64px; text-align: center; font-size: 11px; font-weight: 600;
   padding: 2px 6px; border-radius: 4px; margin-top: 1px; }
-.tr-caret { color: #c0c4cc; margin-right: 2px; }
+.tr-caret { flex-shrink: 0; width: 12px; color: #c0c4cc; margin-top: 2px; font-size: 11px; }
 .badge-agent { background: #f0f9eb; color: #529b2e; }
 .badge-thinking { background: #f3e8ff; color: #7c3aed; }
 .badge-tool { background: #ecf5ff; color: #2563eb; }

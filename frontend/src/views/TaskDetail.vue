@@ -161,14 +161,9 @@
               <span class="run-status" :class="`rs-${r.status}`"
                     :title="runDotTitle(r)"
                     @click.stop="isAdmin && onRunDot(r)">{{ runStatusLabel(r.status) }}</span>
-              <span class="run-agent" @click="toggleRun(r.id)">{{ agentDisplayBySlug(r.agent_slug) }}</span>
+              <span class="run-agent" @click="openTranscript(r)">{{ agentDisplayBySlug(r.agent_slug) }}</span>
               <span class="run-detail-btn" title="查看所有命令与运行时详情"
                     @click.stop="openTranscript(r)">日志详情</span>
-              <span class="run-toggle" @click="toggleRun(r.id)">{{ openRuns[r.id] ? '▾' : '▸' }}</span>
-            </div>
-            <div v-if="openRuns[r.id]" class="run-logs">
-              <div v-for="(l, i) in (runLogs[r.id] || [])" :key="i" class="run-log" :class="l.channel">{{ l.content }}</div>
-              <div v-if="(runLogs[r.id] || []).length === 0" class="run-log">（无日志）</div>
             </div>
           </div>
           <div v-if="runs.length === 0" class="side-empty">还没有执行记录</div>
@@ -248,8 +243,6 @@ const team = ref([])
 const timeline = ref([])
 const subtasks = ref([])
 const runs = ref([])
-const runLogs = ref({})
-const openRuns = ref({})
 const input = ref('')
 const atSlug = ref('')
 const streaming = ref(false)
@@ -446,10 +439,6 @@ async function doAddSub() {
     ElMessage.error(e?.response?.data?.detail || e.message)
   }
 }
-async function toggleRun(rid) {
-  openRuns.value[rid] = !openRuns.value[rid]
-  if (openRuns.value[rid] && !runLogs.value[rid]) runLogs.value[rid] = (await runsApi.logs(rid)).logs
-}
 function openTranscript(r) {
   transcriptRunId.value = r.id
   transcriptAgentName.value = agentDisplayBySlug(r.agent_slug)
@@ -597,10 +586,6 @@ onUnmounted(stopPolling)
 .run-detail-btn { font-size: 11px; color: #409eff; cursor: pointer; padding: 1px 6px;
   border: 1px solid #d9ecff; border-radius: 4px; background: #ecf5ff; flex-shrink: 0; }
 .run-detail-btn:hover { background: #d9ecff; }
-.run-toggle { color: #c0c4cc; cursor: pointer; }
-.run-logs { border-top: 1px solid #f5f5f5; padding: 8px 10px; max-height: 200px; overflow-y: auto; background: #1e1e1e; border-radius: 0 0 8px 8px; }
-.run-log { font-family: monospace; font-size: 11px; line-height: 1.5; color: #d4d4d4; word-break: break-word; }
-.run-log.stderr { color: #f48771; }
 .exec-progress { background: #fdf6ec; border: 1px solid #f5dab1; border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
 .exec-progress.done-hint { background: #f0f9eb; border-color: #d1edc4; color: #67c23a; font-size: 12px; }
 .exec-progress-head { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: #b88230; margin-bottom: 8px; }
