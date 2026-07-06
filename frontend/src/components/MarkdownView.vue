@@ -11,23 +11,34 @@ const props = defineProps({
   text: { type: String, default: '' },
 })
 
-// GFM：支持 **粗体**、# 标题、列表、表格、代码块、换行等常见 Markdown
+// GFM：支持 **粗体**、# 标题、列表、表格、代码块、自动裸链接、换行等常见 Markdown
 marked.setOptions({ gfm: true, breaks: true })
 
-// 渲染后统一用 DOMPurify 消毒，防止 Agent/LLM 产出的内容夹带 XSS
-const html = computed(() => {
-  const raw = props.text || ''
-  if (!raw.trim()) return ''
-  const parsed = marked.parse(raw)
-  return DOMPurify.sanitize(parsed, { USE_PROFILES: { html: true } })
-})
-
-// 外部链接新标签打开
+// 外部链接新标签打开（消毒阶段追加，先注册一次 hook）
 DOMPurify.addHook('afterSanitizeAttributes', (node) => {
   if (node.tagName === 'A' && node.getAttribute('href')) {
     node.setAttribute('target', '_blank')
     node.setAttribute('rel', 'noopener noreferrer')
   }
+  // 图片懒加载
+  if (node.tagName === 'IMG') {
+    node.setAttribute('loading', 'lazy')
+  }
+})
+
+// 渲染后统一用 DOMPurify 消毒（防 Agent/LLM 产出的 XSS），
+// 显式放行图片 <img> 与链接 <a>（含 target/rel），并允许 http/https/mailto/data 图片。
+// 保留 DOMPurify 默认 URI 白名单（http/https/mailto/tel/相对路径，覆盖绝大多数链接与图片），
+// 仅显式放行 target/rel/loading 属性。默认已允许 <img>/<a>，无需额外 ADD_TAGS。
+const SANITIZE_OPTS = {
+  USE_PROFILES: { html: true },
+  ADD_ATTR: ['target', 'rel', 'loading'],
+}
+const html = computed(() => {
+  const raw = props.text || ''
+  if (!raw.trim()) return ''
+  const parsed = marked.parse(raw)
+  return DOMPurify.sanitize(parsed, SANITIZE_OPTS)
 })
 </script>
 
