@@ -591,12 +591,12 @@ onUnmounted(stopPolling)
 .chat-name { font-size: 12px; color: #909399; margin-bottom: 4px; }
 .chat-row.mine .chat-name { text-align: right; }
 .chat-time { color: #c0c4cc; margin-left: 8px; font-size: 11px; }
-.chat-bubble { white-space: pre-wrap; word-break: break-word; line-height: 1.65; font-size: 13px;
-  padding: 8px 12px; border-radius: 10px; background: #f5f7fa; color: #303133; }
+.chat-bubble { white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 19px;
+  padding: 10px 14px; border-radius: 10px; background: #f5f7fa; color: #303133; }
 /* 含 Markdown 渲染时由 MarkdownView 自行排版，取消父级 pre-wrap 以免多余空白 */
 .chat-bubble:has(.md-body) { white-space: normal; }
-/* 气泡内 Markdown 字号与气泡一致（组件默认 14px，这里统一到 13px） */
-.chat-bubble :deep(.md-body) { font-size: 13px; }
+/* 气泡内正文（含 Markdown）字号：正文是阅读主体，在原 13px 上再加 6px = 19px；头像/昵称保持小 */
+.chat-bubble :deep(.md-body) { font-size: 19px; }
 .chat-row.mine .chat-bubble { background: #ecf3ff; }
 .running { color: #e6a23c; margin-left: 6px; }
 .tools { margin-top: 6px; }
