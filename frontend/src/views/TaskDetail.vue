@@ -50,7 +50,8 @@
             <!-- 活动：细行 + 小头像 -->
             <div v-if="it.kind === 'activity'" class="tl-activity">
               <AgentAvatar v-if="it.author" :agent="it.author" :size="18" class="tl-av" />
-              <span v-else class="tl-actor-ic">{{ it.actor_type === 'user' ? '👤' : '⚙️' }}</span>
+              <AgentAvatar v-else-if="it.actor_type === 'user'" :agent="activityUserAvatar(it)" :size="18" class="tl-av" />
+              <span v-else class="tl-actor-ic">⚙️</span>
               <span class="tl-text">{{ activityText(it) }}</span>
               <span class="tl-time">{{ shortTime(it.created_at) }}</span>
             </div>
@@ -289,8 +290,17 @@ const currentAgentName = computed(() => {
 // 聊天气泡：解析一条消息的发言人。user 消息用后端返回的实际发送者名（user_name，
 // 即当时发消息的人/任务创建者），而非当前查看者登录名；缺省回退「用户」。
 function msgAgent(it) {
-  if (it.role === 'user') return { name: it.user_name || userName.value || '用户', emoji: '👤' }
+  if (it.role === 'user') {
+    const uname = it.user_name || userName.value || '用户'
+    // 按用户名猜同名头像 <用户名>.png（icon 目录里有则显示，没有则 AgentAvatar 回退 emoji）
+    return { name: uname, emoji: '👤', avatar: uname ? `${uname}.png` : '' }
+  }
   return it.author || team.value.find((x) => x.slug === it.author_slug) || { name: 'Agent', emoji: '🤖' }
+}
+// 活动行里 user 操作者的头像：按操作者名猜同名 <名>.png，回退 👤
+function activityUserAvatar(it) {
+  const uname = it.actor_display || it.actor_name || userName.value || '用户'
+  return { name: uname, emoji: '👤', avatar: uname ? `${uname}.png` : '' }
 }
 function msgName(it) {
   if (it.role === 'user') return it.user_name || userName.value || '用户'
