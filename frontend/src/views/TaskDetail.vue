@@ -581,12 +581,12 @@ onUnmounted(stopPolling)
 .run-head { display: flex; align-items: center; gap: 8px; padding: 9px 12px; font-size: 12px; }
 /* 执行状态标记：统一 18px 圆形 */
 .run-ctrl { width: 14px; height: 14px; flex-shrink: 0; border: none; border-radius: 50%;
-  display: inline-flex; align-items: center; justify-content: center; font-size: 12px;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 13px;
   line-height: 1; padding: 0; color: #fff; }
 .run-ctrl.running { background: #f56c6c; cursor: pointer; padding-left: 1px; /* ▶ 视觉居中 */ }
 .run-ctrl.running:hover { background: #f23c3c; box-shadow: 0 0 0 3px rgba(245,108,108,.2); }
 .run-ctrl.running:disabled { cursor: default; box-shadow: none; }
-.run-ctrl.killed { background: #303133; border-radius: 3px; cursor: pointer; font-size: 11px; }
+.run-ctrl.killed { background: #303133; border-radius: 3px; cursor: pointer; font-size: 12px; }
 .run-ctrl.killed:hover { background: #000; }
 .run-ctrl.failed { background: #f56c6c; cursor: pointer; }
 .run-ctrl.failed:hover { background: #f23c3c; }
