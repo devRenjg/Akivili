@@ -3,7 +3,7 @@
     <!-- 面包屑 + 操作 -->
     <div class="td-topbar">
       <div class="td-crumb">
-        <el-button text :icon="ArrowLeft" @click="goBack">工作区</el-button>
+        <el-button text :icon="ArrowLeft" @click="goBack">返回</el-button>
         <span class="crumb-sep">/</span>
         <template v-if="task && task.parent_task_id">
           <span class="crumb-link" @click="openTask(task.parent_task_id)">{{ task.parent_title || '父任务' }}</span>
@@ -380,7 +380,11 @@ async function refreshLite() {
   await Promise.all([loadSubtasks(), loadRuns(), loadProgress()])
 }
 
-function goBack() { router.push(`/projects/${pid}?tab=workspace`) }
+// 返回：子任务→回父任务；顶层任务→回工作区
+function goBack() {
+  if (task.value?.parent_task_id) openTask(task.value.parent_task_id)
+  else router.push(`/projects/${pid}?tab=workspace`)
+}
 
 async function loadAll() {
   loading.value = true
