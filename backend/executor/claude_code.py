@@ -106,8 +106,7 @@ class ClaudeCodeBackend(ExecutorBackend):
                 line = line.strip()
                 if not line:
                     continue
-                ev = _parse_line(line)
-                if ev:
+                for ev in _parse_line(line):
                     loop.call_soon_threadsafe(queue.put_nowait, ev)
             err = proc.stderr.read()
             proc.wait()
@@ -132,21 +131,67 @@ class ClaudeCodeBackend(ExecutorBackend):
         yield ExecEvent("done")
 
 
-def _parse_line(line: str) -> ExecEvent | None:
+def _parse_line(line: str) -> list[ExecEvent]:
+    """解析一行 stream-json，返回 0..N 个 ExecEvent（一条消息可含文本+多次工具调用）。
+
+    - assistant 消息：content[] 里 text→text 事件、thinking→thinking 事件、
+      tool_use→tool 事件（保留工具名 + 完整 input，含 Bash 的实际命令）。
+    - user 消息：content[] 里 tool_result→tool_result 事件（保留工具执行输出）。
+    - result：结束标记。
+    """
     try:
         obj = json.loads(line)
     except json.JSONDecodeError:
-        return None
+        return []
     t = obj.get("type")
+    events: list[ExecEvent] = []
     if t == "assistant":
         parts = obj.get("message", {}).get("content", [])
-        texts = [p.get("text", "") for p in parts if p.get("type") == "text"]
-        tools = [p.get("name", "") for p in parts if p.get("type") == "tool_use"]
-        if tools:
-            return ExecEvent("tool", "调用工具：" + ", ".join(t for t in tools if t))
-        joined = "".join(texts).strip()
-        if joined:
-            return ExecEvent("text", joined)
+        for p in parts:
+            ptype = p.get("type")
+            if ptype == "text":
+                txt = (p.get("text") or "").strip()
+                if txt:
+                    events.append(ExecEvent("text", txt))
+            elif ptype == "thinking":
+                think = (p.get("thinking") or p.get("text") or "").strip()
+                if think:
+                    events.append(ExecEvent("thinking", think))
+            elif ptype == "tool_use":
+                name = p.get("name", "") or "Tool"
+                inp = p.get("input") if isinstance(p.get("input"), dict) else {}
+                events.append(ExecEvent(
+                    "tool", _tool_summary(name, inp), tool=name, tool_input=inp))
+    elif t == "user":
+        # 工具执行结果回灌在 user 消息里（tool_result 块）
+        parts = obj.get("message", {}).get("content", [])
+        if isinstance(parts, list):
+            for p in parts:
+                if isinstance(p, dict) and p.get("type") == "tool_result":
+                    out = _tool_result_text(p.get("content"))
+                    if out:
+                        events.append(ExecEvent("tool_result", "", tool_output=out))
     elif t == "result":
-        return ExecEvent("system", "执行完成")
-    return None
+        events.append(ExecEvent("system", "执行完成"))
+    return events
+
+
+def _tool_summary(name: str, inp: dict) -> str:
+    """给工具调用生成一行摘要（列表精简展示用；完整信息在 tool_input 里）。"""
+    for k in ("command", "file_path", "path", "pattern", "query", "prompt", "description", "url"):
+        v = inp.get(k)
+        if isinstance(v, str) and v.strip():
+            s = v.strip().replace("\n", " ")
+            return f"{name}: {s[:120]}" + ("…" if len(s) > 120 else "")
+    return f"调用工具：{name}"
+
+
+def _tool_result_text(content) -> str:
+    """tool_result 的 content 可能是字符串或 [{type:text,text:..}] 列表，统一成文本。"""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        texts = [c.get("text", "") for c in content
+                 if isinstance(c, dict) and c.get("type") == "text"]
+        return "\n".join(t for t in texts if t).strip()
+    return ""

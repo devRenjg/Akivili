@@ -160,11 +160,14 @@ CREATE TABLE IF NOT EXISTS task_runs (
 );
 
 CREATE TABLE IF NOT EXISTS run_logs (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id  INTEGER NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
-    ts      TEXT DEFAULT (datetime('now')),
-    channel TEXT DEFAULT 'event',            -- stdout|stderr|event|system
-    content TEXT DEFAULT ''
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id      INTEGER NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+    ts          TEXT DEFAULT (datetime('now')),
+    channel     TEXT DEFAULT 'event',        -- stdout|stderr|event|system|tool|tool_result|thinking
+    content     TEXT DEFAULT '',
+    tool        TEXT DEFAULT '',             -- 工具名（Bash/Read/Write…）
+    tool_input  TEXT DEFAULT '',             -- 工具完整入参 JSON（含实际命令）
+    tool_output TEXT DEFAULT ''              -- 工具完整输出
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -236,6 +239,15 @@ async def _migrate(db) -> None:
     mcols = {row[1] for row in await cur.fetchall()}
     if "author_slug" not in mcols:
         await db.execute("ALTER TABLE messages ADD COLUMN author_slug TEXT DEFAULT ''")
+    # run_logs 结构化工具字段（用于「日志详情」还原命令与运行时详情）
+    cur = await db.execute("PRAGMA table_info(run_logs)")
+    rlcols = {row[1] for row in await cur.fetchall()}
+    if "tool" not in rlcols:
+        await db.execute("ALTER TABLE run_logs ADD COLUMN tool TEXT DEFAULT ''")
+    if "tool_input" not in rlcols:
+        await db.execute("ALTER TABLE run_logs ADD COLUMN tool_input TEXT DEFAULT ''")
+    if "tool_output" not in rlcols:
+        await db.execute("ALTER TABLE run_logs ADD COLUMN tool_output TEXT DEFAULT ''")
 
 
 async def get_connection() -> aiosqlite.Connection:

@@ -52,10 +52,20 @@ async def list_tasks(pid: int):
                FROM tasks t WHERE t.project_id=? AND t.parent_task_id IS NULL
                ORDER BY t.order_idx, t.id""", (pid,))).fetchall()
         tasks = [dict(r) for r in rows]
+        # 取每个顶层任务的子任务（看板卡片下方嵌套小卡展示）
+        sub_rows = await (await db.execute(
+            """SELECT c.id, c.title, c.status, c.priority, c.assignee_slug, c.parent_task_id,
+                      (SELECT status FROM task_runs r WHERE r.task_id=c.id ORDER BY r.id DESC LIMIT 1) AS run_status
+               FROM tasks c WHERE c.project_id=? AND c.parent_task_id IS NOT NULL
+               ORDER BY c.order_idx, c.id""", (pid,))).fetchall()
+        subs_by_parent: dict = {}
+        for sr in sub_rows:
+            subs_by_parent.setdefault(sr["parent_task_id"], []).append(dict(sr))
         for t in tasks:
             for col in ("created_at", "updated_at"):
                 if col in t:
                     t[col] = to_beijing(t[col])
+            t["subtasks"] = subs_by_parent.get(t["id"], [])
         # 按状态分组，便于看板渲染
         board = {s: [t for t in tasks if t["status"] == s] for s in STATUSES}
         return {"tasks": tasks, "board": board}
@@ -230,6 +240,8 @@ async def get_task(pid: int, task_id: int):
 class SubtaskRequest(BaseModel):
     title: str
     assignee_slug: str = ""
+    description: str = ""
+    priority: str = "none"
 
 
 @router.post("/{pid}/tasks/{task_id}/subtasks", dependencies=[Depends(require_admin)])
@@ -239,12 +251,22 @@ async def create_subtask(pid: int, task_id: int, req: SubtaskRequest, user: dict
         raise HTTPException(400, "子任务标题不能为空")
     db = await get_connection()
     try:
+        # 只允许在顶层任务下建子任务：子任务不能再有子任务（避免多层派生）
+        parent = await (await db.execute(
+            "SELECT parent_task_id FROM tasks WHERE id=? AND project_id=?", (task_id, pid))).fetchone()
+        if not parent:
+            raise HTTPException(404, "父任务不存在")
+        if parent["parent_task_id"] is not None:
+            raise HTTPException(400, "子任务下不能再创建子任务")
+        prio = req.priority if req.priority in PRIORITIES else "none"
         conv = await db.execute(
             "INSERT INTO conversations (project_id, title) VALUES (?,?)", (pid, req.title.strip()))
         cur = await db.execute(
-            """INSERT INTO tasks (project_id, title, assignee_slug, conversation_id, parent_task_id, status)
-               VALUES (?,?,?,?,?, 'backlog')""",
-            (pid, req.title.strip(), req.assignee_slug, conv.lastrowid, task_id))
+            """INSERT INTO tasks (project_id, title, description, assignee_slug, conversation_id,
+                                  parent_task_id, priority, status)
+               VALUES (?,?,?,?,?,?,?, 'backlog')""",
+            (pid, req.title.strip(), req.description.strip(), req.assignee_slug,
+             conv.lastrowid, task_id, prio))
         await db.commit()
         row = await (await db.execute("SELECT * FROM tasks WHERE id=?", (cur.lastrowid,))).fetchone()
         result = dict(row)

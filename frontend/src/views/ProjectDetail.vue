@@ -10,11 +10,6 @@
 
     <el-tabs v-model="activeTab" class="proj-tabs">
       <el-tab-pane label="概览与团队" name="overview">
-    <el-card v-if="project" shadow="never" class="info">
-      <div class="info-row"><span class="k">本地文件夹</span><span class="v">📁 {{ project.local_path }}</span></div>
-      <div class="info-row"><span class="k">描述</span><span class="v">{{ project.description || '（无）' }}</span></div>
-    </el-card>
-
     <div class="team-head">
       <h3>团队</h3>
       <div v-if="isAdmin">
@@ -346,10 +341,6 @@ onMounted(() => {
 .detail { width: 100%; }
 .topbar { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .topbar h2 { margin: 0; flex: 1; }
-.info { margin-bottom: 22px; }
-.info-row { display: flex; padding: 4px 0; }
-.info-row .k { width: 90px; color: #909399; font-size: 13px; }
-.info-row .v { color: #303133; font-size: 13px; }
 .team-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .team-head h3 { margin: 0; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }

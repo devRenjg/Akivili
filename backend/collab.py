@@ -416,6 +416,16 @@ async def _run_one(item: dict) -> None:
     if final_text:
         leader_slug = agent["leader_slug"]
         await parse_and_enqueue_mentions(task_id, task["project_id"], final_text, slug, leader_slug)
+
+    # 执行完成后的状态流转（绝不触发经验沉淀——沉淀只在父任务人工验收 done 时发生）：
+    #  - 子任务执行完 → 直接进「完成(done)」（子任务无"验证中"概念），但**不触发沉淀**。
+    #  - 子任务全部 done → 父任务自动进「验证中」，等人工验收。
+    #  - 无子任务的独立顶层任务执行完 → 自身进「验证中」，等人工验收。
+    #  - 经验沉淀 + 已解决计数：只在管理员把父任务/独立任务人工验收拖入「完成」时触发（routes/tasks.py），
+    #    届时把父+全部子任务的经验一起沉淀。
+    if run_status == "done" and final_text and not is_leader:
+        from progress import on_execution_complete
+        await on_execution_complete(task_id)
     return run_status
 
 

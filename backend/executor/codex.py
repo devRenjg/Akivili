@@ -115,16 +115,27 @@ def _parse_line(line: str) -> ExecEvent | None:
         itype = item.get("type", "")
         if itype == "error":
             return ExecEvent("error", item.get("message", "")[:300])
-        # 文件改动：提取路径显示为工具活动，让用户看到改了什么
+        # 命令执行：保留完整命令 + 输出（供日志详情还原运行时详情）
+        if itype in ("command_execution", "tool_call"):
+            cmd = item.get("command") or item.get("text") or item.get("message") or ""
+            cmd = cmd.strip() if isinstance(cmd, str) else ""
+            out = item.get("output") or item.get("aggregated_output") or item.get("result") or ""
+            out = out.strip() if isinstance(out, str) else ""
+            name = "Bash" if itype == "command_execution" else (item.get("name") or "Tool")
+            summary = f"{name}: {cmd[:120]}" + ("…" if len(cmd) > 120 else "") if cmd else f"调用工具：{name}"
+            return ExecEvent("tool", summary, tool=name,
+                             tool_input={"command": cmd} if cmd else {}, tool_output=out)
+        # 文件改动：提取路径 + 完整 diff，作为工具活动
         if itype == "file_change":
-            paths = [c.get("path", "") for c in item.get("changes", []) if c.get("path")]
+            changes = item.get("changes", []) or []
+            paths = [c.get("path", "") for c in changes if c.get("path")]
             if paths:
-                return ExecEvent("tool", "文件改动：" + ", ".join(paths))
+                return ExecEvent("tool", "文件改动：" + ", ".join(paths),
+                                 tool="Edit", tool_input={"changes": changes})
             return None
         text = item.get("text") or item.get("message") or ""
         if isinstance(text, str) and text.strip():
-            kind = "tool" if itype in ("command_execution", "tool_call") else "text"
-            return ExecEvent(kind, text.strip())
+            return ExecEvent("text", text.strip())
         return None
     if t == "error" or t == "turn.failed":
         msg = obj.get("message") or obj.get("error", {}).get("message", "")

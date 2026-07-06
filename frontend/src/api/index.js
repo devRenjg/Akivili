@@ -68,6 +68,7 @@ export const tasksApi = {
 export const runsApi = {
   kill: (runId) => api.post('/runs/kill', { run_id: runId }).then((r) => r.data),
   logs: (runId) => api.get(`/runs/${runId}/logs`).then((r) => r.data),
+  transcript: (runId) => api.get(`/runs/${runId}/transcript`).then((r) => r.data),
   autoDispatch: (taskId) => api.post(`/tasks/${taskId}/auto-dispatch`).then((r) => r.data),
   // SSE 流式分派：用 fetch 读流，onEvent(每个事件), 返回 Promise
   dispatch: async (taskId, prompt, assigneeSlug, onEvent) => {

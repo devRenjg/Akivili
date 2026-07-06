@@ -41,6 +41,26 @@ async def _resolve_member(project_id: int, ref: str) -> str:
     return ""
 
 
+async def _display_name(project_id: int, slug: str) -> str:
+    """把成员 slug 解析成展示名「昵称（角色名）」；无昵称回退角色名；查不到回退 slug。
+    用于活动/发言文案，避免暴露英文 slug。"""
+    if not slug:
+        return slug
+    db = await get_connection()
+    try:
+        r = await (await db.execute(
+            """SELECT pa.name, p.nickname AS nickname FROM project_agents pa
+               LEFT JOIN agent_profiles p ON p.slug = pa.slug
+               WHERE pa.project_id=? AND pa.slug=? LIMIT 1""", (project_id, slug))).fetchone()
+    finally:
+        await db.close()
+    if not r:
+        return slug
+    nick = (r["nickname"] or "").strip()
+    name = r["name"] or slug
+    return f"{nick}（{name}）" if nick else name
+
+
 class SubtaskReq(BaseModel):
     task_id: int          # 父任务（当前任务）
     agent_slug: str       # 调用者身份（runner 注入）
@@ -82,8 +102,9 @@ async def create_subtask(req: SubtaskReq):
         await db.commit()
     finally:
         await db.close()
-    note = (f"委派子任务给 {owner}：{req.title.strip()}（子任务#{sub_id}）" if delegate
-            else f"创建子任务并完成：{req.title.strip()}（子任务#{sub_id}）")
+    owner_disp = await _display_name(pid, owner)
+    note = (f"委派子任务给 {owner_disp}：{req.title.strip()}" if delegate
+            else f"创建子任务并完成：{req.title.strip()}")
     await log_activity(req.task_id, "commented", "agent", req.agent_slug, {"note": note})
     # 委派模式：触发 owner 在子任务里执行（用子任务正文作为给他的指令）
     if delegate:
@@ -133,43 +154,39 @@ class StatusReq(BaseModel):
 
 @router.post("/status")
 async def set_status(req: StatusReq):
-    """Agent 改当前任务状态。若把有未完成子任务的父任务标 done，则拦截并降级为 reviewing。"""
+    """Agent 改当前任务状态。
+
+    🔒 **任务完成必须人工验收**：Agent（含负责人）不允许把任务标记为 `done`。
+    Agent 调 `jian status done` 时，一律**降级为 `reviewing`（验证中）**——表示「执行完成、
+    等待人工验收」，`done` 只能由管理员在看板上人肉验收后手动操作。这样避免 Agent 自行了结任务、
+    绕过验收，也避免未验收就触发经验沉淀。
+    """
     STATUSES = ["backlog", "in_progress", "reviewing", "done", "blocked"]
     if req.status not in STATUSES:
         raise HTTPException(400, f"非法状态：{req.status}")
-    # 闭环规则：子任务没全完成，父任务不能 done
-    if req.status == "done":
-        from progress import blocking_subtasks
-        pending = await blocking_subtasks(req.task_id)
-        if pending:
-            names = "、".join(f"#{s['id']}{s['title']}" for s in pending[:5])
-            await log_activity(req.task_id, "commented", "system", "",
-                               {"note": f"父任务暂不能完成：还有 {len(pending)} 个子任务未完成（{names}）。"
-                                        f"待全部完成后再汇总收尾。"})
-            return {"ok": False, "status": "blocked_by_subtasks",
-                    "pending_subtasks": pending,
-                    "message": f"还有 {len(pending)} 个子任务未完成，父任务不能标记完成"}
+
+    target = req.status
+    downgraded = False
+    # 拦截 Agent 标 done → 降级为 reviewing（执行完成、待人工验收）
+    if target == "done":
+        target = "reviewing"
+        downgraded = True
+
     db = await get_connection()
     try:
         old = await (await db.execute("SELECT status FROM tasks WHERE id=?", (req.task_id,))).fetchone()
         await db.execute("UPDATE tasks SET status=?, updated_at=datetime('now') WHERE id=?",
-                         (req.status, req.task_id))
+                         (target, req.task_id))
         await db.commit()
         old_status = old["status"] if old else ""
     finally:
         await db.close()
-    if old_status != req.status:
+    if old_status != target:
+        note = "执行完成，进入验证中，等待人工验收（Agent 不能直接标记完成）" if downgraded else ""
         await log_activity(req.task_id, "status_changed", "agent", req.agent_slug,
-                           {"from": old_status, "to": req.status})
-        # 子任务完成 → 检查是否该推进父任务（并唤醒负责人收尾）
-        if req.status == "done":
-            from progress import maybe_advance_parent
-            await maybe_advance_parent(req.task_id)
-            # 任务收尾 → 参与角色各自复盘沉淀 Know-how（后台异步，不阻塞）
-            import asyncio
-            from reflect import reflect_on_task_done
-            asyncio.create_task(reflect_on_task_done(req.task_id))
-    return {"ok": True, "status": req.status}
+                           {"from": old_status, "to": target, **({"note": note} if note else {})})
+    return {"ok": True, "status": target,
+            **({"note": "任务需人工验收，已置为 reviewing（验证中），不能由 Agent 直接完成"} if downgraded else {})}
 
 
 @router.get("/roster/{task_id}")

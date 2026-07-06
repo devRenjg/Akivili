@@ -45,6 +45,17 @@
               </span>
               <span class="tc-time">更新于 {{ relTime(t.updated_at) }}</span>
             </div>
+            <!-- 子任务：嵌套小卡，点击进入其详情 -->
+            <div v-if="t.subtasks && t.subtasks.length" class="tc-subs">
+              <div v-for="s in t.subtasks" :key="s.id" class="tc-sub-card"
+                   @click.stop="openTask(s)">
+                <span class="scb-dot" :class="`st-${s.status}`">●</span>
+                <span v-if="s.priority && s.priority !== 'none'" class="scb-prio">{{ prioDot(s.priority) }}</span>
+                <AgentAvatar :agent="assigneeAgent(s)" :size="16" class="scb-av" />
+                <span class="scb-title">{{ s.title }}</span>
+                <span class="scb-status">{{ statusLabel(s.status) }}</span>
+              </div>
+            </div>
           </div>
           <div v-if="(board[col.key] || []).length === 0" class="col-empty">拖拽任务到此</div>
         </div>
@@ -135,15 +146,20 @@ const props = defineProps({
   teamProp: { type: Array, default: null },
 })
 
-// 验证中(reviewing)/阻塞(blocked) 暂不单独设列（以后再扩展）。后端仍会把任务流转到这两个状态，
-// 故在 load() 里把它们并入「进行中」显示，避免任务落入无列可显而“消失”。
+// 看板列：待办 / 进行中 / 验证中 / 已完成。任务执行完成自动进「验证中」，人工验收后拖入「已完成」。
+// 阻塞(blocked) 暂无独立列，load() 里并入「进行中」。
 const COLUMNS = [
   { key: 'backlog', label: '待办' },
   { key: 'in_progress', label: '进行中' },
+  { key: 'reviewing', label: '验证中' },
   { key: 'done', label: '已完成' },
 ]
 function prioDot(p) {
   return { urgent: '🔴', high: '🟠', medium: '🟡', low: '🔵' }[p] || ''
+}
+function statusLabel(s) {
+  return { backlog: '待办', in_progress: '进行中', reviewing: '验证中',
+           done: '已完成', blocked: '阻塞', archived: '归档' }[s] || s
 }
 // 卡片左边框色：按 id 稳定映射到一组 Trello 风配色
 const CARD_COLORS = ['#61bd4f', '#f2d600', '#ff9f1a', '#eb5a46', '#c377e0',
@@ -212,8 +228,8 @@ async function load() {
       project.value = await projectsApi.get(pid)
     }
     const bd = (await tasksApi.list(pid)).board
-    // 暂无 验证中/阻塞 列：把这两个状态的任务并入「进行中」，防止任务无列可显而丢失
-    bd.in_progress = [...(bd.in_progress || []), ...(bd.reviewing || []), ...(bd.blocked || [])]
+    // 阻塞(blocked) 暂无独立列，并入「进行中」防丢失；验证中(reviewing)已有独立列，不并入
+    bd.in_progress = [...(bd.in_progress || []), ...(bd.blocked || [])]
     board.value = bd
   } catch (e) {
     ElMessage.error(e?.response?.data?.detail || e.message)
@@ -280,7 +296,7 @@ function relTime(ts) {
 
 // —— 执行状态徽标 ——
 function runLabel(s) {
-  return { running: '⚙️ 执行中', succeeded: '✓ 已完成', failed: '✗ 失败', killed: '■ 已终止' }[s] || ''
+  return { running: '⚙️ 执行中', succeeded: '✓ 执行完成', failed: '✗ 失败', killed: '■ 已终止' }[s] || ''
 }
 function runClass(s) {
   return s ? `run-${s}` : ''
@@ -329,6 +345,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 /* 各状态淡背景色（Trello 风、克制） */
 .col-backlog { background: #f4f5f7; }
 .col-in_progress { background: #fef6e6; }
+.col-reviewing { background: #eaf4ff; }
 .col-done { background: #eaf7ed; }
 .column.drop-hover { background: #e3ecff; box-shadow: inset 0 0 0 2px #a0c0ff; }
 .col-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; padding: 0 4px; }
@@ -360,6 +377,20 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 .tc-assignee { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .tc-assignee-name { font-size: 12px; color: #5e6c84; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tc-time { font-size: 11px; color: #97a0af; flex-shrink: 0; }
+/* 嵌套子任务小卡 */
+.tc-subs { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.tc-sub-card { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 6px;
+  background: #f7f8fa; border: 1px solid #eceef1; cursor: pointer; transition: background .12s, box-shadow .12s; }
+.tc-sub-card:hover { background: #eef1f6; box-shadow: 0 2px 8px rgba(9,30,66,0.12); }
+.scb-dot { font-size: 9px; flex-shrink: 0; color: #b7bcc5; }
+.scb-dot.st-in_progress { color: #e6a23c; }
+.scb-dot.st-done { color: #67c23a; }
+.scb-dot.st-reviewing { color: #409eff; }
+.scb-dot.st-blocked { color: #f56c6c; }
+.scb-prio { font-size: 10px; flex-shrink: 0; }
+.scb-av { flex-shrink: 0; }
+.scb-title { flex: 1; min-width: 0; font-size: 12px; color: #42526e; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scb-status { font-size: 11px; color: #8993a4; flex-shrink: 0; }
 .tc-result {
   margin: 8px 0; padding: 8px 10px; border-radius: 6px;
   background: #f0f9eb; border-left: 3px solid #67c23a;

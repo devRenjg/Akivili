@@ -19,15 +19,12 @@
         <h1 class="td-title">{{ task.title }}</h1>
         <div v-if="task.description" class="td-desc">{{ task.description }}</div>
 
-        <!-- 子任务 -->
-        <div class="td-section">
+        <!-- 子任务（子任务本身不再显示此区，因不允许多层拆分） -->
+        <div v-if="!isSubtask" class="td-section">
           <div class="td-sec-head">
             <span class="td-sec-title">子任务</span>
             <span v-if="subtasks.length" class="td-sub-progress">{{ subDone }}/{{ subtasks.length }}</span>
-            <el-button v-if="isAdmin" text size="small" @click="addSubVisible = !addSubVisible">+ 新增</el-button>
-          </div>
-          <div v-if="addSubVisible" class="td-sub-add">
-            <el-input v-model="newSubTitle" size="small" placeholder="子任务标题，回车创建" @keyup.enter="doAddSub" />
+            <el-button v-if="isAdmin && !isSubtask" text size="small" @click="openAddSub">+ 新增</el-button>
           </div>
           <div v-for="s in subtasks" :key="s.id" class="td-sub-row" @click="openTask(s.id)">
             <span class="sub-dot" :class="`st-${s.status}`"
@@ -77,7 +74,13 @@
               <div class="chat-name">{{ currentAgentName }} <span class="running">⚙️ 执行中…</span></div>
               <div class="chat-bubble">{{ streamText || '思考中…' }}</div>
               <div v-if="toolEvents.length" class="tools">
-                <div v-for="(t, ti) in toolEvents" :key="ti" class="tool-line">▸ {{ t }}</div>
+                <div v-for="(t, ti) in toolEvents" :key="ti" class="tool-item">
+                  <div class="tool-line" :class="{ clickable: t.detail }" @click="t.detail && (t.open = !t.open)">
+                    <span v-if="t.detail" class="tool-caret">{{ t.open ? '▾' : '▸' }}</span>
+                    <span v-else class="tool-caret">▸</span>{{ t.text }}
+                  </div>
+                  <pre v-if="t.open && t.detail" class="tool-detail">{{ t.detail }}</pre>
+                </div>
               </div>
             </div>
           </div>
@@ -159,6 +162,8 @@
                     :title="runDotTitle(r)"
                     @click.stop="isAdmin && onRunDot(r)">{{ runStatusLabel(r.status) }}</span>
               <span class="run-agent" @click="toggleRun(r.id)">{{ agentDisplayBySlug(r.agent_slug) }}</span>
+              <span class="run-detail-btn" title="查看所有命令与运行时详情"
+                    @click.stop="openTranscript(r)">日志详情</span>
               <span class="run-toggle" @click="toggleRun(r.id)">{{ openRuns[r.id] ? '▾' : '▸' }}</span>
             </div>
             <div v-if="openRuns[r.id]" class="run-logs">
@@ -170,22 +175,62 @@
         </div>
       </div>
     </div>
+
+    <!-- 新增子任务（与工作区新建任务一致的弹框） -->
+    <el-dialog v-model="addSubVisible" title="✦ 新增子任务" width="600px" class="task-dialog" append-to-body>
+      <el-form label-position="top">
+        <el-form-item label="子任务标题" required>
+          <el-input v-model="subForm.title" placeholder="要做什么，如 实现登录接口" />
+        </el-form-item>
+        <el-form-item label="负责人 Owner">
+          <el-select v-model="subForm.assignee_slug" placeholder="指定一位负责人" clearable style="width:100%">
+            <el-option v-for="a in team" :key="a.id" :value="a.slug" :label="dName(a)">
+              <span class="owner-opt">
+                <AgentAvatar :agent="a" :size="22" />
+                <span class="owner-opt-name">{{ dName(a) }}{{ a.is_leader ? ' 👑' : '' }}</span>
+              </span>
+            </el-option>
+          </el-select>
+        </el-form-item>
+        <el-form-item label="任务描述（输入 @ 可点名项目成员）">
+          <MentionTextarea v-model="subForm.description" :members="team" :rows="8"
+                           placeholder="详细描述子任务目标、背景与要求…输入 @ 点名负责的数字人才" />
+        </el-form-item>
+        <el-form-item label="优先级">
+          <el-select v-model="subForm.priority" style="width:160px">
+            <el-option v-for="p in PRIORITY_OPTS" :key="p" :value="p" :label="PRIORITY_LABEL[p]" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="addSubVisible = false">取消</el-button>
+        <el-button class="akivili-primary-btn" @click="doAddSub">创建</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 日志详情：所有命令与运行时详细信息 -->
+    <RunTranscriptDialog v-model="transcriptVisible" :run-id="transcriptRunId"
+                         :agent-name="transcriptAgentName" />
   </div>
 </template>
 
 <script setup>
-import { ref, computed, nextTick, inject, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, inject, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ArrowLeft, VideoPause } from '@element-plus/icons-vue'
 import { tasksApi, runsApi, projectAgentsApi } from '../api'
 import { displayName } from '../utils/agentDisplay'
 import AgentAvatar from '../components/AgentAvatar.vue'
+import MentionTextarea from '../components/MentionTextarea.vue'
+import RunTranscriptDialog from '../components/RunTranscriptDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
-const pid = Number(route.params.id)
-const taskId = Number(route.params.taskId)
+// 用 let：点击子任务导航到另一个 /tasks/:taskId 时，Vue Router 复用同一组件、不重跑 onMounted，
+// 需在 watch 里更新这两个 id 并重新加载（否则点子任务只换 URL、页面不刷新，表现为"进不去"）。
+let pid = Number(route.params.id)
+let taskId = Number(route.params.taskId)
 const isAdmin = inject('isAdmin')
 const currentUser = inject('currentUser')
 const userName = computed(() => currentUser?.value?.username || '我')
@@ -212,7 +257,13 @@ const streamText = ref('')
 const toolEvents = ref([])
 const currentRunId = ref(null)
 const addSubVisible = ref(false)
-const newSubTitle = ref('')
+const subForm = ref({ title: '', assignee_slug: '', description: '', priority: 'none' })
+// 日志详情弹框
+const transcriptVisible = ref(false)
+const transcriptRunId = ref(null)
+const transcriptAgentName = ref('')
+// 当前任务是否本身就是子任务（有 parent_task_id）→ 不允许再建子任务
+const isSubtask = computed(() => !!task.value?.parent_task_id)
 const tlEl = ref(null)
 const atBottom = ref(true)
 const progress = ref({ running: [], queued: [], sub_total: 0, sub_done: 0, active: false })
@@ -375,15 +426,43 @@ async function changeStatus(v) {
 async function changePriority(v) {
   await tasksApi.update(pid, taskId, { priority: v }); task.value.priority = v; await loadTimeline()
 }
+function openAddSub() {
+  subForm.value = { title: '', assignee_slug: '', description: '', priority: 'none' }
+  addSubVisible.value = true
+}
 async function doAddSub() {
-  if (!newSubTitle.value.trim()) return
-  await tasksApi.createSubtask(pid, taskId, { title: newSubTitle.value.trim() })
-  newSubTitle.value = ''; addSubVisible.value = false
-  await Promise.all([loadSubtasks(), loadTimeline(), loadProgress()])
+  if (!subForm.value.title.trim()) return ElMessage.warning('请填写子任务标题')
+  try {
+    await tasksApi.createSubtask(pid, taskId, {
+      title: subForm.value.title.trim(),
+      assignee_slug: subForm.value.assignee_slug || '',
+      description: subForm.value.description || '',
+      priority: subForm.value.priority || 'none',
+    })
+    addSubVisible.value = false
+    await Promise.all([loadSubtasks(), loadTimeline(), loadProgress()])
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.detail || e.message)
+  }
 }
 async function toggleRun(rid) {
   openRuns.value[rid] = !openRuns.value[rid]
   if (openRuns.value[rid] && !runLogs.value[rid]) runLogs.value[rid] = (await runsApi.logs(rid)).logs
+}
+function openTranscript(r) {
+  transcriptRunId.value = r.id
+  transcriptAgentName.value = agentDisplayBySlug(r.agent_slug)
+  transcriptVisible.value = true
+}
+// 把流式 tool 事件转成 {text, detail, open}：text 是一行摘要，detail 是完整 input（点击展开）
+function makeToolEvent(ev) {
+  const inp = ev.tool_input || {}
+  const name = ev.tool || '工具'
+  const key = inp.command || inp.file_path || inp.path || inp.pattern || inp.query || inp.prompt || inp.description || inp.url
+  let text = ev.text
+  if (key) { const s = String(key).replace(/\s+/g, ' '); text = `${name}: ${s.length > 100 ? s.slice(0, 100) + '…' : s}` }
+  const detail = Object.keys(inp).length ? JSON.stringify(inp, null, 2) : ''
+  return { text, detail, open: false }
 }
 async function send() {
   if (!input.value.trim() || streaming.value) return
@@ -395,8 +474,12 @@ async function send() {
     await runsApi.dispatch(taskId, prompt, atSlug.value, (ev) => {
       if (ev.type === 'system' && ev.meta?.run_id) currentRunId.value = ev.meta.run_id
       else if (ev.type === 'text') { streamText.value += ev.text; scrollToBottom() }
-      else if (ev.type === 'tool') toolEvents.value.push(ev.text)
-      else if (ev.type === 'error') { ElMessage.error(ev.text); toolEvents.value.push('❌ ' + ev.text) }
+      else if (ev.type === 'tool') { toolEvents.value.push(makeToolEvent(ev)); scrollToBottom() }
+      else if (ev.type === 'tool_result') {
+        const o = ev.tool_output || ''
+        if (o.trim()) toolEvents.value.push({ text: `↳ ${ev.tool || '结果'}`, detail: o, open: false })
+      }
+      else if (ev.type === 'error') { ElMessage.error(ev.text); toolEvents.value.push({ text: '❌ ' + ev.text, detail: '', open: false }) }
     })
   } catch (e) { ElMessage.error('执行失败：' + e.message) }
   finally {
@@ -417,6 +500,16 @@ function startPolling() {
   }, 3000)
 }
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null } }
+
+// 路由 taskId 变化（点击子任务/父任务面包屑跳转到另一张卡）→ 更新 id、停旧轮询、重新加载
+watch(() => route.params.taskId, (nv) => {
+  const nid = Number(nv)
+  if (!nid || nid === taskId) return
+  stopPolling()
+  pid = Number(route.params.id)
+  taskId = nid
+  loadAll()
+})
 
 onMounted(loadAll)
 onUnmounted(stopPolling)
@@ -475,7 +568,14 @@ onUnmounted(stopPolling)
 .chat-row.mine .chat-bubble { background: #ecf3ff; }
 .running { color: #e6a23c; margin-left: 6px; }
 .tools { margin-top: 6px; }
-.tool-line { font-size: 12px; color: #909399; font-family: monospace; }
+.tool-item { margin-bottom: 2px; }
+.tool-line { font-size: 12px; color: #909399; font-family: monospace; word-break: break-all; }
+.tool-line.clickable { cursor: pointer; }
+.tool-line.clickable:hover { color: #606266; }
+.tool-caret { display: inline-block; width: 12px; color: #c0c4cc; }
+.tool-detail { margin: 2px 0 6px 12px; padding: 8px 10px; background: #1e1e1e; color: #d4d4d4;
+  border-radius: 6px; font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+  font-family: 'Consolas', monospace; max-height: 240px; overflow: auto; }
 .td-composer { border-top: 1px solid #ebeef5; padding-top: 14px; margin-top: 14px; }
 .composer-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
 .at-select { width: 220px; }
@@ -493,6 +593,9 @@ onUnmounted(stopPolling)
 .run-status { font-weight: 600; cursor: pointer; }
 .rs-running { color: #e6a23c; } .rs-succeeded { color: #67c23a; } .rs-failed { color: #f56c6c; } .rs-killed { color: #909399; }
 .run-agent { flex: 1; color: #606266; cursor: pointer; }
+.run-detail-btn { font-size: 11px; color: #409eff; cursor: pointer; padding: 1px 6px;
+  border: 1px solid #d9ecff; border-radius: 4px; background: #ecf5ff; flex-shrink: 0; }
+.run-detail-btn:hover { background: #d9ecff; }
 .run-toggle { color: #c0c4cc; cursor: pointer; }
 .run-logs { border-top: 1px solid #f5f5f5; padding: 8px 10px; max-height: 200px; overflow-y: auto; background: #1e1e1e; border-radius: 0 0 8px 8px; }
 .run-log { font-family: monospace; font-size: 11px; line-height: 1.5; color: #d4d4d4; word-break: break-word; }
@@ -508,6 +611,8 @@ onUnmounted(stopPolling)
 .exec-tag.queued { background: #ebeef5; color: #909399; }
 .exec-agent { flex: 1; color: #606266; }
 .exec-sub { font-size: 10px; color: #c0c4cc; }
+.owner-opt { display: flex; align-items: center; gap: 8px; }
+.owner-opt-name { font-size: 14px; }
 </style>
 
 

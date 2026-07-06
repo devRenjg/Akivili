@@ -67,8 +67,8 @@ async def timeline(task_id: int) -> list[dict]:
 
     items = []
     for a in acts:
-        # 活动作者：agent 用 actor_name(角色名) 匹配成员 → 拿昵称/头像
-        author = member_author(name=a["actor_name"]) if a["actor_type"] == "agent" else None
+        # 活动作者：agent 的 actor_name 可能是角色名，也可能是 slug（历史/部分埋点）→ 两种都试着匹配成员，拿昵称/头像
+        author = member_author(slug=a["actor_name"], name=a["actor_name"]) if a["actor_type"] == "agent" else None
         items.append({
             "kind": "activity",
             "actor_type": a["actor_type"], "actor_name": a["actor_name"],

@@ -10,13 +10,19 @@ from database import get_connection
 
 
 async def blocking_subtasks(task_id: int) -> list[dict]:
-    """返回该任务下**尚未完成**的子任务（用于阻止父任务提前 done）。
-    无子任务或全部 done 时返回空列表。"""
+    """返回该任务下**尚在执行中**的子任务（用于阻止父任务提前验收 done）。
+
+    新模型下子任务执行完成后保持 in_progress（不自动 done），故"完成"的判据不再看 status=done，
+    而看子任务是否还有排队/运行中的 run。只有仍在执行（queued/running）的子任务才阻止父任务 done；
+    已执行完（无待跑 run）的子任务不阻塞——人工验收父任务即代表连同子任务一起验收通过。"""
     db = await get_connection()
     try:
         rows = await (await db.execute(
-            "SELECT id, title, assignee_slug, status FROM tasks "
-            "WHERE parent_task_id=? AND status != 'done'", (task_id,))).fetchall()
+            """SELECT t.id, t.title, t.assignee_slug, t.status FROM tasks t
+               WHERE t.parent_task_id=?
+                 AND EXISTS (SELECT 1 FROM run_queue q
+                             WHERE q.task_id=t.id AND q.status IN ('queued','running'))""",
+            (task_id,))).fetchall()
         return [dict(r) for r in rows]
     finally:
         await db.close()
@@ -60,8 +66,106 @@ async def task_progress(task_id: int) -> dict:
     }
 
 
+async def _has_pending_run(task_ids: list[int]) -> bool:
+    """这些任务里是否还有排队/运行中的 run（判断"是否还在执行"）。"""
+    if not task_ids:
+        return False
+    db = await get_connection()
+    try:
+        ph = ",".join("?" * len(task_ids))
+        row = await (await db.execute(
+            f"SELECT COUNT(*) c FROM run_queue WHERE task_id IN ({ph}) AND status IN ('queued','running')",
+            task_ids)).fetchone()
+        return bool(row and row["c"])
+    finally:
+        await db.close()
+
+
+async def _set_reviewing(task_id: int, note: str) -> bool:
+    """把任务从 in_progress/backlog/planning 推进到 reviewing（幂等：已 reviewing/done 不动）。返回是否改动。"""
+    db = await get_connection()
+    try:
+        row = await (await db.execute("SELECT status FROM tasks WHERE id=?", (task_id,))).fetchone()
+        if not row or row["status"] not in ("in_progress", "backlog", "planning"):
+            return False
+        old = row["status"]
+        await db.execute(
+            "UPDATE tasks SET status='reviewing', updated_at=datetime('now') WHERE id=?", (task_id,))
+        await db.commit()
+    finally:
+        await db.close()
+    from activity import log_activity
+    await log_activity(task_id, "status_changed", "system", "",
+                       {"from": old, "to": "reviewing", "note": note})
+    return True
+
+
+async def _set_done(task_id: int, note: str) -> bool:
+    """把任务从执行中状态置为 done（幂等）。**不触发经验沉淀**——沉淀只在父任务人工验收时发生。"""
+    db = await get_connection()
+    try:
+        row = await (await db.execute("SELECT status FROM tasks WHERE id=?", (task_id,))).fetchone()
+        if not row or row["status"] not in ("in_progress", "backlog", "planning", "reviewing"):
+            return False
+        old = row["status"]
+        await db.execute(
+            "UPDATE tasks SET status='done', updated_at=datetime('now') WHERE id=?", (task_id,))
+        await db.commit()
+    finally:
+        await db.close()
+    from activity import log_activity
+    await log_activity(task_id, "status_changed", "system", "",
+                       {"from": old, "to": "done", "note": note})
+    return True
+
+
+async def on_execution_complete(task_id: int) -> None:
+    """某任务的 run 执行成功后调用，处理执行完成后的状态流转（**绝不触发经验沉淀**）：
+
+    - 子任务执行完 → 直接置「完成(done)」（子任务无"验证中"概念），不触发沉淀；
+      随后若父任务的全部子任务都已 done → 父任务自动进「验证中」等人工验收。
+    - 无子任务的独立顶层任务执行完 → 自身进「验证中」等人工验收。
+    经验沉淀 + 已解决计数一律由人工验收（routes/tasks.py 把父/独立任务置 done）触发。
+    """
+    db = await get_connection()
+    try:
+        t = await (await db.execute(
+            "SELECT id, parent_task_id, status FROM tasks WHERE id=?", (task_id,))).fetchone()
+        if not t:
+            return
+        parent_id = t["parent_task_id"]
+    finally:
+        await db.close()
+
+    if parent_id:
+        # 子任务：执行完直接置 done（不沉淀）
+        await _set_done(task_id, "执行完成，子任务自动完成（等父任务整体验收后一起沉淀经验）")
+        # 全部子任务 done 且都无待跑 run → 父任务进「验证中」
+        db = await get_connection()
+        try:
+            subs = await (await db.execute(
+                "SELECT id, status FROM tasks WHERE parent_task_id=?", (parent_id,))).fetchall()
+        finally:
+            await db.close()
+        sub_ids = [r["id"] for r in subs]
+        all_done = all(r["status"] == "done" for r in subs)
+        if all_done and not await _has_pending_run([parent_id] + sub_ids):
+            await _set_reviewing(parent_id, "全部子任务已完成，自动进入验证中，等待人工验收")
+    else:
+        # 顶层任务：有子任务的由子任务分支推进；此处只处理无子任务的独立任务
+        db = await get_connection()
+        try:
+            sub_ids = [r["id"] for r in await (await db.execute(
+                "SELECT id FROM tasks WHERE parent_task_id=?", (task_id,))).fetchall()]
+        finally:
+            await db.close()
+        if sub_ids or await _has_pending_run([task_id]):
+            return
+        await _set_reviewing(task_id, "执行完成，自动进入验证中，等待人工验收")
+
+
 async def maybe_advance_parent(sub_task_id: int) -> None:
-    """某子任务状态变更后调用：若父任务的**所有子任务都已 done**，且父任务还在进行中，
+    """[保留兼容] 某子任务状态变更后调用：若父任务的**所有子任务都已 done**，且父任务还在进行中，
     则推进父任务到 `reviewing`，并**唤醒负责人做总结汇报**（协同闭环的收尾环节）。
     只在"进行中→全完成"这一刻触发一次（reviewing/done 状态不再重复触发）。
     父任务的 `done` 由负责人汇总后自行决定，不在这里直接置 done。"""

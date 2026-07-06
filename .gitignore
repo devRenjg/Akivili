@@ -21,6 +21,10 @@ TestReport/
 *.bak
 *.bak_*
 
+# 记忆回滚备份（本地运行产物，不入仓）
+backend/_mem_bak_*/
+_mem_bak_*/
+
 # Python
 __pycache__/
 *.py[cod]

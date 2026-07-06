@@ -347,8 +347,13 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str):
             if ev.type == "text":
                 collected.append(ev.text)
                 await _log(run_id, "stdout", ev.text)
+            elif ev.type == "thinking":
+                await _log(run_id, "thinking", ev.text)
             elif ev.type == "tool":
-                await _log(run_id, "event", ev.text)
+                # 完整命令/参数落库（tool_input），列表展示用摘要 content
+                await _log(run_id, "tool", ev.text, tool=ev.tool, tool_input=ev.tool_input)
+            elif ev.type == "tool_result":
+                await _log(run_id, "tool_result", ev.text, tool=ev.tool, tool_output=ev.tool_output)
             elif ev.type == "system":
                 await _log(run_id, "system", ev.text)
             elif ev.type == "error":
@@ -384,11 +389,16 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str):
                        {"run_id": run_id, "summary": final_text[:120]})
 
 
-async def _log(run_id: int, channel: str, content: str):
+async def _log(run_id: int, channel: str, content: str,
+               tool: str = "", tool_input: dict | None = None, tool_output: str = ""):
+    import json as _json
+    ti = _json.dumps(tool_input, ensure_ascii=False) if tool_input else ""
     db = await get_connection()
     try:
-        await db.execute("INSERT INTO run_logs (run_id, channel, content) VALUES (?,?,?)",
-                         (run_id, channel, content))
+        await db.execute(
+            "INSERT INTO run_logs (run_id, channel, content, tool, tool_input, tool_output) "
+            "VALUES (?,?,?,?,?,?)",
+            (run_id, channel, content, tool, ti, tool_output))
         await db.commit()
     finally:
         await db.close()

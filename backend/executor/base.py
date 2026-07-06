@@ -2,15 +2,20 @@
 
 每个后端把底层（claude -p / codex exec / API）的输出，标准化成 ExecEvent 序列：
 - text:  助手文本增量
-- tool:  工具/命令活动（仅作日志展示）
+- thinking: 模型思考过程（可选，供日志详情展示）
+- tool:  工具/命令调用（tool=工具名，tool_input=完整参数，如 Bash 的 command）
+- tool_result: 工具执行结果（tool=工具名，tool_output=完整输出）
 - system:系统提示（启动、结束原因等）
 - error: 错误
 - done:  结束（带最终文本）
+
+tool/tool_input/tool_output 用于「日志详情」还原每条命令与运行时详情；
+text/system/error 走 text 字段。所有字段可选，按 type 取用。
 """
 from dataclasses import dataclass, field
 from typing import Literal
 
-EventType = Literal["text", "tool", "system", "error", "done"]
+EventType = Literal["text", "thinking", "tool", "tool_result", "system", "error", "done"]
 
 
 @dataclass
@@ -18,6 +23,9 @@ class ExecEvent:
     type: EventType
     text: str = ""
     meta: dict = field(default_factory=dict)
+    tool: str = ""                 # 工具名（Bash/Read/Write…），tool / tool_result 用
+    tool_input: dict = field(default_factory=dict)   # 工具完整入参（含实际命令）
+    tool_output: str = ""          # 工具完整输出（tool_result 用）
 
 
 @dataclass
