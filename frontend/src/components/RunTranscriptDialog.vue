@@ -27,7 +27,8 @@
     <div v-loading="loading" class="tr-body">
       <!-- 元数据 chips -->
       <div class="tr-meta">
-        <span v-if="meta.provider_id" class="tr-chip">🧠 {{ meta.provider_id }}</span>
+        <span v-if="meta.provider_label" class="tr-chip">🧠 {{ meta.provider_label }}</span>
+        <span v-if="meta.provider_id" class="tr-chip tr-chip-id" :title="'供应商 ID'">🆔 {{ meta.provider_id }}</span>
         <span v-if="duration" class="tr-chip">⏱ {{ duration }}</span>
         <span v-if="toolCount" class="tr-chip">🔧 {{ toolCount }} 次工具调用</span>
         <span class="tr-chip">
@@ -272,6 +273,7 @@ function copyAll() {
 .tr-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
 .tr-chip { font-size: 12px; color: #4e5969; background: #f0f2f5; border: 1px solid #e4e7ed;
   border-radius: 6px; padding: 2px 9px; }
+.tr-chip-id { font-family: 'Consolas', monospace; color: #909399; }
 .tr-bar { display: flex; gap: 2px; height: 18px; border-radius: 4px; overflow: hidden; margin-bottom: 12px; }
 .tr-seg { height: 100%; border: none; cursor: pointer; min-width: 3px; transition: opacity .15s; }
 .tr-seg:hover { opacity: .75; }

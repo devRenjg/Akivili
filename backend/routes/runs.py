@@ -247,9 +247,20 @@ async def get_transcript(run_id: int):
     meta = {}
     if run:
         m = dict(run)
+        # 把内部 provider_id（hash）解析成人类可读的「供应商名 · 模型」
+        prov_label = ""
+        pid_str = m["provider_id"] or ""
+        if pid_str:
+            from config import load_settings
+            for p in load_settings().providers:
+                if p.id == pid_str:
+                    prov_label = f"{p.name} · {p.model}" if p.model else p.name
+                    break
+            if not prov_label:
+                prov_label = "（供应商已删除）"
         meta = {
             "run_id": m["id"], "task_id": m["task_id"], "agent_slug": m["agent_slug"],
-            "status": m["status"], "provider_id": m["provider_id"],
+            "status": m["status"], "provider_id": pid_str, "provider_label": prov_label,
             "started_at": to_beijing(m["started_at"]), "ended_at": to_beijing(m["ended_at"]),
         }
     return {"meta": meta, "items": items}
