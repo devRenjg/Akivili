@@ -125,5 +125,7 @@ if _DIST.exists():
 
 if __name__ == "__main__":
     s = load_settings()
-    reload = os.environ.get("JIANAGENCY_RELOAD", "").lower() in ("1", "true", "yes")
+    # 默认开启热加载：改后端代码即自动重启，免手动重启。
+    # 生产/需要关闭时设 JIANAGENCY_RELOAD=0（或 false/no）。
+    reload = os.environ.get("JIANAGENCY_RELOAD", "1").lower() not in ("0", "false", "no")
     uvicorn.run("main:app", host=s.host, port=s.port, reload=reload)
