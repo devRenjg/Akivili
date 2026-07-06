@@ -17,7 +17,7 @@
       <!-- 主内容区 -->
       <div class="td-main">
         <h1 class="td-title">{{ task.title }}</h1>
-        <div v-if="task.description" class="td-desc">{{ task.description }}</div>
+        <div v-if="task.description" class="td-desc"><MarkdownView :text="task.description" /></div>
 
         <!-- 子任务（子任务本身不再显示此区，因不允许多层拆分） -->
         <div v-if="!isSubtask" class="td-section">
@@ -62,7 +62,7 @@
                   <span class="fold-caret">{{ isFolded(i) ? '▸' : '▾' }}</span>
                   {{ msgName(it) }}<span class="chat-time">{{ shortTime(it.created_at) }}</span>
                 </div>
-                <div v-show="!isFolded(i)" class="chat-bubble">{{ it.content }}</div>
+                <div v-show="!isFolded(i)" class="chat-bubble"><MarkdownView :text="it.content" /></div>
                 <div v-show="isFolded(i)" class="chat-bubble folded" @click="toggleFold(i)">{{ foldPreview(it.content) }}</div>
               </div>
             </div>
@@ -235,6 +235,7 @@ import { displayName } from '../utils/agentDisplay'
 import AgentAvatar from '../components/AgentAvatar.vue'
 import MentionTextarea from '../components/MentionTextarea.vue'
 import RunTranscriptDialog from '../components/RunTranscriptDialog.vue'
+import MarkdownView from '../components/MarkdownView.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -525,7 +526,7 @@ onUnmounted(stopPolling)
 .td-side { width: 300px; flex-shrink: 0; }
 .td-title { font-size: 24px; font-weight: 700; margin: 0 0 12px; }
 .td-desc { background: #f5f7fa; border-radius: 8px; padding: 14px 16px; font-size: 14px;
-  line-height: 1.7; color: #303133; white-space: pre-wrap; margin-bottom: 20px; }
+  line-height: 1.7; color: #303133; margin-bottom: 20px; }
 .td-section { margin-bottom: 20px; }
 .td-sec-head { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px; margin-bottom: 10px; }
 .td-sub-progress { font-size: 12px; color: #909399; }
@@ -562,6 +563,8 @@ onUnmounted(stopPolling)
 .chat-time { color: #c0c4cc; margin-left: 8px; font-size: 11px; }
 .chat-bubble { white-space: pre-wrap; word-break: break-word; line-height: 1.7; font-size: 14px;
   padding: 10px 14px; border-radius: 10px; background: #f5f7fa; color: #303133; }
+/* 含 Markdown 渲染时由 MarkdownView 自行排版，取消父级 pre-wrap 以免多余空白 */
+.chat-bubble:has(.md-body) { white-space: normal; }
 .chat-row.mine .chat-bubble { background: #ecf3ff; }
 .running { color: #e6a23c; margin-left: 6px; }
 .tools { margin-top: 6px; }
