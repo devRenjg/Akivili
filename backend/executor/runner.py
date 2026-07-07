@@ -8,7 +8,7 @@ import signal
 
 from config import load_settings
 from database import get_connection
-from memory import read_memory, append_memory
+from memory import read_memory, append_memory, select_relevant_knowhow, _managed_body
 from executor.base import ExecContext
 from executor.claude_code import ClaudeCodeBackend
 from executor.codex import CodexBackend
@@ -22,6 +22,18 @@ _KILLED: set[int] = set()
 # 让「收工写记忆」无论从正常收尾还是超时兜底（finalize_run）触发，都能拿到同一份上下文，
 # 且谁先写谁 pop，天然幂等、不重复写。
 _RUN_CTX: dict[int, dict] = {}
+
+# 会话历史回灌的滑动窗口上限：协同长 thread 全量回灌会撑爆上下文、诱发 lost-in-the-middle 幻觉。
+# 只保留最近 N 条消息（早期丢弃），够恢复近况即可；更早的靠记忆/knowhow 承载。
+_HISTORY_MAX_MSGS = 20
+
+
+def _clip_history(history: list) -> list:
+    """把回灌历史裁到最近 _HISTORY_MAX_MSGS 条（保留时间序，丢弃更早的）。"""
+    if len(history) <= _HISTORY_MAX_MSGS:
+        return history
+    return history[-_HISTORY_MAX_MSGS:]
+
 
 # 平台 CLI 使用说明（注入所有 Agent 的系统提示，教它用 jian 在平台上真正操作）
 JIAN_CLI_USAGE = """## 平台操作：jian CLI（唯一有效方式）
@@ -90,8 +102,9 @@ async def finalize_run(run_id: int, status: str) -> None:
     _KILLED.discard(run_id)
 
 
-# per-run「近期动态」受管段落保留的最大条数（滚动，防无限膨胀）
-_RECENT_RUNS_MAX = 8
+# per-run「近期动态」受管段落保留的最大条数（滚动，防无限膨胀）。
+# 只留最新几条供开工回忆近期上下文，学习交给 reflect 的 knowhow；条数少+只存净结论，避免占爆上下文。
+_RECENT_RUNS_MAX = 3
 
 
 async def _persist_memory(run_id: int) -> None:
@@ -115,14 +128,16 @@ async def _persist_memory(run_id: int) -> None:
     try:
         rows = await (await db.execute(
             """SELECT content FROM messages
-               WHERE conversation_id=? AND id>? AND role='assistant' AND (author_slug=? OR author_slug='')
+               WHERE conversation_id=? AND id>? AND role='assistant' AND author_slug=?
                ORDER BY id""", (conv_id, since_msg_id, slug))).fetchall()
     finally:
         await db.close()
-    deliverable = "\n".join(r["content"] for r in rows if (r["content"] or "").strip()).strip()
-    conclusion = deliverable or (ctx.get("stream_text") or "").strip()
+    # 只记「净交付」：本轮该 Agent 经 jian comment/subtask 落库的发言。
+    # 不拿流式 stdout 兜底——那是过程碎语（命令/环境/编码提示），进 recent 只会污染开工回忆上下文。
+    # 无净交付时不记（未走 jian 的情况已由 execute_dispatch 打醒目标记，此处不重复噪声）。
+    conclusion = "\n".join(r["content"] for r in rows if (r["content"] or "").strip()).strip()
     if not conclusion:
-        return  # 什么都没产出，不记
+        return  # 本轮无净交付，不记 recent
 
     # 滚动更新「近期动态」受管段落：读现有条目 → 追加本条 → 只留最新 _RECENT_RUNS_MAX 条
     from memory import upsert_managed_section
@@ -164,6 +179,35 @@ def _pick_backend(provider):
     return None
 
 
+# 每次注入系统提示的 knowhow 条目上限（文件里全量保留，只精选最相关的注入，防上下文膨胀/同质化污染）
+_KNOWHOW_INJECT_TOP_N = 8
+
+
+def _compose_injected_memory(agent_slug: str, task_text: str) -> str:
+    """组装「本轮注入系统提示」的记忆文本：knowhow 按与本任务相关性精选 top-N + recent 近期动态 + workspace 约束。
+
+    与文件全量分开：文件里 knowhow/recent 全留，这里只挑最相关的注入，避免整份记忆随时间膨胀、
+    把无关低价值经验塞进上下文诱发幻觉。workspace（工作区路径约束）始终全给。
+    """
+    import re as _re
+    def _strip_markers(s: str) -> str:
+        # 剥离任务归属标记 <!-- akivili:task:ID -->：对模型无意义，且占 token
+        return _re.sub(r"\s*<!-- akivili:task:\d+ -->", "", s) if s else s
+
+    know = select_relevant_knowhow(agent_slug, task_text, top_n=_KNOWHOW_INJECT_TOP_N)
+    mem_full = read_memory(agent_slug)
+    recent = _strip_markers(_managed_body(mem_full, "recent"))
+    workspace = _managed_body(mem_full, "workspace")  # workspace 无 task 标记，无需剥
+    parts = []
+    if know:
+        parts.append(know)
+    if recent:
+        parts.append(recent)
+    if workspace:
+        parts.append(workspace)
+    return "\n\n".join(parts).strip()
+
+
 async def build_context(agent_slug: str, persona: str, project_dir: str,
                         provider, prompt: str, history: list,
                         is_leader: bool = False, project_id: int = 0, task_id: int = 0) -> ExecContext:
@@ -173,7 +217,7 @@ async def build_context(agent_slug: str, persona: str, project_dir: str,
     - 团队花名册注入给**所有** Agent（让整个 Team 互相认识），Leader 额外注入统筹协议。
     - 注入 jian CLI 身份环境变量，使 Agent 能在平台上建子任务/发言/改状态。
     """
-    mem = read_memory(agent_slug)
+    mem = _compose_injected_memory(agent_slug, prompt)
     skill_bodies = await _skill_bodies(agent_slug)
 
     sections = []
@@ -314,13 +358,13 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
             # 取会话历史（回灌，恢复上下文），不含刚插入的本轮
             rows = await (await db.execute(
                 "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id", (conv_id,))).fetchall()
-            history = [{"role": r["role"], "content": r["content"]} for r in rows[:-1]]
+            history = _clip_history([{"role": r["role"], "content": r["content"]} for r in rows[:-1]])
         else:
             # 机器合成的派活指令：不落 user 消息（否则时间线会以「我」名义重复复述任务）。
             # 本轮起点取当前最大消息 id，之后该 Agent 的发言才算本轮产出。
             rows = await (await db.execute(
                 "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id", (conv_id,))).fetchall()
-            history = [{"role": r["role"], "content": r["content"]} for r in rows]
+            history = _clip_history([{"role": r["role"], "content": r["content"]} for r in rows])
             mrow = await (await db.execute(
                 "SELECT COALESCE(MAX(id), 0) AS mid FROM messages WHERE conversation_id=?", (conv_id,))).fetchone()
             user_msg_id = mrow["mid"]

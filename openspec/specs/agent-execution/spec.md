@@ -16,7 +16,7 @@
 
 #### Scenario: 上下文恢复
 - **WHEN** Agent 开始执行
-- **THEN** 系统先读取其记忆（含工作区约束与 Skills 说明）与该任务的会话历史，组装进上下文
+- **THEN** 系统读取其记忆与该任务的会话历史组装进上下文：记忆里的 Know-how 按**与当前任务的相关性精选**注入若干条（非全量），近期动态与工作区约束一并注入，注入文本剥离内部归属标记；会话历史按**滑动窗口只回灌最近若干条**，避免长 thread 撑爆上下文
 
 #### Scenario: CLI 交付经 jian、过程仅入日志
 - **WHEN** CLI 后端（claude/codex）的 Agent 执行完毕，流式 stdout 里含执行过程碎语（如 jian 命令用法、环境变量、终端编码提示等）
@@ -32,7 +32,7 @@
 
 #### Scenario: 收工写记忆
 - **WHEN** 一次执行结束
-- **THEN** 系统把关键结论写回该 Agent 记忆；取值优先 Agent 经 jian comment 落库的发言，无则回退流式 stdout 兜底
+- **THEN** 系统把关键结论写回该 Agent 记忆的「近期动态」段落：只取本轮该 Agent 经 jian comment/subtask 落库的净交付，无净交付则不写（不拿流式 stdout 兜底）
 
 ### Requirement: 执行控制
 

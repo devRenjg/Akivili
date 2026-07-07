@@ -222,6 +222,16 @@ JianAgency/
 
 ## 版本记录
 
+### v0.15.0 — 2026-07-07
+- 🧠 **记忆卫生：让 Agent「越做越强」而非「越背越沉」**（OpenSpec change：`2026-07-07-memory-hygiene-and-board-polish`，能力 `agent-execution`/`agent-memory`/`agent-reflection`/`task-board`）
+  - **近期动态只存净交付（P0-1）**：收工写记忆只记本轮该 Agent 经 `jian comment`/`jian subtask` 落库的净交付，**不再拿流式 stdout 兜底**（jian.bat 调用、PYTHONUTF8、编码提示等过程碎语不再进记忆）；滚动上限 8 → 3。无净交付则不记（未走 jian 已由执行层打醒目标记）。
+  - **Know-how 按相关性精选注入（P0-2）**：新增 `memory.select_relevant_knowhow`——用 jieba 分词做「当前任务 ↔ 各 Know-how 条目」关键词重叠打分，注入系统提示时只放最相关的 top-8。**文件里 Know-how 全量保留**，仅注入时精选，避免无关经验随任务增多堆积、稀释领域硬经验、撑大上下文。注入的 Know-how/近期动态一并剥离内部归属标记（省 token）。
+  - **反思质量门槛（P1-3）**：反思 prompt 增「宁缺毋滥 + 只沉淀本专业领域新方法/新坑/新诀窍；常规沟通/介绍/汇报类无专业增量则回『无』、不写通用套话」——根治低含金量任务灌入同质化空话。
+  - **会话历史滑动窗口（P1-4）**：回灌只保留最近 20 条消息（早期丢弃），对 CLI/API 两路径同时生效，防协同长 thread 撑爆上下文、诱发 lost-in-the-middle 幻觉。
+  - 分词依赖：优先用 jieba（已装），缺失时自动退化为「英文词 + 中文 2-gram」零依赖方案。
+  - 验证：新增 `TestReport/run_memory_hygiene_probe.py` 11/11（相关性精选/标记剥离/条目≤N全给/recent上限/history窗口/反思门槛）；`run_stdout_display_probe` 8/8、`run_reflect_probe` 6/6、QA 28/30 与基线一致；真实记忆冒烟：数据向任务注入的 8 条全为数据经验、前端向经验被正确过滤。
+- 🗂️ **工作区看板对齐与排序**：卡片执行状态（执行中/完成/失败/终止）用 `margin-left:auto` 固定右对齐，不再因有无子任务进度而左右横跳；顶层任务列表排序由 `order_idx` 改为**创建时间倒序**（最新任务出现在每列最上方）。
+
 ### v0.14.1 — 2026-07-07
 - 🧹 **会话正文只留真实交付，命令过程碎语归入日志**（OpenSpec change：`2026-07-07-cli-stdout-not-in-thread`，能力 `agent-execution`）
   - **问题**：CLI Agent（Claude/Codex）的会话正文里混进大量执行过程碎语——如「`jian` 命令通过 `jian.bat` 调用」「设 `PYTHONUTF8=1`」「连通正常（roster 已取到，仅打印 GBK 编码崩）」「结尾那句是终端编码显示问题，实际已发送成功」。正常问答/结论没问题，但命令细节不该进正文。

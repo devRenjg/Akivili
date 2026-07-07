@@ -118,6 +118,65 @@ def _managed_body(mem: str, key: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def _tokens(text: str) -> set[str]:
+    """把中英文文本切成词集合，用于相关性重叠打分。
+
+    优先 jieba 精确分词；未装则退化为「英文单词 + 中文 2-gram 字符片」的零依赖方案。
+    过滤长度 1 的散字/停用符，减少噪声匹配。
+    """
+    text = (text or "").lower()
+    toks: set[str] = set()
+    try:
+        import jieba  # noqa: PLC0415
+        for w in jieba.cut(text):
+            w = w.strip()
+            if len(w) >= 2 and not w.isspace():
+                toks.add(w)
+    except Exception:  # noqa: BLE001 — jieba 缺失/异常时零依赖退化
+        # 英文词
+        for w in re.findall(r"[a-z0-9_]{2,}", text):
+            toks.add(w)
+        # 中文 2-gram
+        han = re.findall(r"[一-鿿]+", text)
+        for seg in han:
+            for i in range(len(seg) - 1):
+                toks.add(seg[i:i + 2])
+    return toks
+
+
+def select_relevant_knowhow(slug: str, task_text: str, top_n: int = 8) -> str | None:
+    """按与当前任务的关键词重叠度，从该 Agent 的 knowhow 段落里挑最相关的 top_n 条。
+
+    - 文件里的 knowhow 全量保留，本函数只决定「本轮注入系统提示」时展示哪几条。
+    - 条目数 <= top_n 或无有效任务文本时，原样返回整段（不做筛选）。
+    - 返回可直接注入的段落文本（含标题）；无 knowhow 段落时返回 None。
+    条目尾部的 <!-- akivili:task:ID --> 标记在展示时剥离（对模型无意义、且占 token）。
+    """
+    mem = read_memory(slug)
+    body = _managed_body(mem, "knowhow")
+    if not body:
+        return None
+    bullets = [ln.strip()[2:].strip() for ln in body.splitlines() if ln.strip().startswith("- ")]
+    if not bullets:
+        return None
+
+    def _clean(b: str) -> str:
+        return re.sub(r"\s*<!-- akivili:task:\d+ -->\s*$", "", b).strip()
+
+    cleaned = [_clean(b) for b in bullets]
+    q = _tokens(task_text)
+    title = "## 🧠 工作经验与 Know-how（做同类任务前先看）"
+    # 条目不多 或 无任务关键词 → 全给（剥标记）
+    if len(cleaned) <= top_n or not q:
+        return title + "\n\n" + "\n".join(f"- {b}" for b in cleaned)
+    # 按重叠词数打分，稳定排序（分数降序，原顺序为次键）
+    scored = sorted(
+        ((len(q & _tokens(b)), -i, b) for i, b in enumerate(cleaned)),
+        key=lambda x: (x[0], x[1]), reverse=True)
+    picked = [b for _s, _i, b in scored[:top_n]]
+    return title + "\n\n" + "\n".join(f"- {b}" for b in picked)
+
+
 def purge_task_memory(slug: str, task_ids: list[int]) -> int:
     """从该 Agent 记忆里删除属于给定任务的条目（recent 块 + knowhow 条目）。
 
