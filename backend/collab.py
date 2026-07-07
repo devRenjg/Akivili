@@ -426,7 +426,9 @@ async def _run_one(item: dict) -> None:
     #    届时把父+全部子任务的经验一起沉淀。
     if run_status == "done" and final_text and not is_leader:
         from progress import on_execution_complete
-        await on_execution_complete(task_id)
+        # 传本 run 的队列行 id：此刻它的 done 标记还没写（在 _process_one finally 里），
+        # 需从"是否还有待跑 run"里排除自己，否则父任务永远收不了尾。
+        await on_execution_complete(task_id, exclude_run_id=item.get("id"))
     return run_status
 
 

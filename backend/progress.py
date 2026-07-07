@@ -66,16 +66,25 @@ async def task_progress(task_id: int) -> dict:
     }
 
 
-async def _has_pending_run(task_ids: list[int]) -> bool:
-    """这些任务里是否还有排队/运行中的 run（判断"是否还在执行"）。"""
+async def _has_pending_run(task_ids: list[int], exclude_run_id: int | None = None) -> bool:
+    """这些任务里是否还有排队/运行中的 run（判断"是否还在执行"）。
+
+    exclude_run_id: 排除某个 run_queue 行——用于"刚跑完的 run 触发本次检查、但其队列行
+    尚未被 _process_one 的 finally 标为 done"的时刻（否则它会把自己算成 pending，
+    导致父任务永远等不到"全部完成"、无法自动进验证中/唤醒汇总）。
+    """
     if not task_ids:
         return False
     db = await get_connection()
     try:
         ph = ",".join("?" * len(task_ids))
-        row = await (await db.execute(
-            f"SELECT COUNT(*) c FROM run_queue WHERE task_id IN ({ph}) AND status IN ('queued','running')",
-            task_ids)).fetchone()
+        sql = (f"SELECT COUNT(*) c FROM run_queue "
+               f"WHERE task_id IN ({ph}) AND status IN ('queued','running')")
+        params = list(task_ids)
+        if exclude_run_id is not None:
+            sql += " AND id<>?"
+            params.append(exclude_run_id)
+        row = await (await db.execute(sql, params)).fetchone()
         return bool(row and row["c"])
     finally:
         await db.close()
@@ -161,13 +170,17 @@ async def _advance_and_summarize_parent(parent_id: int) -> None:
     await collab.enqueue_run(parent_id, leader_slug, summary_prompt, "collaborate", is_leader=True)
 
 
-async def on_execution_complete(task_id: int) -> None:
+async def on_execution_complete(task_id: int, exclude_run_id: int | None = None) -> None:
     """某任务的 run 执行成功后调用，处理执行完成后的状态流转（**绝不触发经验沉淀**）：
 
     - 子任务执行完 → 直接置「完成(done)」（子任务无"验证中"概念），不触发沉淀；
       随后若父任务的全部子任务都已 done → 父任务自动进「验证中」等人工验收。
     - 无子任务的独立顶层任务执行完 → 自身进「验证中」等人工验收。
     经验沉淀 + 已解决计数一律由人工验收（routes/tasks.py 把父/独立任务置 done）触发。
+
+    exclude_run_id: 触发本次调用的 run_queue 行 id。此刻它可能还是 running（其 done 标记
+    在 _process_one 的 finally 里、晚于本调用），需从"是否还有待跑 run"判断中排除，
+    否则最后一个完成的子任务会把自己算作 pending，父任务永远无法自动收尾。
     """
     db = await get_connection()
     try:
@@ -191,7 +204,7 @@ async def on_execution_complete(task_id: int) -> None:
             await db.close()
         sub_ids = [r["id"] for r in subs]
         all_done = all(r["status"] == "done" for r in subs)
-        if all_done and not await _has_pending_run([parent_id] + sub_ids):
+        if all_done and not await _has_pending_run([parent_id] + sub_ids, exclude_run_id):
             # 父任务进「验证中」并唤醒负责人做统一汇总汇报（协同闭环收尾）
             await _advance_and_summarize_parent(parent_id)
     else:
@@ -202,7 +215,7 @@ async def on_execution_complete(task_id: int) -> None:
                 "SELECT id FROM tasks WHERE parent_task_id=?", (task_id,))).fetchall()]
         finally:
             await db.close()
-        if sub_ids or await _has_pending_run([task_id]):
+        if sub_ids or await _has_pending_run([task_id], exclude_run_id):
             return
         await _set_reviewing(task_id, "执行完成，自动进入验证中，等待人工验收")
 

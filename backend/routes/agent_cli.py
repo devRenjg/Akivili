@@ -176,10 +176,13 @@ async def set_status(req: StatusReq):
 
     target = req.status
     downgraded = False
+    # 子任务没有"验证中"概念：子任务执行完就是 done（随父任务整体验收）。
+    # Agent 对子任务标 reviewing → 归一为 done，避免子任务卡在 reviewing、父任务永远等不齐。
+    if is_subtask and target == "reviewing":
+        target = "done"
     # 拦截 Agent 标 done → 降级为 reviewing（执行完成、待人工验收）。
-    # 但**子任务没有"验证中"概念**：子任务执行完就直接 done，随父任务整体验收，
-    # 故仅对顶层任务降级；子任务 done 正常放行。
-    if target == "done" and not is_subtask:
+    # 仅对顶层任务降级；子任务 done 正常放行。
+    elif target == "done" and not is_subtask:
         target = "reviewing"
         downgraded = True
 
@@ -194,10 +197,20 @@ async def set_status(req: StatusReq):
         note = "执行完成，进入验证中，等待人工验收（Agent 不能直接标记完成）" if downgraded else ""
         await log_activity(req.task_id, "status_changed", "agent", req.agent_slug,
                            {"from": old_status, "to": target, **({"note": note} if note else {})})
-    # 子任务被标 done：若父任务全部子任务已完成，自动把父任务推进到「验证中」等人工验收
+    # 子任务被标 done：若父任务全部子任务已完成，自动把父任务推进到「验证中」等人工验收。
+    # 该 agent 是在自己的 run 执行中调 jian status done 的，其 run_queue 行此刻仍是 running，
+    # 需排除自己，否则会被算成 pending 而阻止父任务收尾。
     if is_subtask and target == "done":
         import progress as _progress
-        await _progress.on_execution_complete(req.task_id)
+        db = await get_connection()
+        try:
+            own = await (await db.execute(
+                "SELECT id FROM run_queue WHERE task_id=? AND agent_slug=? AND status='running' "
+                "ORDER BY id DESC LIMIT 1", (req.task_id, req.agent_slug))).fetchone()
+        finally:
+            await db.close()
+        await _progress.on_execution_complete(
+            req.task_id, exclude_run_id=own["id"] if own else None)
     return {"ok": True, "status": target,
             **({"note": "任务需人工验收，已置为 reviewing（验证中），不能由 Agent 直接完成"} if downgraded else {})}
 
