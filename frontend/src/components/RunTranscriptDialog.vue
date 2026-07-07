@@ -49,8 +49,8 @@
         <div v-for="it in displayItems" :key="it.seq" :ref="(el) => setRef(it.seq, el)"
              class="tr-row" :class="{ sel: selectedSeq === it.seq }">
           <div class="tr-row-head" :class="{ clickable: hasDetail(it) }" @click="hasDetail(it) && toggle(it.seq)">
-            <span v-if="hasDetail(it)" class="tr-caret">{{ open[it.seq] ? '▾' : '▸' }}</span>
-            <span v-if="labelOf(it)" class="tr-badge" :class="`badge-${colorOf(it)}`">{{ labelOf(it) }}</span>
+            <span class="tr-caret">{{ hasDetail(it) ? (open[it.seq] ? '▾' : '▸') : '' }}</span>
+            <span class="tr-badge" :class="`badge-${colorOf(it)}`">{{ labelOf(it) }}</span>
             <span class="tr-summary" :class="{ err: it.channel === 'stderr' }">{{ summaryOf(it) || '（空）' }}</span>
             <span class="tr-time" :title="it.ts">{{ clockTime(it.ts) }}</span>
           </div>
@@ -129,11 +129,11 @@ function labelOf(it) {
   if (it.channel === 'thinking') return '思考'
   if (it.channel === 'stderr') return '错误'
   if (it.channel === 'system') return '系统'
-  return '发言'   // 助手发言：绿色「发言」标签（colorOf 返回 agent=绿）
+  return 'Agent'   // 助手发言：绿色「Agent」标签（colorOf 返回 agent=绿）
 }
 // 筛选下拉用（与行内一致；保留以便将来两者需分开）
 function filterLabel(it) {
-  return labelOf(it) || '发言'
+  return labelOf(it) || 'Agent'
 }
 function summaryOf(it) {
   if (it.channel === 'tool') {

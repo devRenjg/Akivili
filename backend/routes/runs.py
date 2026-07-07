@@ -194,16 +194,26 @@ async def get_runs(task_id: int):
 
 
 async def _run_summary(db, run_id: int) -> str:
-    """一行运行摘要：优先首条工具命令（如 Bash 命令），否则首条助手文本；都无则空。"""
-    # 首条工具调用的命令/参数
+    """一行运行摘要：取这次会话开始的几句话（Agent 的开场发言/文本），而非工具命令。
+
+    优先该 run 的首条助手文本（stdout / thinking）；都没有时才回退到首个工具动作。
+    """
+    # 首条会话文本（助手流式发言优先，其次思考）——即"会话开始的前几句话"
     trow = await (await db.execute(
+        "SELECT content FROM run_logs WHERE run_id=? AND channel IN ('stdout','thinking') "
+        "ORDER BY id LIMIT 1", (run_id,))).fetchone()
+    if trow and (trow["content"] or "").strip():
+        s = trow["content"].strip().replace("\n", " ")
+        return redact_secrets(s[:80])
+    # 回退：首个工具动作（无任何文本时）
+    tool = await (await db.execute(
         "SELECT tool, tool_input FROM run_logs WHERE run_id=? AND channel='tool' ORDER BY id LIMIT 1",
         (run_id,))).fetchone()
-    if trow:
+    if tool:
         import json as _json
-        tool = trow["tool"] or "工具"
+        name = tool["tool"] or "工具"
         try:
-            inp = _json.loads(trow["tool_input"]) if trow["tool_input"] else {}
+            inp = _json.loads(tool["tool_input"]) if tool["tool_input"] else {}
         except (ValueError, TypeError):
             inp = {}
         key = ""
@@ -212,15 +222,7 @@ async def _run_summary(db, run_id: int) -> str:
             if isinstance(v, str) and v.strip():
                 key = v.strip().replace("\n", " ")
                 break
-        s = f"{tool}: {key}" if key else f"调用 {tool}"
-        return redact_secrets(s[:100])
-    # 否则首条助手文本
-    srow = await (await db.execute(
-        "SELECT content FROM run_logs WHERE run_id=? AND channel='stdout' ORDER BY id LIMIT 1",
-        (run_id,))).fetchone()
-    if srow and (srow["content"] or "").strip():
-        s = srow["content"].strip().replace("\n", " ")
-        return redact_secrets(s[:100])
+        return redact_secrets((f"{name}: {key}" if key else f"调用 {name}")[:80])
     return ""
 
 
