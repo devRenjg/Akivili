@@ -175,6 +175,7 @@ async def get_messages(task_id: int):
 
 @router.get("/tasks/{task_id}/runs")
 async def get_runs(task_id: int):
+    """任务的执行历史列表。每条附一行 summary（命令缩略版）供执行日志区紧凑展示。"""
     db = await get_connection()
     try:
         rows = await (await db.execute(
@@ -185,10 +186,42 @@ async def get_runs(task_id: int):
             for col in ("started_at", "ended_at"):
                 if col in d:
                     d[col] = to_beijing(d[col])
+            d["summary"] = await _run_summary(db, r["id"])
             out.append(d)
         return {"runs": out}
     finally:
         await db.close()
+
+
+async def _run_summary(db, run_id: int) -> str:
+    """一行运行摘要：优先首条工具命令（如 Bash 命令），否则首条助手文本；都无则空。"""
+    # 首条工具调用的命令/参数
+    trow = await (await db.execute(
+        "SELECT tool, tool_input FROM run_logs WHERE run_id=? AND channel='tool' ORDER BY id LIMIT 1",
+        (run_id,))).fetchone()
+    if trow:
+        import json as _json
+        tool = trow["tool"] or "工具"
+        try:
+            inp = _json.loads(trow["tool_input"]) if trow["tool_input"] else {}
+        except (ValueError, TypeError):
+            inp = {}
+        key = ""
+        for k in ("command", "file_path", "path", "pattern", "query", "description"):
+            v = inp.get(k)
+            if isinstance(v, str) and v.strip():
+                key = v.strip().replace("\n", " ")
+                break
+        s = f"{tool}: {key}" if key else f"调用 {tool}"
+        return redact_secrets(s[:100])
+    # 否则首条助手文本
+    srow = await (await db.execute(
+        "SELECT content FROM run_logs WHERE run_id=? AND channel='stdout' ORDER BY id LIMIT 1",
+        (run_id,))).fetchone()
+    if srow and (srow["content"] or "").strip():
+        s = srow["content"].strip().replace("\n", " ")
+        return redact_secrets(s[:100])
+    return ""
 
 
 @router.get("/runs/{run_id}/logs")

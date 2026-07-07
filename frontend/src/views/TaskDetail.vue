@@ -157,32 +157,22 @@
           <div v-else-if="progress.sub_total > 0" class="exec-progress done-hint">
             子任务 {{ progress.sub_done }}/{{ progress.sub_total }} 完成{{ progress.sub_done === progress.sub_total ? ' · 待负责人汇总收尾' : '' }}
           </div>
-          <div v-for="r in runs" :key="r.id" class="run-item">
-            <div class="run-head">
-              <!-- 执行状态图标：执行中/失败/终止可点（终止/重跑），完成仅展示 -->
-              <button v-if="r.status === 'running'" class="run-ico running"
-                      :title="isAdmin ? '点击终止执行' : '执行中'"
-                      :disabled="!isAdmin" @click.stop="isAdmin && onRunDot(r)">
-                <el-icon><VideoPause /></el-icon>
-              </button>
-              <button v-else-if="r.status === 'failed'" class="run-ico failed"
-                      :title="isAdmin ? '执行失败 · 点击重新执行' : '执行失败'"
-                      :disabled="!isAdmin" @click.stop="isAdmin && onRunDot(r)">
-                <el-icon><CircleCloseFilled /></el-icon>
-              </button>
-              <button v-else-if="r.status === 'killed'" class="run-ico killed"
-                      :title="isAdmin ? '已终止 · 点击重新执行' : '已终止'"
-                      :disabled="!isAdmin" @click.stop="isAdmin && onRunDot(r)">
-                <el-icon><RemoveFilled /></el-icon>
-              </button>
-              <span v-else class="run-ico succeeded" title="已完成">
-                <el-icon><SuccessFilled /></el-icon>
-              </span>
-              <span class="run-agent" @click="openTranscript(r)">{{ agentDisplayBySlug(r.agent_slug) }}</span>
-              <span class="run-detail-btn" title="查看所有命令与运行时详情"
-                    @click.stop="openTranscript(r)">日志详情</span>
+          <!-- 进行中的运行：始终展示 -->
+          <RunRow v-for="r in activeRuns" :key="r.id" :run="r" :agent="runAgent(r)"
+                  :time="relTime(r.started_at)" :is-admin="isAdmin"
+                  @ctrl="onRunDot(r)" @detail="openTranscript(r)" />
+          <!-- 历史运行：折叠，点开展开全部 -->
+          <template v-if="pastRuns.length">
+            <div class="run-hist-toggle" @click="showPastRuns = !showPastRuns">
+              <span class="rh-caret">{{ showPastRuns ? '▾' : '▸' }}</span>
+              {{ showPastRuns ? '隐藏历史运行' : '显示历史运行' }}（{{ pastRuns.length }}）
             </div>
-          </div>
+            <template v-if="showPastRuns">
+              <RunRow v-for="r in pastRuns" :key="r.id" :run="r" :agent="runAgent(r)"
+                      :time="relTime(r.ended_at || r.started_at)" :is-admin="isAdmin"
+                      @ctrl="onRunDot(r)" @detail="openTranscript(r)" />
+            </template>
+          </template>
           <div v-if="runs.length === 0" class="side-empty">还没有执行记录</div>
         </div>
       </div>
@@ -230,13 +220,14 @@
 import { ref, computed, nextTick, inject, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { ArrowLeft, VideoPause, CircleCloseFilled, RemoveFilled, SuccessFilled } from '@element-plus/icons-vue'
+import { ArrowLeft, VideoPause } from '@element-plus/icons-vue'
 import { tasksApi, runsApi, projectAgentsApi } from '../api'
 import { displayName } from '../utils/agentDisplay'
 import AgentAvatar from '../components/AgentAvatar.vue'
 import MentionTextarea from '../components/MentionTextarea.vue'
 import RunTranscriptDialog from '../components/RunTranscriptDialog.vue'
 import MarkdownView from '../components/MarkdownView.vue'
+import RunRow from '../components/RunRow.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -261,6 +252,7 @@ const team = ref([])
 const timeline = ref([])
 const subtasks = ref([])
 const runs = ref([])
+const showPastRuns = ref(false)
 const input = ref('')
 const atSlug = ref('')
 const streaming = ref(false)
@@ -347,6 +339,24 @@ function agentDisplayBySlug(slug) {
 }
 function subAgent(s) {
   return team.value.find((x) => x.slug === s.assignee_slug) || { emoji: '🤖' }
+}
+// 执行历史：进行中始终展示，历史折叠
+const activeRuns = computed(() => runs.value.filter((r) => r.status === 'running'))
+const pastRuns = computed(() => runs.value.filter((r) => r.status !== 'running'))
+function runAgent(r) { return team.value.find((x) => x.slug === r.agent_slug) || null }
+// 相对时间：刚刚 / N 分钟前 / N 小时前 / N 天前（ts 为北京时间 'YYYY-MM-DD HH:MM:SS'）
+function relTime(ts) {
+  if (!ts) return ''
+  const t = new Date(ts.replace(' ', 'T')).getTime()
+  if (isNaN(t)) return ''
+  const diff = Date.now() - t
+  const m = Math.floor(diff / 60000)
+  if (m < 1) return '刚刚'
+  if (m < 60) return `${m} 分钟前`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h} 小时前`
+  const d = Math.floor(h / 24)
+  return `${d} 天前`
 }
 
 // 动态折叠
@@ -621,31 +631,11 @@ onUnmounted(stopPolling)
 .side-label { width: 56px; font-size: 13px; color: #909399; flex-shrink: 0; }
 .side-ctrl { flex: 1; }
 .side-val { font-size: 13px; color: #303133; }
-.run-item { border: 1px solid #ebeef5; border-radius: 8px; margin-bottom: 8px; background: #fff; }
-.run-head { display: flex; align-items: center; gap: 8px; padding: 9px 12px; font-size: 12px; }
-/* 执行状态图标（Element Plus 图标）：填充图标自带形状，仅上色；执行中另加红色圆底 */
-.run-ico { flex-shrink: 0; border: none; background: none; padding: 0; display: inline-flex;
-  align-items: center; justify-content: center; font-size: 16px; line-height: 1; }
-.run-ico .el-icon { font-size: 16px; }
-.run-ico.succeeded { color: #67c23a; }
-.run-ico.failed { color: #f56c6c; cursor: pointer; }
-.run-ico.failed:hover { color: #f23c3c; }
-.run-ico.killed { color: #909399; cursor: pointer; }
-.run-ico.killed:hover { color: #606266; }
-/* 执行中：红色圆底 + 白色停止图标，脉冲呼吸提示「可点击终止」 */
-.run-ico.running { width: 18px; height: 18px; border-radius: 50%; background: #f56c6c;
-  color: #fff; cursor: pointer; animation: run-pulse 1.6s ease-in-out infinite; }
-.run-ico.running .el-icon { font-size: 11px; }
-.run-ico.running:hover { background: #f23c3c; animation: none; }
-.run-ico.running:disabled { cursor: default; }
-@keyframes run-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(245,108,108,.5); }
-  50% { box-shadow: 0 0 0 4px rgba(245,108,108,0); }
-}
-.run-agent { flex: 1; color: #606266; cursor: pointer; }
-.run-detail-btn { font-size: 11px; color: #409eff; cursor: pointer; padding: 1px 6px;
-  border: 1px solid #d9ecff; border-radius: 4px; background: #ecf5ff; flex-shrink: 0; }
-.run-detail-btn:hover { background: #d9ecff; }
+/* 历史运行折叠开关 */
+.run-hist-toggle { display: flex; align-items: center; gap: 4px; font-size: 12px; color: #909399;
+  cursor: pointer; padding: 6px 8px; border-radius: 6px; }
+.run-hist-toggle:hover { background: #f5f7fa; color: #606266; }
+.rh-caret { width: 12px; color: #c0c4cc; }
 .exec-progress { background: #fdf6ec; border: 1px solid #f5dab1; border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
 .exec-progress.done-hint { background: #f0f9eb; border-color: #d1edc4; color: #67c23a; font-size: 12px; }
 .exec-progress-head { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: #b88230; margin-bottom: 8px; }
