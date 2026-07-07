@@ -400,7 +400,9 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
   font-size: 12px; color: #5a6b5a; line-height: 1.5;
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
 }
-.tc-run { font-size: 12px; }
+/* 执行状态始终固定在右侧：无论有无子任务进度(☑ N/M)，都用 margin-left:auto 推到最右，
+   避免"有子任务进度时靠右、无子任务进度时靠左"的横跳 */
+.tc-run { font-size: 12px; margin-left: auto; }
 .run-running { color: #e6a23c; }
 .run-succeeded { color: #67c23a; }
 .run-failed { color: #f56c6c; }

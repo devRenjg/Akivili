@@ -50,7 +50,7 @@ async def list_tasks(pid: int):
                       (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id=t.id) AS sub_total,
                       (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id=t.id AND c.status='done') AS sub_done
                FROM tasks t WHERE t.project_id=? AND t.parent_task_id IS NULL
-               ORDER BY t.order_idx, t.id""", (pid,))).fetchall()
+               ORDER BY t.created_at DESC, t.id DESC""", (pid,))).fetchall()
         tasks = [dict(r) for r in rows]
         # 取每个顶层任务的子任务（看板卡片下方嵌套小卡展示）
         sub_rows = await (await db.execute(
