@@ -125,7 +125,7 @@ function colorOf(it) {
 }
 function labelOf(it) {
   if (it.channel === 'tool') return it.tool || '工具'
-  if (it.channel === 'tool_result') return it.tool ? `${it.tool} 结果` : '结果'
+  if (it.channel === 'tool_result') return '结果'
   if (it.channel === 'thinking') return '思考'
   if (it.channel === 'stderr') return '错误'
   if (it.channel === 'system') return '系统'
