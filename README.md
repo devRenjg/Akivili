@@ -25,7 +25,7 @@ Akivili 是一个**本地优先（local-first）**的多 Agent 编排平台：
 - Agent 记忆：每个 Agent 跨项目共用持久记忆，自动写入工作区约束与 Skills 说明；分「近期动态」滚动段落与「Know-how」经验段落
 - Skills 库：能力指令文本库，可导入 / 新建 / 下载，Agent 按需启用
 - 工作区看板：Trello 式任务看板，细粒度状态 + 优先级 + 子任务（父卡片下嵌套小卡片）+ 活动时间线（两栏详情）；「验证中」独立成列
-- Agent 真实执行：@ 分派，CLI 在项目目录真实改文件跑命令 / API 对话，流式输出，可 Kill / 查日志
+- Agent 真实执行：@ 分派，CLI 在项目目录真实改文件跑命令 / API 对话，流式输出，可 Kill / 查日志；会话正文只留真实交付（CLI 交付经 jian comment / 过程碎语归日志，API 回复即产出）
 - 执行日志与历史：右侧执行日志区进行中运行常显、历史运行折叠可展开，每行为命令缩略 + 状态图标（hover 看 Agent）+ 相对时间；点「日志详情」进弹窗，逐条还原命令的完整参数与运行结果（timeline + 过滤 + 排序 + 复制 + 执行时间 + 供应商·模型），执行中实时展开看命令，敏感信息自动脱敏
 - 富文本渲染：任务描述与消息按 Markdown 渲染（标题/粗体/列表/表格/代码块/图片/可点击链接），DOMPurify 消毒防 XSS
 - 多 Agent 协同：Team Leader 统筹调度、@mention/子任务委派、成员执行回报、并发池调度（多成员并行、跨供应商）、父子任务闭环收尾（全子完成自动唤醒负责人汇总汇报）、卡死超时兜底（按角色可配）、多层防死循环
@@ -221,6 +221,15 @@ JianAgency/
 > ⚠️ **安全提醒**：管理员触发 Agent 执行时为放开权限模式，Agent 能在本机改文件、跑命令。请仅在可信内网开放，妥善设置并保管管理员密码。如需真正的域名，请让内网 DNS 把名称解析到本机 IP。
 
 ## 版本记录
+
+### v0.14.1 — 2026-07-07
+- 🧹 **会话正文只留真实交付，命令过程碎语归入日志**（OpenSpec change：`2026-07-07-cli-stdout-not-in-thread`，能力 `agent-execution`）
+  - **问题**：CLI Agent（Claude/Codex）的会话正文里混进大量执行过程碎语——如「`jian` 命令通过 `jian.bat` 调用」「设 `PYTHONUTF8=1`」「连通正常（roster 已取到，仅打印 GBK 编码崩）」「结尾那句是终端编码显示问题，实际已发送成功」。正常问答/结论没问题，但命令细节不该进正文。
+  - **根因**：`runner.execute_dispatch` 把后端的**流式 stdout 全文**无条件落成一条会话消息。而 CLI Agent 的**真实交付**走 `jian comment`/`jian subtask`（已单独落库、干净）——同一产出被记两遍。线上数据印证：每条噪声消息长度与对应 run 的 stdout 落库长度逐条精确相等。
+  - **修复**：按后端类型分流——**CLI 后端的流式 stdout 不再落成会话正文消息**（仍全量进 `run_logs`，日志详情可排查）；**API 后端不变**（无 jian 通道，stdout 即唯一产出，照常展示）。与 `_persist_memory` 既有原则一致（jian comment 发言＝真实产出 ＞ stdout 兜底）；收工写记忆的 stdout 兜底不受影响。
+  - **CLI 未走 jian 交付时打标记，不拿 stdout 兜底**：目标是让 `jian comment` 100% 出现，而非用可能错误的 stdout 结论兜底（无意义）。若某 CLI run 成功结束却无任何 jian 平台动作（`jian comment` 落消息 / `jian subtask`/`jian status` 记活动），落一条 `⚠️ …未通过 jian comment/subtask 提交交付…` 系统活动便于追查（stdout 仍在日志详情里）；`_has_jian_deliverable` 兼顾"只委派不发言"的 Leader，不误判。
+  - **历史噪声清理**：全库按三重精确判据（内容==该 run stdout 拼接 + 同会话同 agent + CLI 供应商）识别出 9 条 stdout-mirror 噪声（克里珀 task53/55/56/57/58/59），删前备份 `jianagency.db` 且逐条校验同会话同 agent 另有 jian 交付（正文不空），按精确 msg id 删除、复核残留 0。
+  - 验证：`TestReport/run_stdout_display_probe.py` **8/8**（CLI stdout 不落正文但进日志 / 无 jian 打标记 / jian 交付保留且不打标记 / API 照落且不打标记）；QA 套件 28/30 等回归与改动前基线逐项一致（既有 2 项协同排序失败为测试 harness 漂移、与本改动无关）。仅改 `backend/executor/runner.py`，前端无改动、无数据迁移。
 
 ### v0.14.0 — 2026-07-07
 - 📜 **执行日志与历史列表重做+ 日志详情增强**（OpenSpec change：`2026-07-07-exec-log-history-and-fixes`）

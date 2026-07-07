@@ -399,10 +399,16 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     else:
         status = "succeeded"
 
-    # 落库助手消息 + 收工写记忆。流式文本作为记忆兜底（CLI Agent 真实结论多在 jian comment/messages 里，
-    # _persist_memory 会优先取那份）。_persist_memory 幂等：与超时兜底 finalize_run 谁先跑谁 pop 上下文。
-    if final_text:
+    # 落库助手消息（决定会话正文里展示什么）：按后端类型分流。
+    #   - CLI 后端（claude/codex）：Agent 的**真实交付**走 `jian comment`/`jian subtask`（已单独落库、干净）。
+    #     流式 stdout 是「边干边碎念」的过程文本（jian.bat 调用、设 PYTHONUTF8、编码显示问题……），
+    #     只应进 run_logs 供日志详情排查，**不落成会话消息**，否则会把命令细节塞进正文污染阅读。
+    #   - API 后端：无 jian 通道，stdout final_text **即** Agent 的唯一产出，必须落库展示。
+    # 与 _persist_memory 的判别原则一致（jian comment 发言=真实产出 > stdout 兜底）。
+    is_cli = bool(provider and provider.type in ("claude-cli", "codex-cli"))
+    if final_text and not is_cli:
         await _save_assistant(conv_id, final_text, author_slug=slug)
+    # 流式文本始终作为「收工写记忆」的兜底（_persist_memory 仍优先取 jian comment 发言）。
     if run_id in _RUN_CTX:
         _RUN_CTX[run_id]["stream_text"] = final_text
     await _finish_run(run_id, status)
@@ -411,6 +417,16 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     act = {"succeeded": "task_completed", "failed": "task_failed", "killed": "task_failed"}[status]
     await log_activity(task["id"], act, "agent", agent.get("name", slug),
                        {"run_id": run_id, "summary": final_text[:120]})
+
+    # CLI run 未产出 jian 交付的标记：CLI Agent 的真实产出必须走 jian comment/subtask 落库。
+    # 若本轮成功结束、却没有任何该 Agent 的落库发言（只在 stdout 说了话、忘了 jian），
+    # 正文里会没有它的痕迹 —— 我们**不拿 stdout 错误兜底**（目标是让 jian comment 100% 出现），
+    # 而是打一条醒目活动标记，便于发现并追查（stdout 全文仍在 run_logs / 日志详情里）。
+    if (is_cli and status == "succeeded" and final_text
+            and not await _has_jian_deliverable(conv_id, slug, user_msg_id, task["id"], run_id)):
+        await log_activity(task["id"], "commented", "system", "",
+                           {"note": f"⚠️ {agent.get('name', slug)} 本轮只在终端输出、未通过 jian comment/subtask "
+                                    f"提交交付，正文无其产出（完整过程见执行日志详情 run #{run_id}）。"})
 
 
 async def _log(run_id: int, channel: str, content: str,
@@ -424,6 +440,35 @@ async def _log(run_id: int, channel: str, content: str,
             "VALUES (?,?,?,?,?,?)",
             (run_id, channel, content, tool, ti, tool_output))
         await db.commit()
+    finally:
+        await db.close()
+
+
+async def _has_jian_deliverable(conv_id: int, slug: str, since_msg_id: int,
+                                task_id: int, run_id: int) -> bool:
+    """本轮该 Agent 是否用 jian 做过真实平台动作（发言 / 建卡 / 改状态）。
+
+    覆盖 jian 的三条落库路径（agent_cli.py），任一命中即视为有交付：
+    - `jian comment`：在本会话落一条 author_slug=<本人> 的 assistant 消息（不记活动）
+      → 查本轮起点 since_msg_id 之后、作者为本人的消息。
+    - `jian subtask`：记一条 action='commented'、actor_name=<本人 slug> 的活动（委派/自产出子任务）。
+    - `jian status`：记一条 action='status_changed'、actor_name=<本人 slug> 的活动。
+      → 查本 run 启动之后（created_at >= task_runs.started_at）该 slug 的上述活动。
+    CLI 后端的 stdout 已不落会话消息，故消息检查不会把 stdout 误判成交付。
+    """
+    db = await get_connection()
+    try:
+        msg = await (await db.execute(
+            "SELECT 1 FROM messages WHERE conversation_id=? AND id>? AND role='assistant' "
+            "AND author_slug=? LIMIT 1", (conv_id, since_msg_id, slug))).fetchone()
+        if msg is not None:
+            return True
+        act = await (await db.execute(
+            "SELECT 1 FROM activities a JOIN task_runs r ON r.id=? "
+            "WHERE a.task_id=? AND a.actor_type='agent' AND a.actor_name=? "
+            "AND a.action IN ('commented','status_changed') AND a.created_at >= r.started_at LIMIT 1",
+            (run_id, task_id, slug))).fetchone()
+        return act is not None
     finally:
         await db.close()
 
