@@ -50,6 +50,13 @@ async def task_progress(task_id: int) -> dict:
             f"""SELECT task_id, agent_slug, status FROM run_queue
                 WHERE task_id IN ({ph}) AND status IN ('queued','running')
                 ORDER BY id""", all_ids)).fetchall()
+        # 负责人是否已做过收尾汇总：父任务上有一条以负责人身份完成的 collaborate run
+        parent = await (await db.execute("SELECT status FROM tasks WHERE id=?", (task_id,))).fetchone()
+        parent_status = parent["status"] if parent else ""
+        summ = await (await db.execute(
+            "SELECT 1 FROM run_queue WHERE task_id=? AND is_leader=1 AND trigger='collaborate' "
+            "AND status='done' LIMIT 1", (task_id,))).fetchone()
+        summarized = bool(summ)
     finally:
         await db.close()
 
@@ -63,6 +70,8 @@ async def task_progress(task_id: int) -> dict:
         "running": running, "queued": queued,
         "sub_total": sub_total, "sub_done": sub_done,
         "active": bool(running or queued),
+        "parent_status": parent_status,
+        "summarized": summarized,
     }
 
 

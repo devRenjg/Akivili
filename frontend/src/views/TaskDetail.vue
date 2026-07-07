@@ -155,7 +155,7 @@
             </div>
           </div>
           <div v-else-if="progress.sub_total > 0" class="exec-progress done-hint">
-            子任务 {{ progress.sub_done }}/{{ progress.sub_total }} 完成{{ progress.sub_done === progress.sub_total ? ' · 待负责人汇总收尾' : '' }}
+            子任务 {{ progress.sub_done }}/{{ progress.sub_total }} 完成{{ subHintSuffix }}
           </div>
           <!-- 进行中的运行：始终展示 -->
           <RunRow v-for="r in activeRuns" :key="r.id" :run="r" :agent="runAgent(r)"
@@ -269,7 +269,16 @@ const transcriptAgentName = ref('')
 const isSubtask = computed(() => !!task.value?.parent_task_id)
 const tlEl = ref(null)
 const atBottom = ref(true)
-const progress = ref({ running: [], queued: [], sub_total: 0, sub_done: 0, active: false })
+const progress = ref({ running: [], queued: [], sub_total: 0, sub_done: 0, active: false,
+  parent_status: '', summarized: false })
+// 子任务进度提示后缀：全完成后按"是否已汇总/是否已验收"给准确措辞
+const subHintSuffix = computed(() => {
+  const p = progress.value
+  if (p.sub_done !== p.sub_total) return ''            // 尚未全完成
+  if (p.parent_status === 'done') return ' · 已完成'
+  if (p.summarized) return ' · 负责人已汇总，待人工验收'
+  return ' · 待负责人汇总收尾'
+})
 let pollTimer = null
 
 const subDone = computed(() => subtasks.value.filter((s) => s.status === 'done').length)
