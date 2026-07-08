@@ -27,10 +27,12 @@
         <div class="desc">{{ s.description || '（无描述）' }}</div>
         <div class="sc-foot">
           <el-tag size="small" effect="plain">{{ s.slug }}</el-tag>
-          <span class="dl-count">⬇ {{ s.download_count || 0 }}</span>
-          <el-button v-if="s.downloadable !== 0" text size="small" :icon="Download" @click.stop="doDownload(s)">
-            下载{{ s.is_dir ? ' zip' : ' .md' }}
-          </el-button>
+          <template v-if="s.downloadable !== 0">
+            <span class="dl-count">⬇ {{ s.download_count || 0 }}</span>
+            <el-button text size="small" :icon="Download" @click.stop="doDownload(s)">
+              下载{{ s.is_dir ? ' zip' : ' .md' }}
+            </el-button>
+          </template>
           <el-tag v-else size="small" type="info" effect="plain" title="该能力仅供 Agent 集成，不提供下载">🔒 仅集成</el-tag>
         </div>
       </el-card>
@@ -50,7 +52,7 @@
           <el-tag v-else size="small" type="info" effect="plain" title="该能力仅供 Agent 集成，不提供下载">🔒 仅供 Agent 集成</el-tag>
         </div>
         <p class="detail-desc">{{ detail.description }}</p>
-        <div v-if="isAdmin" class="dl-logs">
+        <div v-if="isAdmin && detail.downloadable !== 0" class="dl-logs">
           <div class="dl-logs-head">
             <span>下载记录（共 {{ dlTotal }} 次）</span>
             <el-button text size="small" @click="loadLogs">刷新</el-button>
@@ -131,7 +133,7 @@ async function openDetail(id) {
   detail.value = await skillsApi.detail(id)
   detailVisible.value = true
   dlLogs.value = []; dlTotal.value = 0
-  if (isAdmin.value) loadLogs()
+  if (isAdmin.value && detail.value.downloadable !== 0) loadLogs()
 }
 async function loadLogs() {
   if (!detail.value) return
