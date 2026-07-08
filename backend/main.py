@@ -93,6 +93,7 @@ async def _startup():
         await agents_mod.rescan()
     if await skills_mod.count_skills() == 0:
         await skills_mod.rescan()
+    await collab_mod.reclaim_orphan_runs()  # 回收重启前遗留的孤儿 running（消除「假执行中」）
     collab_mod.start_loop()   # 启动多 Agent 协同后台循环
 
 

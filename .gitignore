@@ -7,8 +7,9 @@ memory/*.md
 icon/
 
 # 内部取数 / 知识库 skill（含内部接口地址与凭证、内部数据表名，绝不公开）
+# bilisc-* 一律为内部 skill，整类排除；narya-data 单列。新增内部 skill 无需再改此处。
 skills/narya-data/
-skills/bilisc-kb-live-revenue/
+skills/bilisc-*/
 
 # TestReport 内部测试脚本与运行产物（不入公开仓）
 TestReport/

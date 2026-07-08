@@ -610,6 +610,42 @@ async def _loop():
         await asyncio.sleep(1.0)             # 队列空或池满：轮询间隔
 
 
+async def reclaim_orphan_runs() -> int:
+    """启动时回收孤儿 running：run_queue 里状态为 running 的行落成 failed。
+
+    run_queue 的执行由本进程内存态（_running 集合 + _process_one 协程）驱动。进程重启后
+    内存态清空，任何残留的 running 行都不可能再有协程去收尾（外部 kill 或重启中断都会留下
+    这种孤儿），会被 progress.py 误判为「任务仍在执行中」。启动时统一落终态，消除假象。
+
+    只在 start_loop 之前调用（此刻 _running 必为空、_loop 尚未领新活），故所有 running 皆为孤儿。
+    对应 task_runs 的终态由各自的 kill/finalize 路径负责，这里只补 run_queue 这一层。"""
+    db = await get_connection()
+    try:
+        rows = await (await db.execute(
+            "SELECT id, task_id, agent_slug FROM run_queue WHERE status='running'")).fetchall()
+        if not rows:
+            return 0
+        await db.execute("UPDATE run_queue SET status='failed' WHERE status='running'")
+        await db.commit()
+    finally:
+        await db.close()
+    # 落终态后，尝试推进各受影响任务的父任务状态（清掉「执行中」假象后可能可收尾）
+    from activity import log_activity
+    from progress import maybe_advance_parent
+    seen_tasks = set()
+    for r in rows:
+        if r["task_id"] in seen_tasks:
+            continue
+        seen_tasks.add(r["task_id"])
+        try:
+            await log_activity(r["task_id"], "task_failed", "system", "",
+                               {"note": f"重启前遗留的执行（队列 #{r['id']}）已回收为失败，非真正在执行"})
+            await maybe_advance_parent(r["task_id"])
+        except Exception:  # noqa: BLE001
+            pass
+    return len(rows)
+
+
 def start_loop():
     """FastAPI 启动时调用，拉起后台协同循环（幂等）。"""
     global _loop_started
