@@ -222,6 +222,13 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.6 — 2026-07-08
+- 🩹 **修复孤儿回收误伤已成功任务**（能力 `agent-collaboration`/`agent-execution`）
+  - **背景**：v0.16.x 的启动孤儿回收把所有 `running` 的 `task_runs` 一刀切落 `killed`。但「进程正常结束、只是 run 没落库」型孤儿也被误标，污染了**已成功任务**的真实终态。
+  - **两处症状**：①工作区卡片 `run_status` 取最新 run = killed → 已完成任务显「■已终止」而非「✓执行完成」；②团队成员「已完成任务数」（`solved_tasks`，要求 `run=succeeded AND task=done`）少计，数据工程师显 3、实际 4。
+  - **修**：(a) 回收改为**状态感知**——任务已 `done/reviewing` 的 running 孤儿落 `succeeded`、未收尾的才落 `killed`，且不给已完成任务记误导性「回收失败」活动；(b) 前端 `Workspace.vue` 新增 `effRunStatus`：任务 done/reviewing 时卡片一律显「执行完成」，不被单条 run 状态污染（双保险）。
+  - 孤儿回收探针升级 13/13；QA 31/31、concurrency 7/7 全绿。
+
 ### v0.16.5 — 2026-07-08
 - 💬 **对话框纵深放大 + 输入框 @mention 引入成员协作**（能力 `agent-collaboration`/`agent-execution`）
   - **对话区放大**：详情页 `max-width` 1280→1440；追加指令输入框 3 行→6 行（`min-height` 132px）、字号放大，多轮长对话更从容。

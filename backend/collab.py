@@ -638,6 +638,14 @@ async def reclaim_orphan_runs() -> int:
         if q_rows:
             await db.execute("UPDATE run_queue SET status='failed' WHERE status='running'")
         if r_rows:
+            # task_runs 孤儿的终态按其任务是否已成功收尾区分：
+            #  - 任务已 done/reviewing → 这条 run 正是任务成功的产出，落 succeeded（否则会把
+            #    已完成任务的成果 run 误标 killed，污染卡片「执行完成」显示与 solved_tasks 计数）；
+            #  - 任务未收尾 → 确是被中断的孤儿，落 killed。
+            await db.execute(
+                """UPDATE task_runs SET status='succeeded', ended_at=datetime('now')
+                   WHERE status='running' AND task_id IN (
+                       SELECT id FROM tasks WHERE status IN ('done','reviewing'))""")
             await db.execute(
                 "UPDATE task_runs SET status='killed', ended_at=datetime('now') WHERE status='running'")
         await db.commit()
@@ -651,13 +659,25 @@ async def reclaim_orphan_runs() -> int:
     for row in r_rows:
         runner._RUN_PIDS.pop(row["id"], None)
         runner._KILLED.discard(row["id"])
-    # 落终态后，记一条活动 + 尝试推进父任务状态（清掉「执行中」假象后可能可收尾）
+    if not affected_tasks:
+        return len(q_rows) + len(r_rows)
+    # 查受影响任务的当前状态：已 done/reviewing 的不记「回收失败」活动（那是成功任务、只是 run 没落库）
+    db = await get_connection()
+    try:
+        ph = ",".join("?" for _ in affected_tasks)
+        finished = {r["id"] for r in await (await db.execute(
+            f"SELECT id FROM tasks WHERE id IN ({ph}) AND status IN ('done','reviewing')",
+            tuple(affected_tasks))).fetchall()}
+    finally:
+        await db.close()
+    # 落终态后，对未收尾的任务记一条活动 + 尝试推进父任务状态（清掉「执行中」假象后可能可收尾）
     from activity import log_activity
     from progress import maybe_advance_parent
     for tid in affected_tasks:
         try:
-            await log_activity(tid, "task_failed", "system", "",
-                               {"note": "重启前遗留的「执行中」记录已回收（进程已不存在），非真正在执行"})
+            if tid not in finished:
+                await log_activity(tid, "task_failed", "system", "",
+                                   {"note": "重启前遗留的「执行中」记录已回收（进程已不存在），非真正在执行"})
             await maybe_advance_parent(tid)
         except Exception:  # noqa: BLE001
             pass

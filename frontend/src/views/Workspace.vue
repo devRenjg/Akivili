@@ -36,7 +36,7 @@
             </div>
             <div class="tc-foot">
               <span v-if="t.sub_total > 0" class="tc-sub">☑ {{ t.sub_done }}/{{ t.sub_total }}</span>
-              <span class="tc-run" :class="runClass(t.run_status)">{{ runLabel(t.run_status) }}</span>
+              <span class="tc-run" :class="runClass(effRunStatus(t))">{{ runLabel(effRunStatus(t)) }}</span>
             </div>
             <div class="tc-meta">
               <span class="tc-assignee">
@@ -295,6 +295,13 @@ function relTime(ts) {
 }
 
 // —— 执行状态徽标 ——
+// 有效执行状态：任务本身已收尾（done/reviewing）时，卡片以任务成功为准显示「执行完成」，
+// 不被某条 run 的 killed/failed 污染（如孤儿回收把已成功任务的最后一次 run 落成 killed）。
+// 仅当任务尚未收尾时，才如实反映最新 run 的执行态（执行中/失败/终止）。
+function effRunStatus(t) {
+  if (t.status === 'done' || t.status === 'reviewing') return 'succeeded'
+  return t.run_status
+}
 function runLabel(s) {
   return { running: '⚙️ 执行中', succeeded: '✓ 执行完成', failed: '✗ 失败', killed: '■ 已终止' }[s] || ''
 }
