@@ -26,14 +26,15 @@
         </div>
         <div class="desc">{{ s.description || '（无描述）' }}</div>
         <div class="sc-foot">
-          <el-tag size="small" effect="plain">{{ s.slug }}</el-tag>
+          <el-tag size="small" effect="plain" class="slug-chip">{{ s.slug }}</el-tag>
           <template v-if="s.downloadable !== 0">
             <span class="dl-count">⬇ {{ s.download_count || 0 }}</span>
             <el-button text size="small" :icon="Download" @click.stop="doDownload(s)">
               下载{{ s.is_dir ? ' zip' : ' .md' }}
             </el-button>
           </template>
-          <el-tag v-else size="small" type="info" effect="plain" title="该能力仅供 Agent 集成，不提供下载">🔒 仅集成</el-tag>
+          <el-tag v-else size="small" type="info" effect="plain" class="only-integrate"
+                  title="该能力仅供 Agent 集成，不提供下载">🔒 仅集成</el-tag>
         </div>
       </el-card>
       <el-empty v-if="!loading && list.length === 0" description="暂无 Skill" />
@@ -193,17 +194,35 @@ onMounted(load)
 .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
 .search { width: 320px; }
 .total { color: #909399; font-size: 13px; margin-left: auto; }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
-.skill-card { cursor: pointer; }
-.sc-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-.sc-head .emoji { font-size: 18px; color: #ffb02e; }
-.sc-head .name { font-weight: 600; font-size: 15px; }
-.desc {
-  color: #606266; font-size: 13px; line-height: 1.5; margin-bottom: 10px;
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; align-items: stretch; }
+/* 卡片等高：card 撑满 grid 行高，body 变纵向 flex，三区分别定位 */
+.skill-card { cursor: pointer; height: 100%; }
+.skill-card :deep(.el-card__body) { height: 100%; display: flex; flex-direction: column; }
+/* 第一区：名字（固定两行高度，长名字换行后仍与相邻卡片对齐） */
+.sc-head {
+  display: flex; align-items: flex-start; gap: 8px; margin-bottom: 8px;
+  min-height: 44px;
+}
+.sc-head .emoji { font-size: 18px; color: #ffb02e; line-height: 1.4; flex-shrink: 0; }
+.sc-head .name {
+  font-weight: 600; font-size: 15px; line-height: 1.4;
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
-.sc-foot { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.sc-head :deep(.el-tag) { flex-shrink: 0; margin-top: 1px; }
+/* 第二区：描述（固定两行高度，撑开中间、把底部压到卡片底） */
+.desc {
+  color: #606266; font-size: 13px; line-height: 1.5; margin-bottom: 10px;
+  min-height: 39px;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+/* 第三区：slug + 下载/仅集成，贴卡片底、跨卡片对齐 */
+.sc-foot { display: flex; align-items: center; gap: 6px; margin-top: auto; }
+.sc-foot .slug-chip {
+  max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .dl-count { font-size: 12px; color: #909399; margin-left: auto; }
+/* 仅集成标签靠右，与可下载卡片的「下载」按钮位置一致 */
+.sc-foot .only-integrate { margin-left: auto; }
 .dl-logs { margin: 14px 0; padding: 12px 14px; background: #f7f8fa; border-radius: 8px; }
 .dl-logs-head { display: flex; align-items: center; justify-content: space-between; font-size: 13px; font-weight: 600; color: #606266; margin-bottom: 8px; }
 .dl-log-list { max-height: 180px; overflow-y: auto; }
