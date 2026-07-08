@@ -39,7 +39,10 @@
     </el-aside>
     <el-main class="main">
       <div class="main-inner">
-        <router-view />
+        <!-- key 绑定到 path（不含 query）：切换项目/任务等路由参数变化时强制重挂载组件，
+             避免 Vue 复用实例导致「切项目仍显示旧项目数据、需手动刷新」。
+             用 path 而非 fullPath：忽略 ?tab= 等 query 变化，不打断同页 tab 切换。 -->
+        <router-view :key="$route.path" />
       </div>
     </el-main>
 

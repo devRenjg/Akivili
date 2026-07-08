@@ -222,6 +222,12 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.2 — 2026-07-08
+- 🔧 **切换项目即时刷新 + 新项目从空团队开始**（OpenSpec change：`2026-07-08-empty-team-and-route-refresh`，能力 `project-management`）
+  - **切项目不刷新修复**：此前从项目 A 切到项目 B（工作区/团队概览）仍显示 A 的旧数据、需手动刷新。根因是 Vue Router 切换同名路由组件时复用实例、不重新 mount，`pid` 与数据停在旧项目。修法：`App.vue` 的 `<router-view :key="$route.path">`——路由 path 变化强制重挂载，一行覆盖所有参数驱动页面（项目/任务详情/工作区）；用 `path` 非 `fullPath`，忽略 `?tab=` query 变化不打断同页 tab 切换。
+  - **新项目不再默认塞固定负责人**：此前新建项目自动把「项目负责人（星）」设为 Team Leader，导致所有项目都复用同一个。移除 `create_project` 的 `_seed_leader`——新项目从空团队开始，由用户自行从人才库导入选定 Agent、再用「设为负责人」指定 Leader。既有项目不受影响。
+  - 验证：隔离验证新建项目成员数=0；前端 build 通过；`openspec validate --specs` 12/12。
+
 ### v0.16.1 — 2026-07-08
 - 🔄 **重跑子任务时父任务状态即时回写 + 会话结构化排版**（OpenSpec change：`2026-07-08-rerun-reactivate-and-structured-output`，能力 `agent-collaboration`/`agent-execution`/`task-system`）
   - **父状态显示滞后修复**：去子任务卡片重新触发执行时，后端 `auto_dispatch` 即时把该子任务及其父任务（若已 done/reviewing）回写 `in_progress`，前端 `rerunTask` 同步做乐观更新——不再「先显已完成、隔几秒才变进行中」。仅对已收尾任务的重跑生效，首次执行不误伤。
