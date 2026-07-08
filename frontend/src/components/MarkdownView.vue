@@ -34,11 +34,32 @@ const SANITIZE_OPTS = {
   USE_PROFILES: { html: true },
   ADD_ATTR: ['target', 'rel', 'loading'],
 }
+// 纯数字单元格（含千分位/小数/负号/百分号/货币/占比）右对齐更易读。
+// 在已消毒的 HTML 串上做一次轻量 DOM 处理，给匹配的 <td> 加 md-num class。
+const NUM_CELL_RE = /^\s*[¥$€]?\s*-?[\d,]+(\.\d+)?\s*[%‰]?\s*$/
+function enhanceTables(safeHtml) {
+  if (!safeHtml.includes('<table')) return safeHtml
+  const tpl = document.createElement('template')
+  tpl.innerHTML = safeHtml
+  // 数字单元格右对齐
+  tpl.content.querySelectorAll('tbody td').forEach((td) => {
+    if (NUM_CELL_RE.test(td.textContent || '')) td.classList.add('md-num')
+  })
+  // 给每个表格套一层可横向滚动的容器（宽表在窄气泡里不撑破布局）
+  tpl.content.querySelectorAll('table').forEach((table) => {
+    const wrap = document.createElement('div')
+    wrap.className = 'md-table-wrap'
+    table.parentNode.insertBefore(wrap, table)
+    wrap.appendChild(table)
+  })
+  return tpl.innerHTML
+}
 const html = computed(() => {
   const raw = props.text || ''
   if (!raw.trim()) return ''
   const parsed = marked.parse(raw)
-  return DOMPurify.sanitize(parsed, SANITIZE_OPTS)
+  const safe = DOMPurify.sanitize(parsed, SANITIZE_OPTS)
+  return enhanceTables(safe)
 })
 </script>
 
@@ -77,10 +98,32 @@ const html = computed(() => {
 .md-body :deep(pre code) { background: none; padding: 0; color: inherit; font-size: 12.5px; }
 .md-body :deep(blockquote) { margin: 8px 0; padding: 4px 14px; border-left: 3px solid #dcdfe6;
   color: #606266; background: #fafafa; }
-.md-body :deep(table) { border-collapse: collapse; margin: 10px 0; font-size: 13px; }
+/* 表格：给足视觉分量——外框圆角、表头深色实底、斑马纹、行 hover、横向可滚动 */
+.md-body :deep(.md-table-wrap) { margin: 14px 0; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.md-body :deep(table) {
+  border-collapse: separate; border-spacing: 0; width: 100%; margin: 0;
+  font-size: 13.5px; line-height: 1.5;
+  border: 1px solid #dfe3eb; border-radius: 8px; overflow: hidden;
+  box-shadow: 0 1px 3px rgba(15, 28, 51, .06);
+}
+.md-body :deep(thead th) {
+  background: linear-gradient(180deg, #eef1f6, #e6eaf1);
+  color: #0f1c33; font-weight: 700; font-size: 13px;
+  letter-spacing: .3px; white-space: nowrap;
+  border-bottom: 2px solid #d0d6e0;
+}
 .md-body :deep(th),
-.md-body :deep(td) { border: 1px solid #ebeef5; padding: 6px 10px; }
-.md-body :deep(th) { background: #f5f7fa; font-weight: 600; }
+.md-body :deep(td) {
+  padding: 9px 14px; text-align: left; vertical-align: top;
+  border-bottom: 1px solid #eef0f4; border-right: 1px solid #f2f4f8;
+}
+.md-body :deep(th:last-child),
+.md-body :deep(td:last-child) { border-right: none; }
+.md-body :deep(tbody tr:last-child td) { border-bottom: none; }
+.md-body :deep(tbody tr:nth-child(even)) { background: #fafbfd; }
+.md-body :deep(tbody tr:hover) { background: #eef4ff; transition: background .15s; }
+/* 纯数字单元格右对齐更易读（含千分位/百分号/负号/货币符） */
+.md-body :deep(td.md-num) { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .md-body :deep(hr) { border: none; border-top: 1px solid #ebeef5; margin: 14px 0; }
 .md-body :deep(img) { max-width: 100%; border-radius: 6px; }
 </style>
