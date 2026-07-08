@@ -406,11 +406,22 @@ async function pauseTask(tid) {
 }
 async function rerunTask(tid) {
   try {
+    // 乐观更新：重跑瞬间本地立即把该子任务 + 当前父任务视图置「进行中」，
+    // 不等 3 秒轮询聚合，消除「先显已完成、隔几秒才变进行中」的滞后窗口。
+    optimisticReactivate(tid)
     await runsApi.autoDispatch(tid)
     ElMessage.success('已重新触发执行')
     await refreshLite()
     startPolling()   // 重跑后开始轮询，子任务状态实时刷新为「进行中」直至完成
   } catch (e) { ElMessage.error(e?.response?.data?.detail || '重跑失败') }
+}
+// 本地乐观置「进行中」：命中的子任务改 status，且若当前打开的就是父任务则父任务也即时翻牌
+function optimisticReactivate(tid) {
+  const s = subtasks.value.find((x) => x.id === tid)
+  if (s && (s.status === 'done' || s.status === 'reviewing')) s.status = 'in_progress'
+  if (task.value && (task.value.status === 'done' || task.value.status === 'reviewing')) {
+    task.value.status = 'in_progress'
+  }
 }
 // 执行日志区 run 状态点
 async function onRunDot(r) {

@@ -84,6 +84,35 @@ async def dispatch(task_id: int, req: DispatchRequest, request: Request,
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+async def _reactivate_on_redispatch(task_id: int, parent_id, status: str) -> None:
+    """重跑（重新触发执行）时，把已收尾的任务及其父任务即时回写 in_progress。
+
+    否则前端要等 3 秒轮询聚合 progress 才把状态从「已完成/验证中」翻成「进行中」，出现滞后窗口。
+    只在任务当前是 done/reviewing（确属重跑，而非首次执行）时回写；in_progress/backlog 不动。
+    """
+    from activity import log_activity
+    targets = []
+    if status in ("done", "reviewing"):
+        targets.append(task_id)
+    db = await get_connection()
+    try:
+        if parent_id:
+            prow = await (await db.execute(
+                "SELECT status FROM tasks WHERE id=?", (parent_id,))).fetchone()
+            if prow and prow["status"] in ("done", "reviewing"):
+                targets.append(parent_id)
+        for tid in targets:
+            await db.execute(
+                "UPDATE tasks SET status='in_progress', updated_at=datetime('now') WHERE id=?", (tid,))
+        if targets:
+            await db.commit()
+    finally:
+        await db.close()
+    for tid in targets:
+        await log_activity(tid, "status_changed", "system", "",
+                           {"to": "in_progress", "note": "重新触发执行，回到进行中"})
+
+
 async def _first_mentioned_slug(project_id: int, text: str) -> str:
     """从任务描述里解析首个 @ 成员，按项目成员名匹配，返回其 slug。"""
     if not text or "@" not in text:
@@ -119,6 +148,10 @@ async def auto_dispatch(task_id: int):
         task = dict(task)
     finally:
         await db.close()
+
+    # 重跑即时回写：若该任务已 done/reviewing（重新触发执行），立即把它——以及其父任务
+    # （若已 done/reviewing）——回写 in_progress，不等 3 秒轮询聚合，消除「先显已完成、隔几秒才变进行中」的滞后。
+    await _reactivate_on_redispatch(task_id, task.get("parent_task_id"), task.get("status"))
 
     # 任务 Owner 统筹：以负责人身份唤醒（注入协作协议+花名册，可拉人协调）
     owner = task.get("assignee_slug")

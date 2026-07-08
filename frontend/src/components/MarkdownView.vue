@@ -47,18 +47,26 @@ const html = computed(() => {
 .md-body { font-size: 14px; line-height: 1.7; color: #303133; word-break: break-word; }
 .md-body :deep(> *:first-child) { margin-top: 0; }
 .md-body :deep(> *:last-child) { margin-bottom: 0; }
-.md-body :deep(h1) { font-size: 20px; }
-.md-body :deep(h2) { font-size: 17px; }
-.md-body :deep(h3) { font-size: 15px; }
+/* 标题：拉开与正文的字号/字重/颜色差建立主次；h1/h2 带底部细分隔线强化章节感 */
+.md-body :deep(h1) { font-size: 21px; color: #0f1c33; padding-bottom: 6px; border-bottom: 2px solid #e4e7ed; }
+.md-body :deep(h2) { font-size: 17px; color: #172b4d; padding-bottom: 5px; border-bottom: 1px solid #ebeef5; }
+.md-body :deep(h3) { font-size: 15px; color: #24324d; }
+.md-body :deep(h4) { font-size: 14px; color: #3a4a63; }
 .md-body :deep(h1),
 .md-body :deep(h2),
 .md-body :deep(h3),
-.md-body :deep(h4) { font-weight: 700; margin: 14px 0 8px; line-height: 1.4; }
+.md-body :deep(h4) { font-weight: 700; margin: 18px 0 9px; line-height: 1.35; letter-spacing: .2px; }
+/* 首个标题不顶太多空隙 */
+.md-body :deep(> h1:first-child),
+.md-body :deep(> h2:first-child),
+.md-body :deep(> h3:first-child) { margin-top: 2px; }
 .md-body :deep(p) { margin: 8px 0; }
 .md-body :deep(ul),
 .md-body :deep(ol) { margin: 8px 0; padding-left: 22px; }
-.md-body :deep(li) { margin: 3px 0; }
-.md-body :deep(strong) { font-weight: 700; color: #1d2129; }
+.md-body :deep(li) { margin: 4px 0; }
+.md-body :deep(li)::marker { color: #909399; }
+/* 粗体：作为「字段名/关键项」标签，比正文更深更实 */
+.md-body :deep(strong) { font-weight: 700; color: #0f1c33; }
 .md-body :deep(em) { font-style: italic; }
 .md-body :deep(a) { color: #409eff; text-decoration: none; }
 .md-body :deep(a:hover) { text-decoration: underline; }

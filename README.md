@@ -222,6 +222,15 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.1 — 2026-07-08
+- 🔄 **重跑子任务时父任务状态即时回写 + 会话结构化排版**（OpenSpec change：`2026-07-08-rerun-reactivate-and-structured-output`，能力 `agent-collaboration`/`agent-execution`/`task-system`）
+  - **父状态显示滞后修复**：去子任务卡片重新触发执行时，后端 `auto_dispatch` 即时把该子任务及其父任务（若已 done/reviewing）回写 `in_progress`，前端 `rerunTask` 同步做乐观更新——不再「先显已完成、隔几秒才变进行中」。仅对已收尾任务的重跑生效，首次执行不误伤。
+  - **会话字体有了主次层次**：此前 Agent 用 `━━━` 装饰线 + emoji 当章节标题、几乎不用 `##`，渲染出来扁平无层次。两侧一起改——
+    - **生成侧**：`jian` CLI 使用说明 + 负责人收尾 prompt 要求用 Markdown 结构（`##`/`###` 小标题、`**粗体**` 标关键项、`-` 列表），不用装饰线冒充标题。
+    - **渲染侧**：`MarkdownView` 强化标题字号/字重/颜色差 + h1/h2 底部细分隔线，粗体作为字段名标签更深，列表留白优化——结构化内容一眼看出主次。
+  - 老消息（含 `━━━`）照旧渲染，新消息更结构化。
+  - 验证：新增 `TestReport/run_reactivate_probe.py` 5/5（子任务重跑回写父+子、独立任务回写自身、首次执行不误伤）；前端 build 通过；回归 timeout+QA 12/12、subtask 6/6、concurrency 7/7、reflect 6/6、QA 28/30。
+
 ### v0.16.0 — 2026-07-08
 - ⏱️ **执行超时重构：静默超时 + 保成果 + 收尾验收路由**（OpenSpec change：`2026-07-08-idle-timeout-and-qa-routing`，能力 `agent-collaboration`）
   - **超时策略从「固定墙钟」升级为「静默超时(A) + 宽限保成果(B) + 硬墙钟兜底(C)」**：真实案例——数据工程师经 Narya/ingest 遍历全库补数据、真在干活却撞 60 分钟墙钟被误杀、且已完成的成果被销毁。

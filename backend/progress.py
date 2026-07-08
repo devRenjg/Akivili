@@ -195,7 +195,9 @@ async def _advance_and_summarize_parent(parent_id: int) -> None:
         f"代码/数据正确性需要把关），先用 `jian comment @<验收成员>` 点名相应成员做验收，"
         f"把要验收的范围说清楚，**等其验收反馈后再进入下一步**；{qa_hint}\n"
         f"3) 待验收通过（或本任务无需验收）后，用 `jian comment` 写一段**统一汇总汇报**，"
-        f"把各成员的产出整合成一份完整交付（内容较长先写入 .md 再用 `jian comment --body-file <文件>` 发）；\n"
+        f"把各成员的产出整合成一份完整交付（内容较长先写入 .md 再用 `jian comment --body-file <文件>` 发）。"
+        f"汇报用 **Markdown 结构**：`##`/`###` 分章节、`**粗体**` 标关键项、`-` 列表，"
+        f"**不要用 ━━━ 装饰线当标题**（那样渲染出来没层次）；\n"
         f"4) 汇总汇报完成即结束——除验收所需的点名外，不要重复派活或重建子任务。")
     summary_prompt = (
         f"任务：{parent_title}\n\n"
