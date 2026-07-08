@@ -137,6 +137,27 @@ async def _set_done(task_id: int, note: str) -> bool:
     return True
 
 
+async def _qa_member_hint(parent_id: int) -> str:
+    """若项目团队里有测试/QA/安全类成员，给收尾 prompt 一句「可点名谁验收」的提示（不强制）。
+    无则返回空串。判据：slug/name 含 test/qa/测试/安全/验收 等关键词。"""
+    db = await get_connection()
+    try:
+        prow = await (await db.execute(
+            "SELECT project_id FROM tasks WHERE id=?", (parent_id,))).fetchone()
+        if not prow:
+            return ""
+        rows = await (await db.execute(
+            "SELECT slug, name FROM project_agents WHERE project_id=?", (prow["project_id"],))).fetchall()
+    finally:
+        await db.close()
+    kws = ("test", "qa", "测试", "安全", "验收", "质量")
+    qa = [r["name"] for r in rows
+          if any(k in (r["slug"] or "").lower() for k in kws) or any(k in (r["name"] or "") for k in kws)]
+    if not qa:
+        return ""
+    return f"（本团队的验收/测试成员：{ '、'.join(qa) }，如需验收可 @ 其中合适的一位）"
+
+
 async def _advance_and_summarize_parent(parent_id: int) -> None:
     """父任务全部子任务完成时调用：置 reviewing（幂等，作为一次性闸门）并唤醒负责人做统一汇总汇报。
 
@@ -166,15 +187,21 @@ async def _advance_and_summarize_parent(parent_id: int) -> None:
     done_lines = "\n".join(
         f"- 子任务#{s['id']}「{s['title']}」（负责人 {s['assignee_slug']}）：已完成"
         for s in sub_list)
+    # 是否存在测试/QA 类成员（供负责人按需交付验收）——从项目团队里找带 test/qa 的角色
+    qa_hint = await _qa_member_hint(parent_id)
+    verify_step = (
+        f"1) 逐个查看各子任务的成果；\n"
+        f"2) **如果本任务原计划需要测试/验收**（例如你在派活时说过「交测试专员验收」，或改动涉及"
+        f"代码/数据正确性需要把关），先用 `jian comment @<验收成员>` 点名相应成员做验收，"
+        f"把要验收的范围说清楚，**等其验收反馈后再进入下一步**；{qa_hint}\n"
+        f"3) 待验收通过（或本任务无需验收）后，用 `jian comment` 写一段**统一汇总汇报**，"
+        f"把各成员的产出整合成一份完整交付（内容较长先写入 .md 再用 `jian comment --body-file <文件>` 发）；\n"
+        f"4) 汇总汇报完成即结束——除验收所需的点名外，不要重复派活或重建子任务。")
     summary_prompt = (
         f"任务：{parent_title}\n\n"
-        f"【收尾汇报环节】本任务的全部 {len(sub_list)} 个子任务都已完成，现在轮到你（负责人）做总结汇报。\n"
+        f"【收尾环节】本任务的全部 {len(sub_list)} 个子任务都已完成，现在轮到你（负责人）收尾。\n"
         f"各子任务成果如下：\n{done_lines}\n\n"
-        f"请你：\n"
-        f"1) 逐个查看各子任务的成果（成员都已完成，**无需再派活/@任何人**）；\n"
-        f"2) 用 `jian comment` 写一段**统一汇总汇报**，把各成员的产出整合成一份完整交付"
-        f"（内容较长时先写入 .md 文件再用 `jian comment --body-file <文件>` 发，避免多行被截断）；\n"
-        f"3) 汇总汇报完成即可，**不要再 @ 任何人、不要再建子任务**——这是收尾，不是重新分配。")
+        f"请你：\n{verify_step}")
     # is_leader=True：注入协作协议+花名册；trigger=collaborate 表明是统筹收尾环节
     await collab.enqueue_run(parent_id, leader_slug, summary_prompt, "collaborate", is_leader=True)
 

@@ -222,6 +222,16 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.0 — 2026-07-08
+- ⏱️ **执行超时重构：静默超时 + 保成果 + 收尾验收路由**（OpenSpec change：`2026-07-08-idle-timeout-and-qa-routing`，能力 `agent-collaboration`）
+  - **超时策略从「固定墙钟」升级为「静默超时(A) + 宽限保成果(B) + 硬墙钟兜底(C)」**：真实案例——数据工程师经 Narya/ingest 遍历全库补数据、真在干活却撞 60 分钟墙钟被误杀、且已完成的成果被销毁。
+    - **A 静默超时**：不看总耗时，看「多久没有新输出事件」——持续产出就不判超时，仅连续无事件（真卡死）才触发。默认 15 分钟，数据类角色 30 分钟。慢但在干活的任务永不被误杀。
+    - **B 超时保成果**：判超时后先给 90s 宽限并轮询，若该 run 已产出真实交付（jian comment/subtask 或改过任务状态）则按**成功**处理、不 kill 不销毁；宽限内仍无交付才 kill 进程树 + 落 failed。
+    - **C 硬墙钟兜底**：总时长天花板（默认 3 小时、数据类 4 小时），防既不静默也不结束的极端失控。
+  - **收尾支持测试/验收路由**：父任务全子完成后唤醒负责人收尾时，指令从写死「无需 @ 任何人、直接汇总」改为「**如原计划需要验收，先 @ 相应成员验收、通过后再汇总**」；团队有测试/QA/安全成员时点名提示。修复了"用户要求找测试专员验证，却被自动收尾机制架空、测试专员从不出场"的问题。
+  - **僵尸运行清理**：清理两条卡死 14 小时的 `running`（子任务已完成、进程已死），落终态 killed。
+  - 验证：新增 `TestReport/run_timeout_and_qa_probe.py` 12/12；修复期间发现并修正 `_grace_then_kill` 缺 `runner` 局部导入的真 bug（否则超时路径线上会崩）；修复 3 个既有探针的假执行器签名漂移（缺 `persist_user_msg`），concurrency 2/7→7/7、subtask 2/6→6/6 恢复真实覆盖；memory-hygiene 11/11、stdout-display 8/8、reflect 6/6、QA 28/30。
+
 ### v0.15.0 — 2026-07-07
 - 🧠 **记忆卫生：让 Agent「越做越强」而非「越背越沉」**（OpenSpec change：`2026-07-07-memory-hygiene-and-board-polish`，能力 `agent-execution`/`agent-memory`/`agent-reflection`/`task-board`）
   - **近期动态只存净交付（P0-1）**：收工写记忆只记本轮该 Agent 经 `jian comment`/`jian subtask` 落库的净交付，**不再拿流式 stdout 兜底**（jian.bat 调用、PYTHONUTF8、编码提示等过程碎语不再进记忆）；滚动上限 8 → 3。无净交付则不记（未走 jian 已由执行层打醒目标记）。

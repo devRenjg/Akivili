@@ -14,21 +14,99 @@ from database import get_connection
 # 单个任务的协同累计运行上限，防失控烧钱
 MAX_RUNS_PER_TASK = 20
 
-# 单个 Agent 执行超时（秒）：超时 kill 子进程，避免卡死拖垮队列/留僵尸。
-# 默认 30 分钟——多数角色一轮工作（含多轮工具调用）足够，又能兜住真卡死。
-RUN_TIMEOUT_SEC = 1800
+# —— 执行超时策略（A 静默超时 + B 保成果 + 硬墙钟兜底）——
+#
+# 旧策略是「固定墙钟超时」：不管在不在干活，到点就 kill+标 failed。对慢取数角色（数据工程师
+# 经 Narya/ingest 遍历全库，单轮真要 1h+）是误伤——真在产出却被切、且已完成的成果被销毁。
+#
+# 新策略：
+#  A) 静默超时（idle）：只要 Agent **持续有输出**（stdout/工具事件）就不算超时；只有**连续
+#     IDLE_TIMEOUT_SEC 无任何事件**（真卡死/僵死）才判超时。慢但在干活的任务永不被误杀。
+#  B) 超时保成果：判超时后，先给 GRACE_SEC 宽限，尝试让 Agent 自己收尾（jian comment/status）
+#     落库已完成的成果，宽限内正常结束就算成功；宽限仍无动静才 kill。
+#  C) 硬墙钟兜底（HARD_WALL_SEC）：防极端失控（真死循环狂刷日志既不静默也不结束），设一个
+#     总时长天花板，到顶无条件终止。
+#
+# 均为模块全局，便于测试 monkeypatch 调小。
 
-# 按角色 slug 覆盖超时：数据类角色常经外部取数服务拉数、单轮真实工作远超普通角色，
-# 给 60 分钟。新增需要长跑的角色在此登记即可。
-RUN_TIMEOUT_OVERRIDES = {
-    "engineering-data-engineer": 3600,
+# 静默超时：连续多久无输出事件判为卡死（默认 15 分钟）
+IDLE_TIMEOUT_SEC = 900
+# 按角色覆盖静默超时：数据类角色单个取数脚本可能 sleep 轮询较久，放宽到 30 分钟
+IDLE_TIMEOUT_OVERRIDES = {
+    "engineering-data-engineer": 1800,
+}
+# 判超时后给 Agent 的收尾宽限（默认 90 秒）：让它落库已完成的成果
+GRACE_SEC = 90
+# 硬墙钟总上限：无条件终止的天花板（默认 3 小时）
+HARD_WALL_SEC = 10800
+# 数据类等长跑角色的硬墙钟（默认 4 小时）
+HARD_WALL_OVERRIDES = {
+    "engineering-data-engineer": 14400,
 }
 
 
-def _run_timeout(slug: str) -> int:
-    """该角色的执行超时秒数（有覆盖用覆盖，否则用默认）。
-    运行时读模块全局，便于测试 monkeypatch RUN_TIMEOUT_SEC。"""
-    return RUN_TIMEOUT_OVERRIDES.get(slug, RUN_TIMEOUT_SEC)
+def _idle_timeout(slug: str) -> int:
+    """该角色的静默超时秒数（运行时读模块全局，便于测试 monkeypatch）。"""
+    return IDLE_TIMEOUT_OVERRIDES.get(slug, IDLE_TIMEOUT_SEC)
+
+
+def _hard_wall(slug: str) -> int:
+    """该角色的硬墙钟总上限秒数。"""
+    return HARD_WALL_OVERRIDES.get(slug, HARD_WALL_SEC)
+
+
+async def _run_produced_deliverable(task_id: int, slug: str) -> bool:
+    """该 run 是否已产出真实交付：本任务会话里有该 Agent 的 assistant 发言（jian comment/subtask），
+    或它已把任务状态改动过（jian status）。用于「超时保成果」：已交付就不该判失败销毁。"""
+    from database import get_connection
+    db = await get_connection()
+    try:
+        row = await (await db.execute(
+            """SELECT 1 FROM messages m JOIN tasks t ON t.conversation_id=m.conversation_id
+               WHERE t.id=? AND m.role='assistant' AND m.author_slug=? LIMIT 1""",
+            (task_id, slug))).fetchone()
+        if row:
+            return True
+        act = await (await db.execute(
+            "SELECT 1 FROM activities WHERE task_id=? AND actor_type='agent' AND actor_name=? "
+            "AND action IN ('commented','status_changed') LIMIT 1", (task_id, slug))).fetchone()
+        return bool(act)
+    finally:
+        await db.close()
+
+
+async def _grace_then_kill(task_id: int, slug: str, agent: dict,
+                           run_id, outcome: str) -> bool:
+    """判超时后的收尾（B 保成果）：给 GRACE_SEC 宽限让 Agent 自己落库成果；
+    宽限内产出了真实交付则视为成功（保成果、不销毁），否则 kill 进程树 + 落 failed。
+
+    返回 True=已保住成果（run 记 done）、False=真失败（已 kill + finalize failed）。
+    """
+    from activity import log_activity
+    from executor import runner
+    # 宽限：分几次轮询，任何一次检测到已产出交付就提前收尾
+    waited = 0
+    step = 15
+    while waited < GRACE_SEC:
+        await asyncio.sleep(min(step, GRACE_SEC - waited))
+        waited += step
+        if await _run_produced_deliverable(task_id, slug):
+            # Agent 在宽限内交付了 —— 保成果。让其自然收尾落库终态；这里补记一条说明。
+            if run_id:
+                await runner.finalize_run(run_id, "succeeded")
+            await log_activity(task_id, "commented", "system", "",
+                               {"note": f"⏱️ {agent.get('name', slug)} 执行较久但已产出交付，"
+                                        f"按完成处理（超时保护：宽限内检测到成果）。"})
+            return True
+    # 宽限仍无交付 → 真判失败：kill 进程树 + 落 failed（杜绝孤儿 running）
+    if run_id:
+        runner.kill_run(run_id)
+        await runner.finalize_run(run_id, "failed")
+    reason = ("连续无输出超时（疑似卡死）" if outcome == "idle_timeout"
+              else "超过硬性时长上限")
+    await log_activity(task_id, "task_failed", "agent", agent.get("name", slug),
+                       {"reason": f"执行终止：{reason}，且宽限内无成果产出"})
+    return False
 
 _loop_started = False
 
@@ -379,33 +457,47 @@ async def _run_one(item: dict) -> None:
     run_id_box = {"id": None}
     had_error = {"v": False}
 
-    async def _consume():
-        # prompt 是机器合成的派活/统筹指令（非真人输入），不落 user 消息，避免时间线以「我」复述任务
-        async for ev in runner.execute_dispatch(task, agent, prompt, persist_user_msg=False):
-            if ev.type == "system" and ev.meta.get("run_id"):
-                run_id_box["id"] = ev.meta["run_id"]
-            elif ev.type == "text":
-                collected.append(ev.text)
-            elif ev.type == "error":
-                had_error["v"] = True
+    async def _drive():
+        """逐事件消费执行流，返回「结束原因」：
+          normal        —— 生成器自然跑完（Agent 正常收尾）
+          idle_timeout  —— 连续 idle 秒无任何事件（判卡死）
+          hard_wall     —— 超过硬墙钟总上限
+        静默超时用「对每次取下一个事件设 idle 超时」实现——只要 Agent 在持续产出事件，
+        取事件就不会超时；真卡死（无任何事件）才在 idle 秒后触发。
+        """
+        import time as _time
+        idle = _idle_timeout(slug)
+        hard = _hard_wall(slug)
+        start = _time.monotonic()
+        agen = runner.execute_dispatch(task, agent, prompt, persist_user_msg=False)
+        try:
+            while True:
+                if _time.monotonic() - start > hard:
+                    return "hard_wall"
+                try:
+                    ev = await asyncio.wait_for(agen.__anext__(), timeout=idle)
+                except StopAsyncIteration:
+                    return "normal"
+                except asyncio.TimeoutError:
+                    return "idle_timeout"
+                if ev.type == "system" and ev.meta.get("run_id"):
+                    run_id_box["id"] = ev.meta["run_id"]
+                elif ev.type == "text":
+                    collected.append(ev.text)
+                elif ev.type == "error":
+                    had_error["v"] = True
+        finally:
+            await agen.aclose()
 
     run_status = "done"   # run_queue 的最终状态：done / failed
-    timeout_sec = _run_timeout(slug)
     try:
-        # 超时保护：单个 Agent 执行最多 timeout_sec 秒；超时 kill 子进程树，避免卡死拖垮队列与留僵尸
-        await asyncio.wait_for(_consume(), timeout=timeout_sec)
-    except asyncio.TimeoutError:
-        run_status = "failed"
-        # _consume 被 wait_for 取消后，runner.execute_dispatch 生成器的收尾（落库 task_runs 终态）
-        # 跑不到——这里主动 kill 进程树并把 task_run 落成 failed，杜绝孤儿 running 记录。
-        if run_id_box["id"]:
-            runner.kill_run(run_id_box["id"])
-            await runner.finalize_run(run_id_box["id"], "failed")
-        from activity import log_activity
-        mins = timeout_sec // 60
-        # actor_name 用角色名（agent["name"]）而非 slug，前端 timeline 才能解析出「昵称（角色）」
-        await log_activity(task_id, "task_failed", "agent", agent.get("name", slug),
-                           {"reason": f"执行超时（>{mins}分钟），已终止"})
+        outcome = await _drive()
+        if outcome != "normal":
+            # 判超时（静默/硬墙钟）：先给宽限，尝试让 Agent 自己收尾落库已完成的成果（保成果 B）。
+            # 宽限内该 run 若被 finalize/自然结束（进程自己 jian comment 后退出），视为成功、不销毁成果。
+            rid = run_id_box["id"]
+            saved = await _grace_then_kill(task_id, slug, agent, rid, outcome)
+            run_status = "done" if saved else "failed"
     except Exception:  # noqa: BLE001
         run_status = "failed"
 
