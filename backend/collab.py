@@ -611,39 +611,57 @@ async def _loop():
 
 
 async def reclaim_orphan_runs() -> int:
-    """启动时回收孤儿 running：run_queue 里状态为 running 的行落成 failed。
+    """启动时回收孤儿 running —— 两层都要清：run_queue 与 task_runs。
 
-    run_queue 的执行由本进程内存态（_running 集合 + _process_one 协程）驱动。进程重启后
-    内存态清空，任何残留的 running 行都不可能再有协程去收尾（外部 kill 或重启中断都会留下
-    这种孤儿），会被 progress.py 误判为「任务仍在执行中」。启动时统一落终态，消除假象。
+    执行状态由本进程内存态（run_queue 靠 _running 集合 + _process_one 协程；task_runs 靠
+    execute_dispatch 生成器自然收尾或 finalize_run 补落）驱动。进程重启 / 生成器被取消 / 连接
+    断开时，这些收尾路径都跑不到，会留下 status='running' 的孤儿：
+      - run_queue 孤儿 → progress.py 误判「任务仍在执行中」（外部卡片、进度面板）；
+      - task_runs 孤儿 → 详情页右侧「执行记录」列表 RunRow 直接显示「执行中」（/runs 读 task_runs）。
+    两层数据源不同、必须一起回收，否则一层清了另一层仍露馅（曾只清 run_queue，task_runs 残留
+    导致详情页右侧持续显示执行中）。
 
-    只在 start_loop 之前调用（此刻 _running 必为空、_loop 尚未领新活），故所有 running 皆为孤儿。
-    对应 task_runs 的终态由各自的 kill/finalize 路径负责，这里只补 run_queue 这一层。"""
+    只在 start_loop 之前调用（此刻 _running / _RUN_PIDS 必为空、_loop 尚未领新活），故所有
+    running 皆为无主孤儿。run_queue 落 failed；task_runs 落 killed（被中断，非正常失败）。"""
+    from executor import runner  # noqa: PLC0415
+    affected_tasks: set[int] = set()
     db = await get_connection()
     try:
-        rows = await (await db.execute(
-            "SELECT id, task_id, agent_slug FROM run_queue WHERE status='running'")).fetchall()
-        if not rows:
+        # 1) run_queue 层
+        q_rows = await (await db.execute(
+            "SELECT id, task_id FROM run_queue WHERE status='running'")).fetchall()
+        # 2) task_runs 层
+        r_rows = await (await db.execute(
+            "SELECT id, task_id FROM task_runs WHERE status='running'")).fetchall()
+        if not q_rows and not r_rows:
             return 0
-        await db.execute("UPDATE run_queue SET status='failed' WHERE status='running'")
+        if q_rows:
+            await db.execute("UPDATE run_queue SET status='failed' WHERE status='running'")
+        if r_rows:
+            await db.execute(
+                "UPDATE task_runs SET status='killed', ended_at=datetime('now') WHERE status='running'")
         await db.commit()
+        for row in q_rows:
+            affected_tasks.add(row["task_id"])
+        for row in r_rows:
+            affected_tasks.add(row["task_id"])
     finally:
         await db.close()
-    # 落终态后，尝试推进各受影响任务的父任务状态（清掉「执行中」假象后可能可收尾）
+    # 清掉内存注册表里可能残留的这些 run（正常应已空，防御性）
+    for row in r_rows:
+        runner._RUN_PIDS.pop(row["id"], None)
+        runner._KILLED.discard(row["id"])
+    # 落终态后，记一条活动 + 尝试推进父任务状态（清掉「执行中」假象后可能可收尾）
     from activity import log_activity
     from progress import maybe_advance_parent
-    seen_tasks = set()
-    for r in rows:
-        if r["task_id"] in seen_tasks:
-            continue
-        seen_tasks.add(r["task_id"])
+    for tid in affected_tasks:
         try:
-            await log_activity(r["task_id"], "task_failed", "system", "",
-                               {"note": f"重启前遗留的执行（队列 #{r['id']}）已回收为失败，非真正在执行"})
-            await maybe_advance_parent(r["task_id"])
+            await log_activity(tid, "task_failed", "system", "",
+                               {"note": "重启前遗留的「执行中」记录已回收（进程已不存在），非真正在执行"})
+            await maybe_advance_parent(tid)
         except Exception:  # noqa: BLE001
             pass
-    return len(rows)
+    return len(q_rows) + len(r_rows)
 
 
 def start_loop():
