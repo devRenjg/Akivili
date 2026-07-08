@@ -222,6 +222,17 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.3 — 2026-07-08
+- 📦 **目录型 Skill「仅集成、不下载」+ 直播营收知识库接入**（能力 `agent-skills`）
+  - **`bilisc-kb-live-revenue` 接入 Skills 页**：直播营收系统知识库（大航海/PK连线/醒目留言/礼物四大业务域 + 支付/订单/交易/结算/风控/对账六大基础设施域），目录型能力包（`SKILL.md` + `scripts/revenue-kb-api` 查询 CLI）。Agent 可勾选启用、运行时注入其 `SKILL.md` 正文。
+  - **「仅集成、不下载」契约**：Skill 的 frontmatter 标 `downloadable: false` 即视为「仅供 Agent 集成、不对外提供下载」。后端 `download_skill` 对此类 Skill 硬拦截返回 403（防绕过前端直接打下载接口）；前端 Skills 页隐藏下载按钮、改显「🔒 仅集成」标签。适用于知识库这类不希望被整包带走、只允许在平台内被 Agent 调用的能力。
+  - **目录型 Skill 扫描**：`skills_dir` 下 `<slug>/SKILL.md` 结构（含 `scripts`/`references` 子目录）识别为「能力包」（`is_dir=1`）；允许下载的能力包打包成 zip，禁止下载的只展示 `SKILL.md` 正文。
+  - 验证：DB 入库 `is_dir=1, downloadable=0`；API 实测列表返回该 Skill、`/download` 返 403「仅供 Agent 集成使用」；前端 dist 含最新代码。
+- ✅ **QA 套件回归归零：从 TypeError 硬崩恢复到 31/31 全绿**（能力 `agent-collaboration`）
+  - **随 v0.16.2「新项目空团队」同步测试契约**：v0.16.2 有意移除新项目自动种子 Leader（产品行为正确），但 QA 套件旧断言仍验「自动种子 Team Leader」、且后续协同块 `leader["slug"]` 无保护——`leader=None` 时抛 `TypeError` 直接中断整套件。修法：断言反转为「新项目从空团队开始（无负责人）」，并新增「显式导入项目负责人并 `PUT .../leader` 设为 Team Leader」一项，模拟用户自选负责人的新流程、拿到 `leader_slug` 供协同测试复用。
+  - **定位并修复长期被误当「漂移」的协同 `order=[]` 真 bug**：QA 套件的假执行器 `fake_execute_dispatch` 签名过时（缺 `persist_user_msg`/`user_name`），而 `collab._run_one` 以 `runner.execute_dispatch(..., persist_user_msg=False)` 调用它 → 创建异步生成器时抛 `TypeError`、被外层 `except` 吞成 run failed → 采集列表空 → `order=[]`。此失败横跨 07-07 起 5 份历史报告，一直被记为「既有 harness 漂移、与改动无关」。v0.16.0 曾修过 concurrency/subtask 两个探针的同类签名漂移，但漏了 QA 套件这处，本次补齐（桩加 `persist_user_msg=True, user_name=""`）。
+  - 均为测试侧修复，产品代码零改动；QA 30→31 项，31/31 全绿。
+
 ### v0.16.2 — 2026-07-08
 - 🔧 **切换项目即时刷新 + 新项目从空团队开始**（OpenSpec change：`2026-07-08-empty-team-and-route-refresh`，能力 `project-management`）
   - **切项目不刷新修复**：此前从项目 A 切到项目 B（工作区/团队概览）仍显示 A 的旧数据、需手动刷新。根因是 Vue Router 切换同名路由组件时复用实例、不重新 mount，`pid` 与数据停在旧项目。修法：`App.vue` 的 `<router-view :key="$route.path">`——路由 path 变化强制重挂载，一行覆盖所有参数驱动页面（项目/任务详情/工作区）；用 `path` 非 `fullPath`，忽略 `?tab=` query 变化不打断同页 tab 切换。

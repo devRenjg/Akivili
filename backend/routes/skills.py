@@ -20,7 +20,7 @@ _SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 @router.get("")
 async def list_skills(q: str = ""):
-    sql = ("SELECT s.id, s.slug, s.name, s.description, s.is_dir, "
+    sql = ("SELECT s.id, s.slug, s.name, s.description, s.is_dir, s.downloadable, "
            "(SELECT COUNT(*) FROM skill_downloads d WHERE d.skill_id=s.id) AS download_count "
            "FROM skills s WHERE 1=1")
     params: list = []
@@ -58,6 +58,9 @@ async def download_skill(skill_id: int, request: Request):
         if not row:
             raise HTTPException(404, "Skill 不存在")
         row = dict(row)
+        # 禁止下载的 Skill（downloadable=0）：仅展示、供 Agent 集成，服务端硬拦截（防绕过前端直接打接口）
+        if not row.get("downloadable", 1):
+            raise HTTPException(403, "该 Skill 不提供下载（仅供 Agent 集成使用）")
         # 记录下载：客户端 IP（优先 X-Forwarded-For，兜底直连 IP）
         ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
               or (request.client.host if request.client else ""))

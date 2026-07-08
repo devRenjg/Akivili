@@ -28,9 +28,10 @@
         <div class="sc-foot">
           <el-tag size="small" effect="plain">{{ s.slug }}</el-tag>
           <span class="dl-count">⬇ {{ s.download_count || 0 }}</span>
-          <el-button text size="small" :icon="Download" @click.stop="doDownload(s)">
+          <el-button v-if="s.downloadable !== 0" text size="small" :icon="Download" @click.stop="doDownload(s)">
             下载{{ s.is_dir ? ' zip' : ' .md' }}
           </el-button>
+          <el-tag v-else size="small" type="info" effect="plain" title="该能力仅供 Agent 集成，不提供下载">🔒 仅集成</el-tag>
         </div>
       </el-card>
       <el-empty v-if="!loading && list.length === 0" description="暂无 Skill" />
@@ -43,9 +44,10 @@
             <el-tag size="small" effect="plain" class="slug-tag">{{ detail.slug }}</el-tag>
             <el-tag v-if="detail.is_dir" size="small" type="success" effect="plain">📦 能力包（含脚本/参考文件）</el-tag>
           </div>
-          <el-button text size="small" :icon="Download" @click="doDownload(detail)">
+          <el-button v-if="detail.downloadable !== 0" text size="small" :icon="Download" @click="doDownload(detail)">
             下载{{ detail.is_dir ? ' zip' : ' .md' }}
           </el-button>
+          <el-tag v-else size="small" type="info" effect="plain" title="该能力仅供 Agent 集成，不提供下载">🔒 仅供 Agent 集成</el-tag>
         </div>
         <p class="detail-desc">{{ detail.description }}</p>
         <div v-if="isAdmin" class="dl-logs">

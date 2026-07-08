@@ -6,8 +6,9 @@ memory/*.md
 !memory/README.md
 icon/
 
-# 内部取数 skill（含内部接口地址与凭证、内部数据表名，绝不公开）
+# 内部取数 / 知识库 skill（含内部接口地址与凭证、内部数据表名，绝不公开）
 skills/narya-data/
+skills/bilisc-kb-live-revenue/
 
 # TestReport 内部测试脚本与运行产物（不入公开仓）
 TestReport/

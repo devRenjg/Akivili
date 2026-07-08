@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS skills (
     source_path TEXT DEFAULT '',
     body        TEXT DEFAULT '',            -- 能力指令正文（注入 Agent 系统提示）
     is_dir      INTEGER DEFAULT 0,          -- 1=目录型 Skill（SKILL.md + scripts/references），下载打包 zip
+    downloadable INTEGER DEFAULT 1,         -- 0=禁止下载（仅展示，供 Agent 集成，不给人下载）
     imported_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -241,6 +242,8 @@ async def _migrate(db) -> None:
     scols = {row[1] for row in await cur.fetchall()}
     if "is_dir" not in scols:
         await db.execute("ALTER TABLE skills ADD COLUMN is_dir INTEGER DEFAULT 0")
+    if "downloadable" not in scols:
+        await db.execute("ALTER TABLE skills ADD COLUMN downloadable INTEGER DEFAULT 1")
     # messages 发言作者归属（用于详情动态区按成员显示头像/昵称）
     cur = await db.execute("PRAGMA table_info(messages)")
     mcols = {row[1] for row in await cur.fetchall()}

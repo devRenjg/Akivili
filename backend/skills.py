@@ -68,6 +68,7 @@ def scan_from_disk(root_dir: str) -> tuple[list[dict], int]:
             "source_path": str(md),
             "body": body,
             "is_dir": 0,
+            "downloadable": _parse_downloadable(meta),
         })
     # 目录型 Skill：<slug>/SKILL.md（Anthropic Skill 标准，含 scripts/references 子目录）
     for sub in root.iterdir():
@@ -90,8 +91,18 @@ def scan_from_disk(root_dir: str) -> tuple[list[dict], int]:
             "source_path": str(sub),   # 指向目录，供打包 zip 下载
             "body": body,
             "is_dir": 1,
+            "downloadable": _parse_downloadable(meta),
         })
     return skills, skipped
+
+
+def _parse_downloadable(meta: dict) -> int:
+    """frontmatter 里 `downloadable: false`（或 no/0）→ 0 禁止下载；缺省或其它 → 1 允许。
+    用于「仅展示、不给人下载」的 Skill（供 Agent 集成）。"""
+    v = meta.get("downloadable")
+    if v is None:
+        return 1
+    return 0 if str(v).strip().lower() in ("false", "no", "0", "off") else 1
 
 
 async def rescan() -> dict:
@@ -102,13 +113,16 @@ async def rescan() -> dict:
             ex = await (await db.execute("SELECT id FROM skills WHERE slug=?", (s["slug"],))).fetchone()
             if ex:
                 await db.execute(
-                    "UPDATE skills SET name=?, description=?, source_path=?, body=?, is_dir=? WHERE slug=?",
-                    (s["name"], s["description"], s["source_path"], s["body"], s.get("is_dir", 0), s["slug"]))
+                    "UPDATE skills SET name=?, description=?, source_path=?, body=?, is_dir=?, downloadable=? WHERE slug=?",
+                    (s["name"], s["description"], s["source_path"], s["body"],
+                     s.get("is_dir", 0), s.get("downloadable", 1), s["slug"]))
                 updated += 1
             else:
                 await db.execute(
-                    "INSERT INTO skills (slug, name, description, source_path, body, is_dir) VALUES (?,?,?,?,?,?)",
-                    (s["slug"], s["name"], s["description"], s["source_path"], s["body"], s.get("is_dir", 0)))
+                    "INSERT INTO skills (slug, name, description, source_path, body, is_dir, downloadable) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (s["slug"], s["name"], s["description"], s["source_path"], s["body"],
+                     s.get("is_dir", 0), s.get("downloadable", 1)))
                 inserted += 1
         await db.commit()
     return {"inserted": inserted, "updated": updated, "skipped": skipped, "total": inserted + updated}
