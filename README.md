@@ -222,6 +222,20 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.5 — 2026-07-08
+- 💬 **对话框纵深放大 + 输入框 @mention 引入成员协作**（能力 `agent-collaboration`/`agent-execution`）
+  - **对话区放大**：详情页 `max-width` 1280→1440；追加指令输入框 3 行→6 行（`min-height` 132px）、字号放大，多轮长对话更从容。
+  - **输入框内 @mention**：移除原「@谁」下拉，改为在指令文本里输入 `@` 触发团队成员浮层补全（↑↓ 选择、Enter/Tab 选中、Esc 关闭，插入 `@昵称`）。候选来自当前项目团队。
+  - **一条指令可 @ 多位成员协作**：发送时解析被 `@` 的成员——第一位作为流式主受理人即时执行，其余由后端 `dispatch` 复用 `parse_and_enqueue_mentions` 各入队一个 run，经协同后台循环串行执行（主受理人作 `author_slug` 传入，避免重复入队）。底部「将唤醒：@xx」实时提示。多轮会话可按需引入不同成员参与。
+- 📊 **任务详情表格样式强化**（能力 `agent-execution`，`MarkdownView`）
+  - 原细线表格视觉过弱、融进正文。重做：圆角外框+轻投影、深色渐变表头+加粗底线、斑马纹+行 hover、纯数字单元格自动右对齐（`tabular-nums`）、每个表格套可横向滚动容器（宽表在窄气泡不撑破）。数字识别与容器包裹在已消毒 HTML 上做 DOM 后处理，不影响 XSS 防护。
+
+### v0.16.4 — 2026-07-08
+- 🔧 **孤儿「执行中」回收补齐 task_runs 层**（能力 `agent-collaboration`）
+  - v0.16.x 的 `reclaim_orphan_runs` 只回收了 `run_queue`，但任务详情页右侧「执行记录」列表读的是 `task_runs`（`/runs` 接口），只要有 `status='running'` 的行就显示「执行中」。多轮会话中每轮 `dispatch` 建一条 `task_runs`，生成器被取消 / 连接断开 / 进程重启时收尾路径跑不到 → `task_runs` 卡 `running` 成孤儿，即使任务已流转到「验证中」、外部卡片正常，详情页右侧仍持续显示「执行中」。
+  - `reclaim_orphan_runs` 现启动时同时回收两层：`run_queue`→`failed`、`task_runs`→`killed`（被中断非正常失败，补 `ended_at`），并清理内存注册表残留。两层数据源不同必须一起清。
+  - 验证：`run_orphan_reclaim_probe` 12/12（两层孤儿回收 + 非 running 不动 + 幂等）、QA 31/31、concurrency 7/7。
+
 ### v0.16.3 — 2026-07-08
 - 📦 **目录型 Skill「仅集成、不下载」+ 直播营收知识库接入**（能力 `agent-skills`）
   - **`bilisc-kb-live-revenue` 接入 Skills 页**：直播营收系统知识库（大航海/PK连线/醒目留言/礼物四大业务域 + 支付/订单/交易/结算/风控/对账六大基础设施域），目录型能力包（`SKILL.md` + `scripts/revenue-kb-api` 查询 CLI）。Agent 可勾选启用、运行时注入其 `SKILL.md` 正文。

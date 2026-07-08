@@ -62,6 +62,18 @@ async def dispatch(task_id: int, req: DispatchRequest, request: Request,
     # thread 里人手输入的指令：落成 user 消息，署当前登录用户名
     user_name = user.get("username", "")
 
+    # 人工指令里 @ 的其余成员一并唤醒（复用协同队列）：主受理人(agent)走下方流式即时执行，
+    # prompt 里额外 @ 的成员由 parse_and_enqueue_mentions 各入队一个 run，由协同后台循环串行执行。
+    # 把主受理人作为 author_slug 传入 → 它不会被重复入队（避免与流式那次撞车）。
+    primary_slug = agent["slug"]
+    leader_slug = await collab.get_leader_slug(task["project_id"])
+    try:
+        await collab.parse_and_enqueue_mentions(
+            task_id, task["project_id"], req.prompt, primary_slug, leader_slug)
+    except Exception:  # noqa: BLE001
+        pass  # @ 解析失败不阻断主受理人执行
+    collab.start_loop()  # 确保协同后台循环在跑，能领取上面入队的成员 run（幂等）
+
     async def event_stream():
         try:
             async for ev in runner.execute_dispatch(task, agent, req.prompt,

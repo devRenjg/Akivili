@@ -90,17 +90,32 @@
 
         <!-- 追加指令 -->
         <div v-if="isAdmin" class="td-composer">
-          <div class="composer-row">
-            <el-select v-model="atSlug" placeholder="@ 谁" class="at-select" size="default">
-              <el-option v-for="a in team" :key="a.id" :value="a.slug"
-                         :label="`${dName(a)}${a.is_leader ? ' 👑' : ''}`" />
-            </el-select>
-            <el-button v-if="streaming" type="danger" :icon="VideoPause" circle
-                       title="停止此任务执行" @click="doKill" />
+          <div class="composer-hint">
+            <span>输入 <b>@</b> 可点名团队成员协作（可 @ 多位，多轮会话按需引入不同成员）</span>
+            <el-button v-if="streaming" type="danger" size="small" :icon="VideoPause"
+                       title="停止此任务执行" @click="doKill">停止</el-button>
           </div>
-          <el-input v-model="input" type="textarea" :rows="3" :disabled="streaming"
-                    placeholder="下达指令，Enter 发送 / Shift+Enter 换行" @keydown.enter.exact.prevent="send" />
+          <div class="composer-input-wrap">
+            <el-input ref="inputEl" v-model="input" type="textarea" :rows="6" :disabled="streaming"
+                      resize="none"
+                      placeholder="下达指令，输入 @ 点名成员；Enter 发送 / Shift+Enter 换行"
+                      @input="onInput" @keydown="onComposerKeydown" />
+            <!-- @ 补全浮层 -->
+            <div v-if="mentionOpen && mentionList.length" class="mention-pop" :style="mentionPopStyle">
+              <div v-for="(a, mi) in mentionList" :key="a.slug"
+                   class="mention-item" :class="{ active: mi === mentionIdx }"
+                   @mousedown.prevent="pickMention(a)">
+                <AgentAvatar :agent="a" :size="22" class="mention-av" />
+                <span class="mention-name">{{ dName(a) }}</span>
+                <span v-if="a.is_leader" class="mention-badge">👑 负责人</span>
+                <span v-else class="mention-role">{{ a.name }}</span>
+              </div>
+            </div>
+          </div>
           <div class="composer-foot">
+            <span v-if="mentionedNames.length" class="mentioned-chips">
+              将唤醒：<el-tag v-for="n in mentionedNames" :key="n" size="small" effect="plain" class="mchip">@{{ n }}</el-tag>
+            </span>
             <el-button class="akivili-primary-btn" :disabled="streaming || !input.trim()" @click="send">发送</el-button>
           </div>
         </div>
@@ -254,7 +269,12 @@ const subtasks = ref([])
 const runs = ref([])
 const showPastRuns = ref(false)
 const input = ref('')
-const atSlug = ref('')
+const inputEl = ref(null)
+// @mention 补全浮层状态
+const mentionOpen = ref(false)
+const mentionIdx = ref(0)
+const mentionQuery = ref('')
+const mentionAnchor = ref(0)   // '@' 在 input 中的位置
 const streaming = ref(false)
 const streamText = ref('')
 const toolEvents = ref([])
@@ -282,11 +302,97 @@ const subHintSuffix = computed(() => {
 let pollTimer = null
 
 const subDone = computed(() => subtasks.value.filter((s) => s.status === 'done').length)
-const currentAgent = computed(() => team.value.find((x) => x.slug === atSlug.value) || null)
+// 正在流式执行的主受理人（send 时设为第一个被 @ 的成员）
+const primarySlug = ref('')
+const currentAgent = computed(() => team.value.find((x) => x.slug === primarySlug.value) || null)
 const currentAgentName = computed(() => {
   const a = currentAgent.value
-  return a ? dName(a) : '负责人'
+  return a ? dName(a) : '成员'
 })
+
+// —— @mention 补全 ——
+// @ 用名：优先昵称，无则角色名（与后端 parse_and_enqueue_mentions 的匹配口径一致，
+// 且插入 @昵称 比 @「昵称（角色）」清爽）
+function mentionName(a) { return (a.nickname || '').trim() || a.name || a.slug || '' }
+// 候选：当前项目团队成员，按查询词过滤（匹配昵称或角色名，忽略大小写）
+const mentionList = computed(() => {
+  const q = mentionQuery.value.toLowerCase()
+  const list = team.value.filter((a) => {
+    if (!q) return true
+    const nick = mentionName(a).toLowerCase()
+    const role = (a.name || '').toLowerCase()
+    return nick.includes(q) || role.includes(q)
+  })
+  return list.slice(0, 8)
+})
+// 浮层定位在输入框上方（简单固定在输入区顶部左侧，避免测量光标像素）
+const mentionPopStyle = computed(() => ({}))
+// 已在文本里 @ 到的成员名（用于底部“将唤醒”提示）
+const mentionedNames = computed(() => parseMentions(input.value).map((a) => mentionName(a)))
+
+// 从文本解析被 @ 的团队成员（匹配昵称或角色名，去重）
+function parseMentions(text) {
+  if (!text || !text.includes('@')) return []
+  const hits = []
+  const seen = new Set()
+  // 按名字长度降序，避免短名误命中长名的一部分
+  const sorted = [...team.value].sort((a, b) => mentionName(b).length - mentionName(a).length)
+  const tokens = text.match(/@[^\s@，,。、]+/g) || []
+  for (const tk of tokens) {
+    const name = tk.slice(1)
+    for (const a of sorted) {
+      const nick = mentionName(a)
+      const role = a.name || ''
+      if ((name.startsWith(nick) || nick.startsWith(name) ||
+           name.startsWith(role) || role.startsWith(name)) && !seen.has(a.slug)) {
+        seen.add(a.slug); hits.push(a); break
+      }
+    }
+  }
+  return hits
+}
+
+function onInput() {
+  const el = inputEl.value?.textarea || inputEl.value?.$el?.querySelector('textarea')
+  const pos = el ? el.selectionStart : input.value.length
+  // 找光标前最近的 '@'，其后到光标之间无空白 → 处于 @ 补全态
+  const before = input.value.slice(0, pos)
+  const at = before.lastIndexOf('@')
+  if (at >= 0 && !/[\s，,。、]/.test(before.slice(at + 1))) {
+    mentionAnchor.value = at
+    mentionQuery.value = before.slice(at + 1)
+    mentionOpen.value = true
+    mentionIdx.value = 0
+  } else {
+    mentionOpen.value = false
+  }
+}
+
+function pickMention(a) {
+  const name = mentionName(a)
+  const pos = mentionAnchor.value
+  const el = inputEl.value?.textarea || inputEl.value?.$el?.querySelector('textarea')
+  const caret = el ? el.selectionStart : input.value.length
+  const head = input.value.slice(0, pos)
+  const tail = input.value.slice(caret)
+  input.value = `${head}@${name} ${tail}`
+  mentionOpen.value = false
+  nextTick(() => {
+    const t = inputEl.value?.textarea || inputEl.value?.$el?.querySelector('textarea')
+    if (t) { const np = (head + '@' + name + ' ').length; t.focus(); t.setSelectionRange(np, np) }
+  })
+}
+
+function onComposerKeydown(e) {
+  if (mentionOpen.value && mentionList.value.length) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); mentionIdx.value = (mentionIdx.value + 1) % mentionList.value.length; return }
+    if (e.key === 'ArrowUp') { e.preventDefault(); mentionIdx.value = (mentionIdx.value - 1 + mentionList.value.length) % mentionList.value.length; return }
+    if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickMention(mentionList.value[mentionIdx.value]); return }
+    if (e.key === 'Escape') { mentionOpen.value = false; return }
+  }
+  // 普通 Enter 发送（Shift+Enter 换行）
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
+}
 
 // 聊天气泡：解析一条消息的发言人。user 消息用后端返回的实际发送者名（user_name，
 // 即当时发消息的人/任务创建者），而非当前查看者登录名；缺省回退「用户」。
@@ -448,7 +554,6 @@ async function loadAll() {
     team.value = (await projectAgentsApi.list(pid)).agents
     // 用单任务接口取详情（顶层/子任务通用；看板 list 只含顶层任务，取不到子任务）
     task.value = await tasksApi.get(pid, taskId)
-    atSlug.value = task.value?.assignee_slug || (team.value[0]?.slug || '')
     atBottom.value = true
     await Promise.all([loadTimeline(), loadSubtasks(), loadRuns(), loadProgress()])
     scrollToBottom(true)
@@ -524,12 +629,21 @@ function makeToolEvent(ev) {
 }
 async function send() {
   if (!input.value.trim() || streaming.value) return
-  if (!atSlug.value) return ElMessage.warning('请先 @ 一位成员')
+  mentionOpen.value = false
+  // 解析被 @ 的成员：第一个作为流式主受理人，其余由后端解析入队（协同队列串行执行）
+  const mentioned = parseMentions(input.value)
+  // 主受理人：优先取第一个被 @ 的成员；都没 @ 则回退任务负责人（后端 assignee_slug 兜底）
+  const primary = mentioned[0]?.slug || task.value?.assignee_slug || ''
+  if (!primary) return ElMessage.warning('请用 @ 点名至少一位成员，或先为任务设置负责人')
+  primarySlug.value = primary
   const prompt = input.value.trim()
   input.value = ''; streaming.value = true; streamText.value = ''; toolEvents.value = []; currentRunId.value = null
+  if (mentioned.length > 1) {
+    ElMessage.info(`已点名 ${mentioned.length} 位成员，其余成员将在协同队列中依次参与`)
+  }
   await loadTimeline(); atBottom.value = true; scrollToBottom(true)
   try {
-    await runsApi.dispatch(taskId, prompt, atSlug.value, (ev) => {
+    await runsApi.dispatch(taskId, prompt, primary, (ev) => {
       if (ev.type === 'system' && ev.meta?.run_id) currentRunId.value = ev.meta.run_id
       else if (ev.type === 'text') { streamText.value += ev.text; scrollToBottom() }
       else if (ev.type === 'tool') { toolEvents.value.push(makeToolEvent(ev)); scrollToBottom() }
@@ -543,6 +657,8 @@ async function send() {
   finally {
     streamText.value = ''; streaming.value = false; currentRunId.value = null
     await Promise.all([loadTimeline(), loadRuns(), loadProgress()]); scrollToBottom()
+    // 额外 @ 的成员已入协同队列，开轮询让其执行进度即时刷新
+    startPolling()
   }
 }
 async function doKill() { if (currentRunId.value) { await runsApi.kill(currentRunId.value); ElMessage.info('已发送终止信号') } }
@@ -574,7 +690,7 @@ onUnmounted(stopPolling)
 </script>
 
 <style scoped>
-.task-detail { max-width: 1280px; margin: 0 auto; }
+.task-detail { max-width: 1440px; margin: 0 auto; }
 .td-topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
 .td-crumb { display: flex; align-items: center; gap: 8px; }
 .crumb-sep { color: #c0c4cc; }
@@ -639,10 +755,35 @@ onUnmounted(stopPolling)
 .tool-detail { margin: 2px 0 6px 12px; padding: 8px 10px; background: #1e1e1e; color: #d4d4d4;
   border-radius: 6px; font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
   font-family: 'Consolas', monospace; max-height: 240px; overflow: auto; }
-.td-composer { border-top: 1px solid #ebeef5; padding-top: 14px; margin-top: 14px; }
-.composer-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
-.at-select { width: 220px; }
-.composer-foot { display: flex; justify-content: flex-end; margin-top: 8px; }
+.td-composer { border-top: 1px solid #ebeef5; padding-top: 14px; margin-top: 18px; }
+.composer-hint { display: flex; align-items: center; justify-content: space-between;
+  font-size: 12.5px; color: #909399; margin-bottom: 8px; }
+.composer-hint b { color: #409eff; }
+.composer-input-wrap { position: relative; }
+/* 输入框放大：更高、字号更舒展 */
+.composer-input-wrap :deep(.el-textarea__inner) {
+  font-size: 14.5px; line-height: 1.7; padding: 12px 14px; min-height: 132px;
+  border-radius: 10px;
+}
+/* @ 补全浮层：悬浮在输入框上方 */
+.mention-pop {
+  position: absolute; left: 8px; bottom: calc(100% + 6px); z-index: 20;
+  min-width: 240px; max-height: 300px; overflow-y: auto;
+  background: #fff; border: 1px solid #e4e7ed; border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(15, 28, 51, .16); padding: 5px;
+}
+.mention-item { display: flex; align-items: center; gap: 9px; padding: 7px 10px;
+  border-radius: 7px; cursor: pointer; }
+.mention-item.active,
+.mention-item:hover { background: #eef4ff; }
+.mention-av { flex-shrink: 0; }
+.mention-name { font-weight: 600; font-size: 14px; color: #24324d; }
+.mention-badge { font-size: 12px; color: #b8860b; margin-left: auto; }
+.mention-role { font-size: 12px; color: #909399; margin-left: auto;
+  max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.composer-foot { display: flex; justify-content: flex-end; align-items: center; gap: 12px; margin-top: 10px; }
+.mentioned-chips { margin-right: auto; font-size: 12.5px; color: #909399; }
+.mentioned-chips .mchip { margin-left: 5px; }
 .readonly-hint { border-top: 1px solid #ebeef5; padding: 16px 0 4px; text-align: center; color: #909399; font-size: 13px; }
 .side-block { background: #fafbfc; border: 1px solid #ebeef5; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
 .side-block-title { font-size: 14px; font-weight: 600; color: #606266; margin-bottom: 12px; }
