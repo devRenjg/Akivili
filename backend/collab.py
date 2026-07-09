@@ -81,6 +81,11 @@ async def _grace_then_kill(task_id: int, slug: str, agent: dict,
     宽限内产出了真实交付则视为成功（保成果、不销毁），否则 kill 进程树 + 落 failed。
 
     返回 True=已保住成果（run 记 done）、False=真失败（已 kill + finalize failed）。
+
+    注（Loop Engineering）：新版 _drive 已把「硬墙钟到点但仍在产出」的健康长任务挡在前面
+    （续期继续跑，不进本函数）。故能走到这里的 outcome 基本是：idle_timeout（连续静默、
+    疑似卡死），或 hard_wall 且此刻确已静默。宽限是给「刚好在收尾、马上要落库」的最后机会；
+    宽限内仍无交付才判卡死 kill。调用方在 saved=True 时会补 on_execution_complete 推进任务状态。
     """
     from activity import log_activity
     from executor import runner
@@ -461,7 +466,14 @@ async def _run_one(item: dict) -> None:
         """逐事件消费执行流，返回「结束原因」：
           normal        —— 生成器自然跑完（Agent 正常收尾）
           idle_timeout  —— 连续 idle 秒无任何事件（判卡死）
-          hard_wall     —— 超过硬墙钟总上限
+          hard_wall     —— 超过硬墙钟总上限，且此刻已静默（真该收）
+
+        Loop Engineering 理念：长时间跑不是问题，卡死才是问题。判据是「还在不在产出」而非
+        「跑了多久」。故：
+        - 静默超时（连续 idle 秒无任何事件）= 真卡死信号 → 立即返回 idle_timeout。
+        - 硬墙钟到点 ≠ 直接杀：先做活性探测(liveness)——若仍在持续产出事件，则「续期」
+          （重置硬墙钟起点、记一条长跑续期活动），继续追踪直到它真正结束或真的静默；
+          只有硬墙钟到点且此刻确已静默，才返回 hard_wall 收尾。
         静默超时用「对每次取下一个事件设 idle 超时」实现——只要 Agent 在持续产出事件，
         取事件就不会超时；真卡死（无任何事件）才在 idle 秒后触发。
         """
@@ -469,10 +481,26 @@ async def _run_one(item: dict) -> None:
         idle = _idle_timeout(slug)
         hard = _hard_wall(slug)
         start = _time.monotonic()
+        produced_since_wall = False   # 本个硬墙钟周期内是否有产出（活性标志）
+        extensions = 0
         agen = runner.execute_dispatch(task, agent, prompt, persist_user_msg=False)
         try:
             while True:
                 if _time.monotonic() - start > hard:
+                    # 硬墙钟到点：活性探测。本周期内仍在产出 → 续期，不杀。
+                    if produced_since_wall:
+                        extensions += 1
+                        produced_since_wall = False
+                        start = _time.monotonic()
+                        try:
+                            from activity import log_activity
+                            await log_activity(
+                                task_id, "commented", "system", "",
+                                {"note": f"⏱️ {agent.get('name', slug)} 长跑续期（第 {extensions} 次）："
+                                         f"硬墙钟到点但仍在持续产出，判为健康长任务、继续追踪不终止。"})
+                        except Exception:  # noqa: BLE001
+                            pass
+                        continue
                     return "hard_wall"
                 try:
                     ev = await asyncio.wait_for(agen.__anext__(), timeout=idle)
@@ -480,6 +508,7 @@ async def _run_one(item: dict) -> None:
                     return "normal"
                 except asyncio.TimeoutError:
                     return "idle_timeout"
+                produced_since_wall = True   # 收到事件 = 活着且在产出
                 if ev.type == "system" and ev.meta.get("run_id"):
                     run_id_box["id"] = ev.meta["run_id"]
                 elif ev.type == "text":
@@ -490,6 +519,7 @@ async def _run_one(item: dict) -> None:
             await agen.aclose()
 
     run_status = "done"   # run_queue 的最终状态：done / failed
+    saved_via_grace = False   # 是否经「超时保成果」落终态（此时 collected 可能为空，但 DB 里已有交付）
     try:
         outcome = await _drive()
         if outcome != "normal":
@@ -498,6 +528,7 @@ async def _run_one(item: dict) -> None:
             rid = run_id_box["id"]
             saved = await _grace_then_kill(task_id, slug, agent, rid, outcome)
             run_status = "done" if saved else "failed"
+            saved_via_grace = saved
     except Exception:  # noqa: BLE001
         run_status = "failed"
 
@@ -516,7 +547,10 @@ async def _run_one(item: dict) -> None:
     #  - 无子任务的独立顶层任务执行完 → 自身进「验证中」，等人工验收。
     #  - 经验沉淀 + 已解决计数：只在管理员把父任务/独立任务人工验收拖入「完成」时触发（routes/tasks.py），
     #    届时把父+全部子任务的经验一起沉淀。
-    if run_status == "done" and final_text and not is_leader:
+    # 推进条件：正常收尾有产出，或「超时保成果」已落终态（后者 final_text 可能为空，
+    # 但 DB 里已有交付——不能因 collected 为空就漏掉状态推进，否则任务会卡在 in_progress，
+    # 只能等 Agent 自己某次 jian status 侥幸推进。Bug 修复：保成果路径也要推进任务状态）。
+    if run_status == "done" and (final_text or saved_via_grace) and not is_leader:
         from progress import on_execution_complete
         # 传本 run 的队列行 id：此刻它的 done 标记还没写（在 _process_one finally 里），
         # 需从"是否还有待跑 run"里排除自己，否则父任务永远收不了尾。
