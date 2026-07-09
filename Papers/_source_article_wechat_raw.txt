@@ -1,0 +1,212 @@
+style="visibility: hidden; opacity: 0; ">
+澶у濂斤紝鎴戞槸PaperAgent锛屼笉鏄疉gent锛?/span>
+涓€涓湪浣犵潯瑙夋椂浠嶅湪杩愯鐨?/span>
+Loop寰幆
+锛屽苟涓嶈嚜鍔ㄧ瓑浜庝竴涓細瀛︿範鐨?/span>
+Loop寰幆
+銆?/span>
+缁忛獙
+鑳藉惁鍦ㄦ瘡涓€杞凯浠ｄ腑瀛樻椿涓嬫潵锛屽畬鍏ㄥ彇鍐充簬瀹冩渶缁堟矇娣€鍦ㄥ摢閲屻€?/span>
+浠婂ぉ鍒嗕韩涓€绡囨竻鍗庡ぇ瀛﹀叧浜?/span>
+缁忛獙鏃朵唬
+锛圗ra of Experience锛夛紝宸查儴缃茬殑
+Agent
+濡備綍灏嗕氦浜掕建杩硅浆鍖栦负鎸佷箙鐨勮兘鍔涳紝浠庤嚜鎴戣繘鍖栧埌鍏冭繘鍖栫殑璁烘枃銆?/span>
+1. 缁忛獙鏃朵唬宸茬粡鍒版潵
+浼犵粺 AI 浠ラ潤鎬佹暟鎹缁冧负鏍稿績锛岃€屾湭鏉ョ殑 Agentic AI 灏嗙敱
+閮ㄧ讲鍚庣殑浜や簰缁忛獙
+瀹氫箟銆係ilver 鍜?Sutton 鎻愬嚭鐨?"Era of Experience" 鎸囧嚭锛氭櫤鑳戒綋鐨勮繘姝ヤ笉鍐嶄粎鏉ヨ嚜棰勮缁冭鏂欙紝鑰屾潵鑷笌鐜浜や簰涓Н绱殑 grounded rewards 鍜岄暱绋嬪悗鏋溿€?/span>
+璁烘枃灏嗚繖涓€瓒嬪娍褰㈠紡鍖栦负涓€涓?/span>
+杩愯鏃跺璞?/span>
+锛?/span>
+鍏朵腑
+鏄熀搴фā鍨嬶紝
+鏄彲鍙樼殑
+Harness
+锛堣繍琛屾椂鎺у埗灞傦級锛?/span>
+鏄敤鎴蜂晶锛?/span>
+鏄幆澧冧晶銆侶arness 鏄粡楠屾祦鐨勪腑浠嬶細瀹冨喅瀹氱敤鎴疯姹傚浣曞彉鎴愭ā鍨嬪彲瑙佺殑涓婁笅鏂囷紝妯″瀷杈撳嚭濡備綍鍙樻垚鐜鍔ㄤ綔锛屼互鍙婁氦浜掔棔杩瑰浣曠紪璇戜负鏈潵鐨勬洿鏂颁俊鍙枫€?/span>
+Figure 1 璁烘枃鍏ㄨ鍥撅紝灞曠ず浜嗕粠 Harness-Agent 瀹氫箟鍒板閮ㄨ繍琛屾椂閫傚簲銆佸弬鏁板眰鍥哄寲锛屽啀鍒拌瘎娴嬩笌瀹夊叏鐨勫畬鏁磋剦缁?/span>
+2. Harness锛氱粡楠屽熀纭€璁炬柦
+Harness 鏄洿缁曟ā鍨嬬殑杩愯鏃舵帶鍒跺眰锛岃礋璐ｇ粍缁囦笂涓嬫枃銆佸伐鍏疯闂€佹潈闄愩€佹墽琛屻€佸弽棣堛€佽蹇嗗拰鎭㈠銆傚畠鐨勫叧閿环鍊煎湪浜?/span>
+鏃堕棿灏哄害涓嶅绉版€?/span>
+锛欻arness 鐘舵€佸彲浠ュ湪閮ㄧ讲鏈熼棿琚绻併€佷綆鎴愭湰鍦版鏌ャ€佷慨璁㈠拰娌荤悊锛岃€屾ā鍨嬫潈閲嶅垯涓嶈兘銆?/span>
+Figure 3 涓変唬杩涘寲锛氫粠浠诲姟寰幆鍒拌繍琛屾椂绯荤粺
+Gen 1锛圱ask Loops锛?/span>
+锛歐ebGPT銆丷eAct銆丷eflexion銆傚缓绔嬩簡鎺ュ彛鎺ュ湴锛坕nterface grounding锛夛紝浣嗙姸鎬佸ぇ澶氭槸 episodic锛屼换鍔＄粨鏉熷悗鏃犳硶澶嶇敤銆?/span>
+Gen 2锛圕ross-Task Reuse锛?/span>
+锛歏oyager銆丄utoGen銆丮etaGPT銆丩angGraph銆丼WE-agent銆傚紩鍏ユ寔涔呭寲鐘舵€併€佸彲澶嶇敤鎶€鑳藉簱銆佸鏅鸿兘浣撳崗璋冧笌宸ヤ綔娴佺粨鏋勩€?/span>
+Gen 3锛圧untime Systems锛?/span>
+锛欳laude Code銆丆odex銆丆ursor 3銆丱penClaw銆丠ermes Agent銆侶arness 鏈韩鎴愪负宸ョ▼瀵硅薄锛屾敮鎸侀儴缃叉椂鑷€傚簲涓庣粡楠岀Н绱€?/span>
+Figure 2 灞曠ず浜?Harness 濡備綍涓粙鐢ㄦ埛渚т笂涓嬫枃銆佺幆澧冧晶鎵ц銆佺粡楠岀紪璇戜笌鍙彉鏇存柊琛ㄩ潰銆?/span>
+涓€涓鍦ㄨ繍琛岀殑寰幆锛屽拰涓€涓細瀛︿範鐨勫惊鐜紝涓嶆槸涓€鍥炰簨
+銆?/span>
+鍦ㄥ崟涓换鍔″唴閮紝agent 寰幆锛堣鍔ㄢ啋瑙傚療鈫掑喅绛栤啋閲嶅锛夊彧闇€瑕佹垚鍔熶竴娆″氨澶熶簡銆備絾瀛︿範涓嶅悓锛氬畠闇€瑕佸湪澶氫釜绐楀彛涔嬮棿绉疮璺ㄤ細璇濈殑缁忛獙銆?/span>
+灏嗗凡閮ㄧ讲鐨?agent 褰㈠紡鍖栦负鍥涗釜閮ㄥ垎锛氬熀纭€妯″瀷 + 鍙彉鐨?harness锛?harness 宸ョ▼锛? 闈㈠悜鐢ㄦ埛鐨勪竴渚?+ 闈㈠悜鐜鐨勪竴渚с€?/span>
+harness
+鏄綘鍙互鍦ㄩ儴缃叉椂闂村昂搴︿笂妫€鏌ュ苟淇敼鐨勯儴鍒嗏€斺€旀垚鏈繙浣庝簬璋冩暣鏉冮噸鈥斺€斿畠璐熻矗灏嗗師濮嬭建杩癸紙蟿锛夌紪璇戜负鍙鐢ㄧ殑缁忛獙锛坺锛夛紝鐒跺悗灏嗚繖浜涚粡楠岃矾鐢卞埌姝ｇ‘鐨勪綅缃€?/span>
+Loop寰幆
+杩愯鍦?nbsp;
+harness
+涔嬩笂銆?/span>
+harness
+鍐冲畾杩欎釜Loop寰幆鑳戒繚鐣欎粈涔堛€?/span>
+3. Skills锛氱粡楠屽浣曞彉鎴愬彲澶嶇敤绋嬪簭
+鎶€鑳斤紙Skill锛夋槸绋嬪簭鎬х粡楠岀殑澶栭儴鍖栥€傝鏂囬噰鐢ㄧぞ鍖烘敹鏁涚殑
+SKILL.md 妯″紡
+瀹氫箟鎶€鑳藉厓缁勶細
+M
+锛歁anifest锛堝厓鏁版嵁锛岀敤浜庤繍琛屾椂鍙戠幇锛?/span>
+I
+锛欼nstruction锛堜换鍔℃墽琛屾寚浠わ級
+R
+锛歊eference锛堝弬鑰冩枃妗ｃ€丼chema銆佺ず渚嬶級
+A
+锛欰rtifact锛堝彲鎵ц鑴氭湰銆佹ā鏉裤€佽緟鍔╀唬鐮侊級
+3.1 鎶€鑳界敓鍛藉懆鏈燂細鍒涘缓 鈫?浣跨敤 鈫?杩涘寲
+Skill Creation
+锛氭潵婧愬寘鎷笓瀹剁紪鍐欙紙Anthropic/ClawHub锛夈€佷粨搴撴寲鎺橈紙Repo-Based锛夈€佹枃妗ｈ捀棣忥紙Corpus2Skill锛夊拰绂荤嚎杞ㄨ抗锛圱race2Skill/SkillX锛夈€?/span>
+Skill Use
+锛氬寘鍚笁涓叧閿棶棰橈細
+Routing
+锛氬湪澶у瀷搴撲腑妫€绱㈡纭妧鑳姐€係killsWild 鍙戠幇锛屽己鍒跺姞杞界簿閫夋妧鑳藉彲浠ヤ紭浜庝粠澶ц妯℃贩鍚堟睜妫€绱⑩€斺€斿簱鐨勫闀垮彲鑳芥帺鐩栨湁鐢ㄦ妧鑳姐€?/span>
+Composition
+锛氬皢閫変腑鎶€鑳界粍鍚堜负浠诲姟绾ф祦绋嬨€係killNet 閫氳繃鍏ㄥ眬鍏崇郴鍥俱€丟oSkills 閫氳繃灞€閮ㄥ浘銆丼killRAE 閫氳繃 rescued cues 瑙ｅ喅鍏煎鎬ч棶棰樸€?/span>
+Execution
+锛氬湪 Harness 绾︽潫涓嬭繍琛屻€係killSmith 灏嗙绾垮寘缂栬瘧涓鸿竟鐣屽紩瀵肩殑杩愯鏃舵帴鍙ｏ紝鍑忓皯 token 浣跨敤鍜屽欢杩熴€?/span>
+Skill Evolution
+锛氶儴缃茶瘉鎹┍鍔ㄥ簱鏇存柊銆傚叧閿搷浣滃寘鎷細
+Add
+锛氳鐩栫己鍙ｏ紙Trace2Skill, AutoSkill锛?/span>
+Edit
+锛氫慨澶嶈川閲忕己鍙ｏ紙SkillForge, XSkill锛?/span>
+Prune/Retire
+锛氭竻鐞嗘薄鏌擄紙AutoRefine, Hermes Agent锛?/span>
+Validation
+锛歋killsBench 鏄剧ず锛岃嚜鐢熸垚鎶€鑳藉彲鑳藉鑷磋礋杩佺Щ锛坣egative transfer锛夛紝绔埌绔獙璇佸繀涓嶅彲灏戙€?/span>
+4. Memory锛氱粡楠屽浣曞彉鎴愭寔涔呯姸鎬?/span>
+璁板繂涓庢妧鑳戒笉鍚岋細鎶€鑳借瀹?濡備綍鍐嶅仛涓€娆?锛岃蹇嗕繚瀛?鍙戠敓浜嗕粈涔堛€佷粈涔堝彉浜嗐€佷粈涔堝け璐ヤ簡"銆?/span>
+4.1 璁板繂浣滀负涓婁笅鏂囦粙瀵肩殑鎸佷箙鎬?/span>
+璁烘枃灏嗚蹇嗙郴缁熻В鏋勪负涓夊眰锛?/span>
+琛ㄧず灞傦紙Representation锛?/span>
+锛?/span>
+鍐呭鍗曞厓锛氬師濮嬫棩蹇?/ 鎯呰妭杞ㄨ抗 / 鎽樿 / 璇箟鎶借薄
+缁勭粐缁撴瀯锛氭墎骞宠拷鍔犲紡 / 鍒嗗眰寮忥紙MemGPT, LightMem锛? 鍏崇郴鍥惧紡锛圥lugMem, AriadneMem, GAAMA, SAGE锛?/span>
+鎿嶄綔灞傦紙Operations锛?/span>
+锛?/span>
+Write/Admission锛氳嚜閫傚簲鍑嗗叆鎺у埗锛圓daptive Memory Admission Control锛?/span>
+Compression锛氫粠宸ヤ綔鍐呭瓨鍘嬬缉鍒拌涔変簨瀹炴彁鍙?/span>
+Consolidation锛氳法浼氳瘽鍚堝苟涓庢娊璞★紙A-MEM, Auto-Dreamer锛?/span>
+Retrieval/Activation锛氫粠鐩镐技搴︽绱㈠埌鍥鹃亶鍘嗭紙MemORAI锛?/span>
+Update/Revision锛氬鐞嗚繃鏃朵笌鍐茬獊锛圠ive-Evo, STALE, MemoRepair锛?/span>
+杩涘寲灞傦紙Evolution锛?/span>
+锛?/span>
+Content Evolution
+锛氳蹇嗗唴瀹规湰韬殑绮剧偧
+Mechanism Evolution
+锛氳蹇嗙粍缁囦笌鎻愬彇鏂瑰紡鐨勬敼杩涳紙MetaMem, MemSkill锛?/span>
+Policy Evolution
+锛氫綍鏃跺啓銆佷綍鏃惰銆佷綍鏃堕仐蹇樼殑鎺у埗绛栫暐瀛︿範锛圓geMem, MemRL, DeltaMem锛?/span>
+5. Environment锛氭櫤鑳戒綋缁忛獙鐨勫ぉ鑺辨澘
+鐜涓嶄粎鏄閮ㄤ笘鐣岋紝鏇存槸
+鑷敼杩涚殑涓婇檺鍙橀噺
+銆傚鏋滃姩浣滆〃闈㈢嫮绐勩€佸弽棣堢█鐤忋€佷换鍔?horizon 鐭紝鍐嶅鏉傜殑 Harness 鏀硅繘涔熼毦浠ヤ骇鐢熷疄璐ㄦ敹鐩娿€?/span>
+5.1 鐜浣滀负杩愯鏃堕€傚簲鐨勪笂闄?/span>
+璁烘枃鎻愬嚭涓変釜鍒嗘瀽缁村害锛?/span>
+Action Diversity
+锛氬彲鎵ц鍔ㄤ綔鐨勫箍搴︼紙CLI 鈫?Browser 鈫?Desktop 鈫?App Ecosystem锛?/span>
+Feedback Density
+锛氬弽棣堢殑鍙綊鍥犳€т笌瀵嗗害锛堟墽琛岄敊璇€佺姸鎬佹祴璇曘€侀獙璇佸櫒杈撳嚭锛?/span>
+Task Horizon
+锛氭椂搴忔繁搴︿笌鐘舵€佸彲鎭㈠鎬?/span>
+浠?ALFWorld 鍒?Voyager銆乄ebArena銆丱SWorld銆丄ppWorld锛屽啀鍒?Terminal-Bench 鍜?SWE-Gym锛岀幆澧冩鍦ㄤ粠"鍙墽琛?鍚?鍙涔?婕旇繘銆?/span>
+5.2 浠庡彲鎵ц鍒板彲瀛︿範锛氫笁灞傞€掕繘
+鍏抽敭缁撹锛氬彲鎵ц鐜銆佹爣鍑嗗寲杈圭晫銆佸彲瀛︿範鐜鏄笁涓笉鍚岀殑鎴愬氨锛屽垎鍒搴?璁╄蒋浠跺彲杩愯"銆?璁╃粡楠屽彲鎼哄甫"銆?璁╃粡楠屽彲浼樺寲"銆?/span>
+6. RL 涓庢寔缁涔狅細缁忛獙濡備綍鍥哄寲鍒板弬鏁?/span>
+褰?Harness 渚х殑缁忛獙鍙樺緱绋冲畾涓旈€氱敤鏃讹紝灏遍渶瑕佽€冭檻
+鍙傛暟璺緞
+鈥斺€斿皢缁忛獙鍐呴儴鍖栦负妯″瀷鏉冮噸銆?/span>
+6.1 涓轰粈涔堝弬鏁板浐鍖栭噸瑕侊紵
+涓夊ぇ鍔ㄦ満锛?/span>
+Internalize priors
+锛氶伩鍏嶉噸澶嶆敮浠樹笂涓嬫枃缂栨帓寮€閿€锛圕omposer 2, Cursor RL锛?/span>
+Transfer beyond context
+锛氱瓥鐣ユ洿鏂板彲璺ㄤ换鍔°€佷細璇濄€佺敤鎴疯縼绉伙紙SEAgent, UI-Mem锛?/span>
+Collective evolution
+锛氳仈閭﹀紡鏇存柊璁╁崟涓櫤鑳戒綋鐨勭粡楠屾垚涓哄叡浜厛楠?/span>
+鍙傛暟鏇存柊閬靛惊閫夋嫨-淇″彿鎻愬彇-浼樺寲娴佺▼锛?/span>
+6.2 棰勯儴缃茶缁冿細鍨傜洿鑳藉姏涓?Harness 鍔熻兘鍗曞厓
+鍨傜洿鑳藉姏
+锛歋WE-Gym銆丮LE-Dojo銆丼earchGym銆丆UA-Gym 绛夊彲鎵ц璁粌鍩哄簳锛岄€氳繃 SFT + RL 鍩瑰吇棰嗗煙鑳藉姏銆?/span>
+Harness 鍔熻兘鍗曞厓璁粌
+锛氳绛栫暐瀛︿細璋冪敤瀛愭櫤鑳戒綋锛圧outer-R1, xRouter, ToolOrchestra锛夈€佷娇鐢ㄦ妧鑳斤紙SkillRL, D2Skill, SKILL0锛夊拰鎿嶄綔璁板繂锛圡emSearcher, Agentic Memory, EMPO虏锛夈€?/span>
+6.3 閮ㄧ讲鍚庤缁冿細浠庣湡瀹炵棔杩逛腑瀛︿範
+鏈€寮哄叕寮€璇佹嵁鏉ヨ嚜宸ヤ笟鐣岋細
+Composer 2 / Cursor RL
+锛氬湪鐪熷疄 Cursor 浼氳瘽涓繍琛?RL锛屼娇鐢ㄤ笌閮ㄧ讲鐩稿悓鐨勫伐鍏峰拰 Harness
+Codex
+锛氬湪鐪熷疄涓栫晫缂栫爜浠诲姟涓婁娇鐢?RL 璁粌
+OpenClaw-RL / MetaClaw
+锛氬皢瀹炴椂鐢ㄦ埛鍥炲銆佸伐鍏疯緭鍑哄拰缁堢鐘舵€佷綔涓哄湪绾?RL 鐩戠潱
+鐡堕涓嶅湪浜庣瓥鐣ユ搴︾畻娉曪紝鑰屽湪浜?/span>
+鐥曡抗鍒版洿鏂扮殑绯荤粺
+锛氳建杩归€夋嫨銆佸ぇ瑙勬ā鏀堕泦銆佷俊鍙锋彁鍙栥€佸悓 Harness 璁粌銆?/span>
+7. 鍏冭繘鍖栨櫤鑳戒綋锛氳皝鏉ユ帶鍒惰繘鍖栵紵
+褰撴敼杩涜繃绋嬫湰韬垚涓轰紭鍖栧璞℃椂锛屽氨杩涘叆浜?/span>
+鍏冭繘鍖栵紙Meta-Evolution锛?/span>
+regime銆?/span>
+7.1 涓夌杩涘寲 regime
+鎺у埗鑰?\ 杩涘寲瀵硅薄
+TaskAgent 鍐呭璧勪骇
+TaskAgent 鏈哄埗/缁撴瀯
+TaskAgent 鏀硅繘绛栫暐
+Meta-layer 鏈韩
+TaskAgent 鍐呴儴鎺у埗
+TaskAgent 鑷繘鍖?/span>
+TaskAgent 鍏冨涔?/span>
+TaskAgent 鍏冨涔?/span>
+鈥?/span>
+鎸佷箙鍖?Meta-layer 鎺у埗
+鈥?/span>
+鍏冭繘鍖栨櫤鑳戒綋
+鍏冭繘鍖栨櫤鑳戒綋
+鍏冭繘鍖栨櫤鑳戒綋
+TaskAgent Self-Evolution
+锛氬唴瀹硅祫浜э紙鎶€鑳姐€佽蹇嗐€佸亸濂斤級鐨勭Н绱?/span>
+TaskAgent Meta-Learning
+锛氬涔犲浣曞涔狅紝鏀硅繘鎵ц鏈哄埗锛圡etaAgent, ExpWeaver, ARISE锛夋垨鏀硅繘绛栫暐锛圡ulti-Agent SAGE, Ace-Skill, SkillRL锛?/span>
+Meta-Evolving Agent
+锛氱敱鍔熻兘鐙珛鐨?Meta-layer 鎸佺画浼樺寲 TaskAgent锛岀敋鑷充紭鍖栬嚜韬?/span>
+7.2 Meta-layer 鎺у埗鎵ц鏈哄埗
+灞€閮ㄦ帶鍒剁瓥鐣?/span>
+锛歁etaMem锛堝厓璁板繂瑙勫垯锛夈€丮emSkill锛堣蹇嗘妧鑳藉簱锛夈€丆luE锛堟彁绀鸿繘鍖栧惊鐜級
+鑳藉姏璧勬簮鐢熷懡鍛ㄦ湡
+锛歁em2Evolve锛堝伐鍏?涓撳浠ｇ悊鐨勫垱寤?楠岃瘉-钂搁锛夈€丮etaClaw锛堝揩閫熸妧鑳借繘鍖?+ 鎱㈤€熺瓥鐣ュ浐鍖栵級銆丆ontinual Harness锛圕RUD 缂栬緫绯荤粺鎻愮ず/瀛愭櫤鑳戒綋/鎶€鑳?璁板繂锛?/span>
+鎸佷箙缁勭粐涓庤鐭ョ姸鎬?/span>
+锛欻ERA锛堢紪鎺掑櫒 + 缁忛獙搴擄級銆丄utoAgent锛堟墽琛屽惊鐜?+ 杩涘寲寰幆锛?/span>
+7.3 Meta-layer 鎺у埗鏀硅繘绛栫暐
+MetaEvo
+锛氬熀浜庡師鍒欑殑鍏冧紭鍖栬嚜鏍℃寰幆
+SkillOS
+锛氬喕缁撴墽琛屽櫒锛岃缁冪嫭绔嬬殑 Skill Curator 瀛︿範搴撶骇绛栧睍锛坕nsert/update/delete锛?/span>
+Autogenesis
+锛歊SPL锛堣祫婧愯鑼冿級+ SEPL锛堝弽灏?閫夋嫨-鏀硅繘-璇勪及-鎻愪氦寰幆锛?/span>
+7.4 Meta-layer 鑷垜鏀硅繘
+Agent0 / Tool-R0
+锛氳绋?浠诲姟鍚堟垚绛栫暐浣滀负杩涘寲瀵硅薄
+Group-Evolving Agents
+锛氱兢浣撶骇鏀硅繘鐘舵€侊紙妗ｆ銆佺埗閫夋嫨銆佸叡浜粡楠屾睜锛夋湰韬紨鍖?/span>
+Hyperagents
+锛氬皢 task_agent.py 鍜?meta_agent.py 缃簬鍚屼竴鍙紪杈戠▼搴忕┖闂达紝鏀寔鑷垜寮曠敤寮忓厓杩涘寲
+璇勪及鑷繘鍖朅gent
+https://openreview.net/pdf?id=IUltZSgLMm
+Self-Improving Agents
+in
+the Era of Experience: A Survey of Self- to Meta-Evolution
+https://github.com/FrontisAI/Awesome-Self-Improving-Agents
+涓€鍙ｆ皵涓?绡嘇gent ICML椤朵細锛岃繖涓洟闃熷彲澶己浜?/span>
+鍔ㄦ墜璁捐AI Agents锛氾紙缂栨帓銆佽蹇嗐€佹彃浠躲€亀orkflow銆佸崗浣滐級
+鍒嗕韩涓ょ瘒Claude Skills鏈€鏂拌鏂囷紝鏈?涓牳蹇冪粨璁?/span>
+DeepSeek鎶兼敞鐨凥arness锛岃杩欑瘒鏈€鏂扮患杩板交搴曡閫忎簡
+2026锛屽仛Agentic AI锛岀粫涓嶅紑杩欎袱绡囧紑骞寸患杩?/span>
+宸茬粡璇诲埌杩欎簡锛屼笉濡ㄧ偣涓煈嶃€佲潳锔忋€佲啑锔忎笁杩烇紝鍔犱釜鏄熸爣猸愶紝涓嶈糠璺摝~
