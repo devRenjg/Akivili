@@ -94,10 +94,37 @@ def _extract_bullets(section_body: str) -> list[str]:
     return out
 
 
+_TASK_TAG_RE = None
+
+
 def _bullet_text(bullet: str) -> str:
-    """剥掉条目尾部的任务归属标记 <!-- akivili:task:ID -->，返回纯经验正文（用于去重/压缩/喂模型）。"""
+    """剥掉条目尾部的任务归属标记 <!-- akivili:task:ID -->，返回纯经验正文（用于去重/压缩/喂模型）。
+    ID 兼容非数字历史标记（如 liuying-2024q1），用 \\S+ 而非 \\d+。"""
     import re
-    return re.sub(r"\s*<!-- akivili:task:\d+ -->\s*$", "", bullet).strip()
+    return re.sub(r"\s*<!--\s*akivili:task:\S+\s*-->\s*$", "", bullet).strip()
+
+
+def _bullet_tag(bullet: str) -> str:
+    """取条目尾部的任务归属标记（含注释符），无则返回空串。"""
+    import re
+    m = re.search(r"<!--\s*akivili:task:\S+\s*-->\s*$", bullet.strip())
+    return m.group(0) if m else ""
+
+
+def _inherit_tag(compacted_text: str, existing_bullets: list[str], fallback_marker: str) -> str:
+    """压缩后的一条经验，回溯继承其最相似源条目的原始 task 标记，保住血缘。
+    匹配不上（真正新合成/大幅改写）才用 fallback（当前任务标记）。"""
+    import difflib
+    ct = _bullet_text(compacted_text)
+    best_ratio, best_tag = 0.0, ""
+    for eb in existing_bullets:
+        ratio = difflib.SequenceMatcher(None, ct, _bullet_text(eb)).ratio()
+        if ratio > best_ratio:
+            best_ratio, best_tag = ratio, _bullet_tag(eb)
+    # 阈值 0.6：足够相似才判为「同一条经验的压缩版」，继承其原标记
+    if best_ratio >= 0.6 and best_tag:
+        return best_tag
+    return fallback_marker
 
 
 def _current_knowhow(slug: str) -> list[str]:
@@ -165,15 +192,19 @@ async def _reflect_one(task_id: int, member: dict) -> int:
     merged = existing + [f"{b.strip()} {marker}" for b in new_bullets
                          if b.strip() and _bullet_text(b) not in seen]
 
-    # 超上限 → 让模型压缩合并（喂给模型的是纯正文，压缩后条目视为源自本任务、统一带本任务标记）
+    # 超上限 → 让模型压缩合并。喂给模型的是纯正文；压缩后**按相似度回溯继承原标记**保住血缘，
+    # 只有真正新合成/大幅改写、匹配不上任何源条目的才归当前任务（marker）。
+    # （旧实现把压缩结果统一贴当前任务标记，会抹平血缘 → 度量层 knowhow 复用率无法追溯来源。）
     if len(merged) > KNOWHOW_MAX:
+        merged_before = list(merged)   # 保留带标记的源条目，供回溯匹配
         bullets_text = "\n".join(f"- {_bullet_text(b)}" for b in merged)
         compacted = await runner.run_oneshot(
             member["provider_id"], sys_prompt,
             COMPACT_PROMPT.format(cap=KNOWHOW_MAX, bullets=bullets_text), timeout_sec=180)
         c = _extract_bullets(compacted)
         if c:
-            merged = [f"{b} {marker}" for b in c[:KNOWHOW_MAX]]
+            merged = [f"{_bullet_text(b)} {_inherit_tag(b, merged_before, marker)}"
+                      for b in c[:KNOWHOW_MAX]]
         else:
             merged = merged[-KNOWHOW_MAX:]   # 压缩失败兜底：留最近的（保留其原标记）
 
