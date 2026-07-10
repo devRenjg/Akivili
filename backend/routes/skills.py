@@ -27,7 +27,8 @@ async def list_skills(q: str = ""):
     if q:
         sql += " AND (s.name LIKE ? OR s.description LIKE ?)"
         params += [f"%{q}%", f"%{q}%"]
-    sql += " ORDER BY s.name"
+    # 按下载量降序（热门在前）；仅集成/无下载的默认 0，自然沉底；同下载量按名字稳定兜底。
+    sql += " ORDER BY download_count DESC, s.name"
     db = await get_connection()
     try:
         rows = await (await db.execute(sql, params)).fetchall()
