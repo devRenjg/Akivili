@@ -78,6 +78,15 @@
                      @click="joinProject">邀请加入</el-button>
         </div>
 
+        <div class="skill-section">
+          <div class="proj-label">集成的 Skills（{{ (detail.skills || []).length }}）</div>
+          <div v-if="detail.skills && detail.skills.length" class="skill-tags">
+            <el-tag v-for="s in detail.skills" :key="s.slug" type="primary" effect="plain"
+                    class="skill-tag" :title="s.description">✦ {{ s.name }}</el-tag>
+          </div>
+          <div v-else class="proj-empty">未集成任何 Skill</div>
+        </div>
+
         <el-divider>人格定义</el-divider>
         <pre class="body">{{ detail.body }}</pre>
       </div>
@@ -296,6 +305,9 @@ onMounted(() => {
 .joined-tag { cursor: pointer; }
 .joined-tag:hover { opacity: 0.8; }
 .proj-empty { font-size: 13px; color: #c0c4cc; }
+.skill-section { margin: 14px 0; }
+.skill-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.skill-tag { cursor: default; }
 .detail-desc { color: #606266; line-height: 1.6; }
 .join-bar {
   display: flex; gap: 10px; align-items: center;

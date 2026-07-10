@@ -12,14 +12,11 @@
       <el-tab-pane label="概览与团队" name="overview">
     <div class="team-head">
       <h3>团队</h3>
-      <div v-if="isAdmin">
-        <el-button :icon="Plus" @click="openImport">从库导入</el-button>
-        <el-button :icon="EditPen" @click="openCreate">自建 Agent</el-button>
-      </div>
+      <span class="team-hint">在「数字人才库」里邀请人才加入</span>
     </div>
 
     <div class="grid">
-      <el-card v-for="a in team" :key="a.id" class="agent-card" shadow="hover"
+      <el-card v-for="a in visibleTeam" :key="a.id" class="agent-card" shadow="hover"
                :class="{ 'is-leader': a.is_leader }">
         <el-button v-if="isAdmin" class="ac-remove" :icon="Close" circle size="small"
                    title="移除" @click="removeAgent(a)" />
@@ -29,8 +26,7 @@
         </div>
         <div class="ac-meta">
           <el-tag v-if="a.is_leader" size="small" type="warning" effect="dark" class="leader-tag">👑 总负责人</el-tag>
-          <el-tag v-if="a.template_id" size="small" effect="plain">通用人才</el-tag>
-          <el-tag v-else size="small" type="warning" effect="plain">自建</el-tag>
+          <el-tag size="small" effect="plain">通用人才</el-tag>
           <span class="solved-count" title="已完成任务数">✅ {{ a.solved_tasks || 0 }}</span>
         </div>
 
@@ -60,7 +56,7 @@
           <el-button v-if="isAdmin" text size="small" @click="openMemory(a)">记忆</el-button>
         </div>
       </el-card>
-      <el-empty v-if="!loading && team.length === 0" description="还没有人才加入，从库导入或自建" />
+      <el-empty v-if="!loading && visibleTeam.length === 0" description="还没有人才加入，去「数字人才库」邀请人才加入" />
     </div>
       </el-tab-pane>
 
@@ -92,27 +88,6 @@
     </el-dialog>
 
 
-    <!-- 从库导入 -->
-    <el-dialog v-model="importVisible" title="从库导入 Agent" width="640px">
-      <el-input v-model="importQuery" placeholder="搜索 Agent…" :prefix-icon="Search" @input="searchTemplates" clearable />
-      <div class="import-list">
-        <div v-for="t in importCandidates" :key="t.id" class="import-item">
-          <span>{{ t.emoji }} {{ t.name }} <em>{{ t.division }}</em></span>
-          <el-button size="small" type="primary" @click="doImport(t)">导入</el-button>
-        </div>
-      </div>
-    </el-dialog>
-
-    <!-- 自建 -->
-    <el-dialog v-model="createVisible" title="自建 Agent" width="600px">
-      <el-form label-width="70px">
-        <el-form-item label="名称" required><el-input v-model="createForm.name" /></el-form-item>
-        <el-form-item label="Emoji"><el-input v-model="createForm.emoji" placeholder="🤖" /></el-form-item>
-        <el-form-item label="人格"><el-input v-model="createForm.persona" type="textarea" :rows="8" placeholder="描述这个 Agent 的身份、职责、做事方式…" /></el-form-item>
-      </el-form>
-      <template #footer><el-button @click="createVisible=false">取消</el-button><el-button type="primary" @click="doCreate">创建</el-button></template>
-    </el-dialog>
-
     <!-- 改造人格 -->
     <el-drawer v-model="personaVisible" size="55%">
       <template #header>
@@ -143,11 +118,11 @@
 </template>
 
 <script setup>
-import { ref, onMounted, inject } from 'vue'
+import { ref, computed, onMounted, inject } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowLeft, Plus, EditPen, Search, Close } from '@element-plus/icons-vue'
-import { projectsApi, projectAgentsApi, agentsApi, memoryApi,
+import { ArrowLeft, Close } from '@element-plus/icons-vue'
+import { projectsApi, projectAgentsApi, memoryApi,
          settingsApi, skillsApi, agentConfigApi } from '../api'
 import Workspace from './Workspace.vue'
 import AgentAvatar from '../components/AgentAvatar.vue'
@@ -168,6 +143,8 @@ function providerName(pidStr) {
 const project = ref(null)
 const team = ref([])
 const loading = ref(false)
+// 项目区只展示从人才库来的通用人才，不再显示历史自建 Agent（template_id 为空）
+const visibleTeam = computed(() => team.value.filter((a) => a.template_id))
 
 // Agent 配置（模型 + skills），按 slug 缓存
 const cfg = ref({})            // { slug: { provider_id, skill_slugs } }
@@ -183,21 +160,12 @@ function dName(a) { return displayName(a) }
 function openProfile(a) { profileAgent.value = a; profileVisible.value = true }
 async function onProfileSaved() { await load() }
 
-const importVisible = ref(false)
-const importQuery = ref('')
-const importCandidates = ref([])
-
-const createVisible = ref(false)
-const createForm = ref({ name: '', emoji: '🤖', persona: '' })
-
 const personaVisible = ref(false)
 const personaText = ref('')
 const editing = ref(null)
 
 const memoryVisible = ref(false)
 const memoryText = ref('')
-
-let searchTimer = null
 
 async function load() {
   loading.value = true
@@ -247,37 +215,6 @@ async function saveSkills() {
   }
   ElMessage.success('Skills 已保存')
   skillsVisible.value = false
-}
-
-// —— 从库导入 ——
-async function openImport() {
-  importVisible.value = true
-  await searchTemplates()
-}
-async function searchTemplates() {
-  clearTimeout(searchTimer)
-  searchTimer = setTimeout(async () => {
-    importCandidates.value = (await agentsApi.list({ q: importQuery.value })).templates.slice(0, 30)
-  }, 200)
-}
-async function doImport(t) {
-  await projectAgentsApi.import(pid, t.id)
-  ElMessage.success(`已导入 ${t.name}`)
-  importVisible.value = false
-  await load()
-}
-
-// —— 自建 ——
-function openCreate() {
-  createForm.value = { name: '', emoji: '🤖', persona: '' }
-  createVisible.value = true
-}
-async function doCreate() {
-  if (!createForm.value.name.trim()) return ElMessage.warning('名称必填')
-  await projectAgentsApi.create(pid, createForm.value)
-  ElMessage.success('已创建')
-  createVisible.value = false
-  await load()
 }
 
 // —— 改造人格 ——
@@ -372,9 +309,7 @@ onMounted(() => {
 .skill-opt { padding: 8px 0; border-bottom: 1px solid #f5f5f5; }
 .so-name { font-weight: 600; margin-right: 8px; }
 .so-desc { color: #909399; font-size: 12px; }
-.import-list { margin-top: 12px; max-height: 380px; overflow-y: auto; }
-.import-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 4px; border-bottom: 1px solid #f5f5f5; }
-.import-item em { color: #909399; font-style: normal; font-size: 12px; margin-left: 6px; }
+.team-hint { color: #909399; font-size: 12px; }
 .drawer-foot { margin-top: 14px; text-align: right; }
 .mem-tip { margin-bottom: 12px; }
 </style>

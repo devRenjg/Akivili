@@ -58,7 +58,8 @@ async def list_templates(division: str = "", q: str = ""):
     if q:
         sql += " AND (t.name LIKE ? OR t.description LIKE ?)"
         params.extend([f"%{q}%", f"%{q}%"])
-    sql += " ORDER BY project_count DESC, t.division, t.name"
+    # 排序：项目数优先；项目数相同看已完成任务数（越多越靠前）；再按分类、名字兜底。
+    sql += " ORDER BY project_count DESC, solved_tasks DESC, t.division, t.name"
     db = await get_connection()
     try:
         cur = await db.execute(sql, params)
@@ -94,7 +95,14 @@ async def get_template(template_id: int):
         row = await cur.fetchone()
         if not row:
             raise HTTPException(404, "模版不存在")
-        return dict(row)
+        data = dict(row)
+        # 该人才（按 slug）已集成的 Skills，带上 Skill 名称/描述用于界面展示。
+        skill_rows = await (await db.execute(
+            """SELECT s.slug, s.name, s.description
+               FROM agent_skills a JOIN skills s ON s.slug = a.skill_slug
+               WHERE a.agent_slug = ? ORDER BY s.name""", (data["slug"],))).fetchall()
+        data["skills"] = [dict(r) for r in skill_rows]
+        return data
     finally:
         await db.close()
 
