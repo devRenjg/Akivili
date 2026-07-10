@@ -14,6 +14,24 @@ const props = defineProps({
 // GFM：支持 **粗体**、# 标题、列表、表格、代码块、自动裸链接、换行等常见 Markdown
 marked.setOptions({ gfm: true, breaks: true })
 
+// 裸链接边界修正：marked 的 GFM 自动链接会把紧跟 URL 的中文（无 ASCII 空白分隔）
+// 也吞进链接里（如 "…conf_id=xxx，产品内审…" 整段被标成链接）。这里在解析前把裸 URL
+// 显式转成 [url](url)，让链接止于合法 URL 字符集边界（遇 CJK/空白即停）。
+// 跳过代码块/行内代码/已有 md 链接/尖括号链接，避免误伤。
+const BARE_URL = /\bhttps?:\/\/[A-Za-z0-9\-._~:/?#[\]@!$&'()*+,;=%]+/g
+function protectBareUrls(raw) {
+  const parts = raw.split(/(`{1,3}[^`]*`{1,3}|\]\([^)]*\)|<https?:\/\/[^>]+>)/g)
+  return parts.map((seg, i) => {
+    if (i % 2 === 1) return seg   // 分隔符段（代码/已有链接）原样保留
+    return seg.replace(BARE_URL, (m) => {
+      const trailing = m.match(/[.,;:!?)\]]+$/)   // 剔除末尾附着的 ASCII 句读
+      const url = trailing ? m.slice(0, m.length - trailing[0].length) : m
+      const tail = trailing ? trailing[0] : ''
+      return `[${url}](${url})${tail}`
+    })
+  }).join('')
+}
+
 // 外部链接新标签打开（消毒阶段追加，先注册一次 hook）
 DOMPurify.addHook('afterSanitizeAttributes', (node) => {
   if (node.tagName === 'A' && node.getAttribute('href')) {
@@ -57,7 +75,7 @@ function enhanceTables(safeHtml) {
 const html = computed(() => {
   const raw = props.text || ''
   if (!raw.trim()) return ''
-  const parsed = marked.parse(raw)
+  const parsed = marked.parse(protectBareUrls(raw))
   const safe = DOMPurify.sanitize(parsed, SANITIZE_OPTS)
   return enhanceTables(safe)
 })
