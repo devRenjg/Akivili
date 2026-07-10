@@ -31,15 +31,16 @@
         </el-select>
         <div class="ct-hint">绑定后，该人才加入任何项目都自带这些 Skills（写入其记忆使用说明）。</div>
       </el-form-item>
-      <el-form-item label="头像（来自 icon 文件夹）">
+      <el-form-item label="头像（来自 icon 文件夹，已被占用的不再展示）">
         <div class="icon-grid">
           <div class="icon-cell" :class="{ active: form.avatar === '' }" @click="form.avatar = ''">
             <span class="none-emoji">🤖</span><span class="cell-label">默认</span>
           </div>
-          <div v-for="ic in icons" :key="ic" class="icon-cell" :class="{ active: form.avatar === ic }"
-               @click="form.avatar = ic">
+          <div v-for="ic in availableIcons" :key="ic" class="icon-cell"
+               :class="{ active: form.avatar === ic }" @click="form.avatar = ic">
             <img :src="iconUrl(ic)" :alt="ic" /><span class="cell-label">{{ ic.replace(/\.[^.]+$/, '') }}</span>
           </div>
+          <div v-if="availableIcons.length === 0" class="icon-empty">头像已被全部占用，将使用默认头像</div>
         </div>
       </el-form-item>
       <el-form-item label="人格定义（可选，Agent 的系统人格正文）">
@@ -57,7 +58,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { agentsApi, skillsApi, iconsApi, settingsApi } from '../api'
+import { agentsApi, skillsApi, iconsApi, settingsApi, agentConfigApi } from '../api'
 
 const props = defineProps({ modelValue: Boolean })
 const emit = defineEmits(['update:modelValue', 'created'])
@@ -70,8 +71,15 @@ const visible = computed({
 const saving = ref(false)
 const allSkills = ref([])
 const icons = ref([])
+const takenAvatars = ref([])
 const providers = ref([])
 const knownDivisions = ref([])
+
+// 已被其他 Agent 占用的头像不再展示（新人才必须挑没人用的）
+const availableIcons = computed(() => {
+  const used = new Set(takenAvatars.value)
+  return icons.value.filter((ic) => !used.has(ic))
+})
 
 function emptyForm() {
   return {
@@ -86,13 +94,15 @@ function iconUrl(name) { return iconsApi.url(name) }
 async function onOpen() {
   form.value = emptyForm()
   try {
-    const [sk, ic, st, dv] = await Promise.all([
+    const [sk, ic, st, dv, tk] = await Promise.all([
       skillsApi.list(), iconsApi.list(), settingsApi.get(), agentsApi.divisions(),
+      agentConfigApi.taken(''),
     ])
     allSkills.value = sk.skills || []
     icons.value = ic.icons || []
     providers.value = st.providers || []
     knownDivisions.value = dv.divisions || []
+    takenAvatars.value = tk.avatars || []
   } catch (e) {
     ElMessage.error('加载选项失败：' + (e?.response?.data?.detail || e.message))
   }
@@ -125,11 +135,20 @@ async function save() {
 
 <style scoped>
 .ct-hint { font-size: 12px; color: #909399; margin-top: 4px; }
-.icon-grid { display: flex; flex-wrap: wrap; gap: 8px; }
-.icon-cell { width: 60px; height: 68px; border: 1px solid var(--el-border-color); border-radius: 8px;
-  display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; gap: 2px; }
+.icon-grid {
+  display: flex; flex-wrap: wrap; gap: 8px; width: 100%; box-sizing: border-box;
+  max-height: 172px; overflow-y: auto; padding: 10px;
+  border: 1px solid var(--el-border-color); border-radius: 8px; background: var(--el-fill-color-blank);
+}
+.icon-cell {
+  width: 60px; height: 68px; flex: 0 0 auto; box-sizing: border-box;
+  border: 1px solid var(--el-border-color); border-radius: 8px;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; gap: 2px;
+}
+.icon-cell:hover { border-color: var(--el-color-primary-light-5); }
 .icon-cell.active { border-color: var(--el-color-primary); box-shadow: 0 0 0 2px var(--el-color-primary-light-7); }
 .icon-cell img { width: 34px; height: 34px; border-radius: 6px; object-fit: cover; }
-.none-emoji { font-size: 26px; }
-.cell-label { font-size: 10px; color: #909399; max-width: 56px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.none-emoji { font-size: 26px; line-height: 1; }
+.cell-label { font-size: 10px; color: #909399; max-width: 52px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.icon-empty { font-size: 12px; color: #909399; padding: 6px 2px; }
 </style>
