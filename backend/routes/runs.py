@@ -165,10 +165,18 @@ async def auto_dispatch(task_id: int):
     # （若已 done/reviewing）——回写 in_progress，不等 3 秒轮询聚合，消除「先显已完成、隔几秒才变进行中」的滞后。
     await _reactivate_on_redispatch(task_id, task.get("parent_task_id"), task.get("status"))
 
-    # 任务 Owner 统筹：以负责人身份唤醒（注入协作协议+花名册，可拉人协调）
+    # 任务 Owner 唤醒。区分叶子子任务 vs 顶层任务：
+    # - 子任务（有 parent_task_id）：以**普通成员身份**执行（is_leader=False, trigger=assign）。
+    #   否则 leader run 不会触发叶子任务的状态推进（_run_one 里推进条件含 `not is_leader`），
+    #   子任务会「成功却卡在 in_progress」，进而拖住父任务收尾（见 task 70/77 事故）。
+    # - 顶层任务：以负责人身份统筹（注入协作协议+花名册，可拉人协调、收尾汇总）。
     owner = task.get("assignee_slug")
     if owner:
         prompt = (task.get("description") or task.get("title") or "").strip()
+        is_subtask = bool(task.get("parent_task_id"))
+        if is_subtask:
+            await collab.enqueue_run(task_id, owner, prompt, "assign", is_leader=False)
+            return {"ok": True, "mode": "assign", "owner": owner}
         await collab.enqueue_run(task_id, owner, prompt, "collaborate", is_leader=True)
         return {"ok": True, "mode": "collaborate", "owner": owner}
 
