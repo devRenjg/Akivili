@@ -155,7 +155,8 @@
           <div v-if="progress.active" class="exec-progress">
             <div class="exec-progress-head">
               <span class="exec-spinner">⚙️</span>
-              <span>执行中 · 子任务 {{ progress.sub_done }}/{{ progress.sub_total }} 完成</span>
+              <span v-if="progress.sub_total > 0">执行中 · 子任务 {{ progress.sub_done }}/{{ progress.sub_total }} 完成</span>
+              <span v-else>执行中</span>
             </div>
             <div v-for="(r, i) in progress.running" :key="'run' + i" class="exec-line">
               <span class="exec-tag running" :title="isAdmin ? '点击暂停该 Agent' : ''"
