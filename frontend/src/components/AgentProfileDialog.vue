@@ -20,6 +20,13 @@
         <div class="icon-hint">已被其他人才占用的头像不显示。往项目根目录的 icon/ 文件夹放图后点「刷新图库」可见新图。</div>
         <el-button text size="small" @click="loadIcons">刷新图库</el-button>
       </el-form-item>
+      <el-form-item label="集成 Skills（按身份跨项目共享）">
+        <el-select v-model="skillSelection" multiple filterable placeholder="选择要集成的 Skills"
+                   style="width:100%">
+          <el-option v-for="s in allSkills" :key="s.slug" :label="s.name" :value="s.slug" />
+        </el-select>
+        <div class="icon-hint">集成后该人才加入任何项目都自带这些 Skills（写入其记忆使用说明）。</div>
+      </el-form-item>
     </el-form>
     <template #footer>
       <el-button @click="visible = false">取消</el-button>
@@ -31,7 +38,7 @@
 <script setup>
 import { ref, computed, watch, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { agentConfigApi, iconsApi } from '../api'
+import { agentConfigApi, iconsApi, skillsApi } from '../api'
 
 const props = defineProps({
   modelValue: Boolean,
@@ -49,6 +56,9 @@ const avatar = ref('')
 const icons = ref([])
 const takenAvatars = ref([])
 const takenNicknames = ref([])
+const allSkills = ref([])
+const skillSelection = ref([])
+let originalSkills = []
 const saving = ref(false)
 
 const iconUrl = (n) => iconsApi.url(n)
@@ -61,13 +71,26 @@ function baseName(fileName) {
   return fileName.replace(/\.[^.]+$/, '')
 }
 
+// Skills 是否变更（与集合无关顺序）——只在变更时才调 setSkills，避免无谓的记忆同步
+function skillsChanged() {
+  const a = new Set(originalSkills)
+  const b = skillSelection.value
+  if (a.size !== b.length) return true
+  return b.some((s) => !a.has(s))
+}
+
 async function onOpen() {
-  await Promise.all([loadIcons(), loadTaken()])
+  await Promise.all([loadIcons(), loadTaken(), loadSkills()])
   try {
     const cfg = await agentConfigApi.get(props.agent.slug)
     nickname.value = cfg.nickname || ''
     avatar.value = cfg.avatar || ''
-  } catch { nickname.value = ''; avatar.value = '' }
+    originalSkills = cfg.skill_slugs || []
+    skillSelection.value = [...originalSkills]
+  } catch { nickname.value = ''; avatar.value = ''; originalSkills = []; skillSelection.value = [] }
+}
+async function loadSkills() {
+  try { allSkills.value = (await skillsApi.list()).skills } catch { allSkills.value = [] }
 }
 async function loadIcons() {
   try { icons.value = (await iconsApi.list()).icons } catch { icons.value = [] }
@@ -97,6 +120,9 @@ async function save() {
   saving.value = true
   try {
     await agentConfigApi.setProfile(props.agent.slug, nick, avatar.value)
+    if (skillsChanged()) {
+      await agentConfigApi.setSkills(props.agent.slug, skillSelection.value)
+    }
     ElMessage.success('已保存')
     visible.value = false
     emit('saved')
