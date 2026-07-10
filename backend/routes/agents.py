@@ -16,8 +16,7 @@ router = APIRouter(prefix="/api/agents", tags=["agents"])
 class CreateTalentRequest(BaseModel):
     name: str
     description: str = ""
-    division: str = ""
-    tags: list[str] = []          # 自定义标签
+    division: str = ""            # 分类（复用现有 division 字段；输入新名即新增分类）
     body: str = ""                # 人格定义正文
     nickname: str = ""            # 昵称（写 agent_profiles）
     avatar: str = ""              # 头像文件名（写 agent_profiles）
@@ -27,12 +26,21 @@ class CreateTalentRequest(BaseModel):
     color: str = ""
 
 
+class SetDivisionRequest(BaseModel):
+    division: str = ""            # 目标分类（空=归入「其他」）
+
+
+class RenameDivisionRequest(BaseModel):
+    old_name: str
+    new_name: str
+
+
 @router.get("/templates")
-async def list_templates(division: str = "", q: str = "", tag: str = ""):
-    """模版列表。支持按 division、关键词 q（匹配 name/description）、tag（标签精确匹配）过滤。不含 body。
+async def list_templates(division: str = "", q: str = ""):
+    """模版列表。支持按 division 与关键词 q（匹配 name/description）过滤。不含 body。
     默认按「已加入的项目数」降序排（热门人才在前），其次分类、名字。"""
     sql = ("SELECT t.id, t.slug, t.name, t.division, t.description, t.emoji, t.color, "
-           "t.tags, t.origin, "
+           "t.origin, "
            "p.nickname AS nickname, p.avatar AS avatar, "
            "(SELECT COUNT(DISTINCT pa.project_id) FROM project_agents pa WHERE pa.slug = t.slug) AS project_count, "
            # 已解决任务数：该身份(slug)在「已完成(done)」任务里有过成功执行(succeeded run)，按任务去重。
@@ -50,10 +58,6 @@ async def list_templates(division: str = "", q: str = "", tag: str = ""):
     if q:
         sql += " AND (t.name LIKE ? OR t.description LIKE ?)"
         params.extend([f"%{q}%", f"%{q}%"])
-    if tag:
-        # tags 逗号分隔存储，用带分隔符包裹的 LIKE 精确匹配单个标签，避免子串误命中
-        sql += " AND (',' || REPLACE(t.tags, ', ', ',') || ',') LIKE ?"
-        params.append(f"%,{tag},%")
     sql += " ORDER BY project_count DESC, t.division, t.name"
     db = await get_connection()
     try:
@@ -116,23 +120,58 @@ async def template_projects(template_id: int):
         await db.close()
 
 
-@router.get("/tags")
-async def list_tags():
-    """所有已用过的自定义标签 + 各自人才数（供筛选下拉与新增时联想）。"""
+@router.put("/templates/{template_id}/division", dependencies=[Depends(require_admin)])
+async def set_talent_division(template_id: int, req: SetDivisionRequest):
+    """改变某个人才的分类（空=归入「其他」）。"""
+    div = req.division.strip()
     db = await get_connection()
     try:
-        rows = await (await db.execute(
-            "SELECT tags FROM agent_templates WHERE tags <> ''")).fetchall()
+        row = await (await db.execute(
+            "SELECT id FROM agent_templates WHERE id=?", (template_id,))).fetchone()
+        if not row:
+            raise HTTPException(404, "人才不存在")
+        await db.execute("UPDATE agent_templates SET division=? WHERE id=?", (div, template_id))
+        await db.commit()
     finally:
         await db.close()
-    counter: dict[str, int] = {}
-    for r in rows:
-        for tg in (r["tags"] or "").split(","):
-            tg = tg.strip()
-            if tg:
-                counter[tg] = counter.get(tg, 0) + 1
-    tags = [{"tag": k, "n": v} for k, v in sorted(counter.items(), key=lambda x: (-x[1], x[0]))]
-    return {"tags": tags}
+    return {"ok": True, "division": div}
+
+
+@router.put("/divisions/rename", dependencies=[Depends(require_admin)])
+async def rename_division(req: RenameDivisionRequest):
+    """改写分类名：把该分类下所有人才的 division 批量改成新名。"""
+    old = req.old_name.strip()
+    new = req.new_name.strip()
+    if not old:
+        raise HTTPException(400, "原分类名不能为空")
+    if not new:
+        raise HTTPException(400, "新分类名不能为空")
+    db = await get_connection()
+    try:
+        cur = await db.execute(
+            "UPDATE agent_templates SET division=? WHERE division=?", (new, old))
+        await db.commit()
+        affected = cur.rowcount
+    finally:
+        await db.close()
+    return {"ok": True, "affected": affected}
+
+
+@router.delete("/divisions/{name}", dependencies=[Depends(require_admin)])
+async def delete_division(name: str):
+    """删除一个分类：把该分类下人才的 division 清空（归入「其他」），人才本身不删。"""
+    old = (name or "").strip()
+    if not old:
+        raise HTTPException(400, "分类名不能为空")
+    db = await get_connection()
+    try:
+        cur = await db.execute(
+            "UPDATE agent_templates SET division='' WHERE division=?", (old,))
+        await db.commit()
+        affected = cur.rowcount
+    finally:
+        await db.close()
+    return {"ok": True, "affected": affected}
 
 
 @router.post("/rescan", dependencies=[Depends(require_admin)])
@@ -156,7 +195,6 @@ async def create_talent(req: CreateTalentRequest):
         raise HTTPException(400, "名字不能为空")
     # manual- 前缀 + 随机后缀，保证与扫描模版 slug（取自文件名）不撞、rescan 不会误更新
     slug = f"manual-{_slugify(name)}-{uuid.uuid4().hex[:8]}"
-    tags = ",".join(t.strip() for t in req.tags if t.strip())
     nickname = req.nickname.strip()[:40]
 
     db = await get_connection()
@@ -169,10 +207,10 @@ async def create_talent(req: CreateTalentRequest):
                 raise HTTPException(409, f"昵称「{nickname}」已被占用，请换一个")
         await db.execute(
             """INSERT INTO agent_templates
-               (slug, name, division, description, emoji, color, source_path, body, tags, origin)
-               VALUES (?,?,?,?,?,?,?,?,?, 'manual')""",
+               (slug, name, division, description, emoji, color, source_path, body, origin)
+               VALUES (?,?,?,?,?,?,?,?, 'manual')""",
             (slug, name, req.division.strip(), req.description.strip(),
-             req.emoji.strip(), req.color.strip(), "", req.body, tags))
+             req.emoji.strip(), req.color.strip(), "", req.body))
         # agent_profiles：昵称/头像/模型（有任一非空才写）
         if nickname or req.avatar.strip() or req.provider_id.strip():
             await db.execute(

@@ -12,13 +12,11 @@
         <el-input v-model="form.description" type="textarea" :rows="2"
                   maxlength="200" placeholder="这个人才擅长什么" />
       </el-form-item>
-      <el-form-item label="分类">
-        <el-input v-model="form.division" maxlength="30" placeholder="如 engineering / 数据" />
-      </el-form-item>
-      <el-form-item label="自定义标签（回车添加，可多个）">
-        <el-select v-model="form.tags" multiple filterable allow-create default-first-option
-                   placeholder="如 数据、Python、B站" style="width:100%">
-          <el-option v-for="tg in knownTags" :key="tg.tag" :label="`${tg.tag} (${tg.n})`" :value="tg.tag" />
+      <el-form-item label="分类（可选已有分类，或输入新名即新增分类）">
+        <el-select v-model="form.division" filterable allow-create clearable default-first-option
+                   placeholder="如 engineering / 数据" style="width:100%">
+          <el-option v-for="d in knownDivisions" :key="d.division" :label="`${d.division || '其他'} (${d.n})`"
+                     :value="d.division" />
         </el-select>
       </el-form-item>
       <el-form-item label="接入模型（可选，之后也能在项目内配）">
@@ -73,12 +71,12 @@ const saving = ref(false)
 const allSkills = ref([])
 const icons = ref([])
 const providers = ref([])
-const knownTags = ref([])
+const knownDivisions = ref([])
 
 function emptyForm() {
   return {
     name: '', nickname: '', description: '', division: '',
-    tags: [], provider_id: '', skill_slugs: [], avatar: '', body: '',
+    provider_id: '', skill_slugs: [], avatar: '', body: '',
   }
 }
 const form = ref(emptyForm())
@@ -88,13 +86,13 @@ function iconUrl(name) { return iconsApi.url(name) }
 async function onOpen() {
   form.value = emptyForm()
   try {
-    const [sk, ic, st, tg] = await Promise.all([
-      skillsApi.list(), iconsApi.list(), settingsApi.get(), agentsApi.tags(),
+    const [sk, ic, st, dv] = await Promise.all([
+      skillsApi.list(), iconsApi.list(), settingsApi.get(), agentsApi.divisions(),
     ])
     allSkills.value = sk.skills || []
     icons.value = ic.icons || []
     providers.value = st.providers || []
-    knownTags.value = tg.tags || []
+    knownDivisions.value = dv.divisions || []
   } catch (e) {
     ElMessage.error('加载选项失败：' + (e?.response?.data?.detail || e.message))
   }
@@ -108,8 +106,7 @@ async function save() {
       name: form.value.name.trim(),
       nickname: form.value.nickname.trim(),
       description: form.value.description.trim(),
-      division: form.value.division.trim(),
-      tags: form.value.tags,
+      division: (form.value.division || '').trim(),
       provider_id: form.value.provider_id || '',
       skill_slugs: form.value.skill_slugs,
       avatar: form.value.avatar,

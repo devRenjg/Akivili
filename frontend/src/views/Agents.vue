@@ -15,9 +15,10 @@
         <el-option v-for="d in divisions" :key="d.division"
                    :label="`${d.division || '其他'} (${d.n})`" :value="d.division" />
       </el-select>
-      <el-select v-model="tag" placeholder="全部标签" clearable filterable class="div-select" @change="load">
-        <el-option v-for="tg in tags" :key="tg.tag" :label="`${tg.tag} (${tg.n})`" :value="tg.tag" />
-      </el-select>
+      <template v-if="isAdmin && division">
+        <el-button size="small" text :icon="Edit" @click="renameDivision">改名</el-button>
+        <el-button size="small" text type="danger" :icon="Delete" @click="deleteDivision">删除分类</el-button>
+      </template>
       <span class="total">共 {{ count }} 个</span>
     </div>
 
@@ -29,10 +30,6 @@
           <span class="name">{{ dName(t) }}</span>
         </div>
         <div class="desc">{{ t.description }}</div>
-        <div v-if="t.tags" class="card-tags">
-          <el-tag v-for="tg in splitTags(t.tags)" :key="tg" size="small" type="info" effect="plain"
-                  class="ct-tag" @click.stop="filterByTag(tg)">{{ tg }}</el-tag>
-        </div>
         <div class="card-foot">
           <el-tag size="small" effect="plain">{{ t.division || '其他' }}</el-tag>
           <el-tag v-if="t.origin === 'manual'" size="small" type="warning" effect="plain">手动</el-tag>
@@ -49,7 +46,13 @@
           <AgentAvatar :agent="detail" :size="60" />
           <div>
             <div class="detail-name">{{ dName(detail) }}</div>
-            <el-tag size="small">{{ detail.division || '其他' }}</el-tag>
+            <el-select v-if="isAdmin" v-model="detailDivision" size="small" filterable allow-create
+                       clearable default-first-option placeholder="设置分类" class="detail-div-select"
+                       @change="changeTalentDivision">
+              <el-option v-for="d in divisions" :key="d.division"
+                         :label="`${d.division || '其他'} (${d.n})`" :value="d.division" />
+            </el-select>
+            <el-tag v-else size="small">{{ detail.division || '其他' }}</el-tag>
           </div>
           <el-button v-if="isAdmin" size="small" style="margin-left:auto" @click="openProfile(detail)">
             编辑资料
@@ -89,8 +92,8 @@
 <script setup>
 import { ref, onMounted, inject } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { Refresh, Search, Plus } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { Refresh, Search, Plus, Edit, Delete } from '@element-plus/icons-vue'
 import { agentsApi, projectsApi, projectAgentsApi } from '../api'
 import AgentAvatar from '../components/AgentAvatar.vue'
 import AgentProfileDialog from '../components/AgentProfileDialog.vue'
@@ -105,20 +108,17 @@ function openProfile(a) { profileAgent.value = { slug: a.slug, name: a.name, emo
 async function onProfileSaved() { await load(); if (detail.value) detail.value = await agentsApi.detail(detail.value.id) }
 const templates = ref([])
 const divisions = ref([])
-const tags = ref([])
 const count = ref(0)
 const keyword = ref('')
 const division = ref('')
-const tag = ref('')
 const loading = ref(false)
 const scanning = ref(false)
 const createVisible = ref(false)
-
-function splitTags(s) { return (s || '').split(',').map((x) => x.trim()).filter(Boolean) }
-function filterByTag(tg) { tag.value = tg; load() }
-async function onTalentCreated() { await Promise.all([load(), loadDivisions(), loadTags()]) }
 const detailVisible = ref(false)
 const detail = ref(null)
+const detailDivision = ref('')
+
+async function onTalentCreated() { await Promise.all([load(), loadDivisions()]) }
 
 const projects = ref([])
 const joinedProjects = ref([])
@@ -135,7 +135,7 @@ let searchTimer = null
 async function load() {
   loading.value = true
   try {
-    const data = await agentsApi.list({ q: keyword.value, division: division.value, tag: tag.value })
+    const data = await agentsApi.list({ q: keyword.value, division: division.value })
     templates.value = data.templates
     count.value = data.count
   } catch (e) {
@@ -150,10 +150,6 @@ async function loadDivisions() {
   divisions.value = data.divisions
 }
 
-async function loadTags() {
-  try { tags.value = (await agentsApi.tags()).tags } catch { tags.value = [] }
-}
-
 function onSearch() {
   clearTimeout(searchTimer)
   searchTimer = setTimeout(load, 250)
@@ -161,9 +157,59 @@ function onSearch() {
 
 async function openDetail(id) {
   detail.value = await agentsApi.detail(id)
+  detailDivision.value = detail.value.division || ''
   joinProjectId.value = null
   detailVisible.value = true
   await loadTemplateProjects(id)
+}
+
+// 改某人才的分类（输入新名即新增分类）
+async function changeTalentDivision(val) {
+  if (!detail.value) return
+  try {
+    await agentsApi.setDivision(detail.value.id, val || '')
+    detail.value.division = val || ''
+    ElMessage.success('分类已更新')
+    await Promise.all([load(), loadDivisions()])
+  } catch (e) {
+    ElMessage.error('更新失败：' + (e?.response?.data?.detail || e.message))
+    detailDivision.value = detail.value.division || ''
+  }
+}
+
+// 改写当前筛选选中的分类名（批量）
+async function renameDivision() {
+  const old = division.value
+  if (!old) return
+  try {
+    const { value } = await ElMessageBox.prompt(`把分类「${old}」改名为：`, '改写分类', {
+      inputValue: old, confirmButtonText: '确定', cancelButtonText: '取消',
+      inputValidator: (v) => (v && v.trim() ? true : '新分类名不能为空'),
+    })
+    const r = await agentsApi.renameDivision(old, value.trim())
+    ElMessage.success(`已改名，影响 ${r.affected} 个人才`)
+    division.value = value.trim()
+    await Promise.all([load(), loadDivisions()])
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error('改名失败：' + (e?.response?.data?.detail || e.message))
+  }
+}
+
+// 删除当前筛选选中的分类（该分类下人才归「其他」）
+async function deleteDivision() {
+  const old = division.value
+  if (!old) return
+  try {
+    await ElMessageBox.confirm(
+      `删除分类「${old}」？该分类下的人才不会被删除，只是归入「其他」。`, '删除分类',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
+    const r = await agentsApi.deleteDivision(old)
+    ElMessage.success(`已删除分类，${r.affected} 个人才归入「其他」`)
+    division.value = ''
+    await Promise.all([load(), loadDivisions()])
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error('删除失败：' + (e?.response?.data?.detail || e.message))
+  }
 }
 
 async function loadTemplateProjects(id) {
@@ -205,7 +251,7 @@ async function rescan() {
   try {
     const r = await agentsApi.rescan()
     ElMessage.success(`扫描完成：新增 ${r.inserted}，更新 ${r.updated}，跳过 ${r.skipped}`)
-    await Promise.all([load(), loadDivisions(), loadTags()])
+    await Promise.all([load(), loadDivisions()])
   } catch (e) {
     ElMessage.error('扫描失败：' + (e?.response?.data?.detail || e.message))
   } finally {
@@ -216,7 +262,6 @@ async function rescan() {
 onMounted(() => {
   load()
   loadDivisions()
-  loadTags()
   loadProjects()
 })
 </script>
@@ -234,9 +279,7 @@ onMounted(() => {
 .emoji { font-size: 22px; }
 .name { font-weight: 600; font-size: 17px; }
 .header-actions { display: flex; gap: 8px; }
-.card-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
-.ct-tag { cursor: pointer; }
-.ct-tag:hover { opacity: 0.75; }
+.detail-div-select { width: 200px; margin-top: 2px; }
 .card-foot { display: flex; align-items: center; gap: 8px; }
 .proj-count { font-size: 12px; color: #e6a23c; }
 .solved-count { font-size: 12px; color: #67c23a; margin-left: auto; }

@@ -38,7 +38,6 @@ CREATE TABLE IF NOT EXISTS agent_templates (
     color       TEXT DEFAULT '',
     source_path TEXT DEFAULT '',            -- 模版 .md 的绝对路径
     body        TEXT DEFAULT '',            -- 人格正文（frontmatter 之后）
-    tags        TEXT DEFAULT '',            -- 自定义标签（逗号分隔，管理员维护，用于筛选/展示）
     origin      TEXT DEFAULT 'scan',        -- 来源：scan=扫描导入（可被 rescan 覆盖）/ manual=管理员手动新增（rescan 不动）
     imported_at TEXT DEFAULT (datetime('now'))
 );
@@ -239,13 +238,12 @@ async def _migrate(db) -> None:
         await db.execute("ALTER TABLE agent_profiles ADD COLUMN nickname TEXT DEFAULT ''")
     if "avatar" not in pcols:
         await db.execute("ALTER TABLE agent_profiles ADD COLUMN avatar TEXT DEFAULT ''")
-    # agent_templates 自定义标签 + 来源标记
+    # agent_templates 来源标记（区分扫描导入 vs 管理员手动新增）
     cur = await db.execute("PRAGMA table_info(agent_templates)")
     atcols = {row[1] for row in await cur.fetchall()}
-    if "tags" not in atcols:
-        await db.execute("ALTER TABLE agent_templates ADD COLUMN tags TEXT DEFAULT ''")
     if "origin" not in atcols:
         await db.execute("ALTER TABLE agent_templates ADD COLUMN origin TEXT DEFAULT 'scan'")
+    # 兼容上一版误加的 tags 列：SQLite 不支持 DROP COLUMN（旧版），保留不用即可（新代码不读写它）
     # skills 目录型标记
     cur = await db.execute("PRAGMA table_info(skills)")
     scols = {row[1] for row in await cur.fetchall()}
