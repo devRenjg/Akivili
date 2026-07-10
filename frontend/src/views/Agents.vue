@@ -32,7 +32,6 @@
         <div class="desc">{{ t.description }}</div>
         <div class="card-foot">
           <el-tag size="small" effect="plain">{{ t.division || '其他' }}</el-tag>
-          <el-tag v-if="t.origin === 'manual'" size="small" type="warning" effect="plain">手动</el-tag>
           <span v-if="t.project_count > 0" class="proj-count">🗂 {{ t.project_count }} 个项目</span>
           <span class="solved-count" :title="'已完成任务数'">✅ {{ t.solved_tasks || 0 }} 个任务</span>
         </div>
