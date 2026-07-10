@@ -4,7 +4,6 @@
       <h2>数字人才库</h2>
       <div class="header-actions">
         <el-button v-if="isAdmin" type="primary" :icon="Plus" @click="createVisible = true">新增人才</el-button>
-        <el-button v-if="isAdmin" :icon="Refresh" @click="rescan" :loading="scanning">重新扫描</el-button>
       </div>
     </div>
 
@@ -101,7 +100,7 @@
 import { ref, onMounted, inject } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Search, Plus, Edit, Delete } from '@element-plus/icons-vue'
+import { Search, Plus, Edit, Delete } from '@element-plus/icons-vue'
 import { agentsApi, projectsApi, projectAgentsApi } from '../api'
 import AgentAvatar from '../components/AgentAvatar.vue'
 import AgentProfileDialog from '../components/AgentProfileDialog.vue'
@@ -120,7 +119,6 @@ const count = ref(0)
 const keyword = ref('')
 const division = ref('')
 const loading = ref(false)
-const scanning = ref(false)
 const createVisible = ref(false)
 const detailVisible = ref(false)
 const detail = ref(null)
@@ -254,18 +252,6 @@ async function joinProject() {
   }
 }
 
-async function rescan() {
-  scanning.value = true
-  try {
-    const r = await agentsApi.rescan()
-    ElMessage.success(`扫描完成：新增 ${r.inserted}，更新 ${r.updated}，跳过 ${r.skipped}`)
-    await Promise.all([load(), loadDivisions()])
-  } catch (e) {
-    ElMessage.error('扫描失败：' + (e?.response?.data?.detail || e.message))
-  } finally {
-    scanning.value = false
-  }
-}
 
 onMounted(() => {
   load()
