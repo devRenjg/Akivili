@@ -63,6 +63,9 @@ JIAN_CLI_USAGE = """## 平台操作：jian CLI（唯一有效方式）
 - 需要知道团队成员时，**看本系统提示里的「你的团队」花名册即可**（已给全，无需 `jian roster`、更不用探索文件系统），只与花名册里真实列出的成员协作，**绝不凭想象编造成员**。
 - 你的最终产出/结论**必须通过 `jian comment` 或 `jian subtask` 落到平台上**；光在终端打印或用内置工具，等于没做。
 - 需要写长正文时，先把内容写进一个 .md 文件，再用 `--body-file` 传给 `jian subtask` 或 `jian comment`（避免命令行转义/多行截断问题）。
+- 🔴 **收尾铁律**：本轮结束前的**最后一个动作**必须是把「最终结论 / 交付 / 需要用户决策的问题」用 `jian comment`（或 `jian subtask`）发到任务里。
+  - 开工时发的「开工通知 / 计划说明」**不算**交付——那只是过程。真正的结论必须在收尾时**再发一条** `jian comment`。
+  - **凡是需要用户拍板**（范围太大要不要全铺开、方案二选一、信息不全要澄清等），**绝不能只在思考/终端里说**，必须 `jian comment` 把选项和你的建议发出来，让用户在任务里看到并回复。埋在执行日志里 = 用户看不到 = 没做。
 - 请用**中文**作答与操作。
 """
 
@@ -471,14 +474,20 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
                        {"run_id": run_id, "summary": final_text[:120]})
 
     # CLI run 未产出 jian 交付的标记：CLI Agent 的真实产出必须走 jian comment/subtask 落库。
-    # 若本轮成功结束、却没有任何该 Agent 的落库发言（只在 stdout 说了话、忘了 jian），
-    # 正文里会没有它的痕迹 —— 我们**不拿 stdout 错误兜底**（目标是让 jian comment 100% 出现），
-    # 而是打一条醒目活动标记，便于发现并追查（stdout 全文仍在 run_logs / 日志详情里）。
-    if (is_cli and status == "succeeded" and final_text
-            and not await _has_jian_deliverable(conv_id, slug, user_msg_id, task["id"], run_id)):
-        await log_activity(task["id"], "commented", "system", "",
-                           {"note": f"⚠️ {agent.get('name', slug)} 本轮只在终端输出、未通过 jian comment/subtask "
-                                    f"提交交付，正文无其产出（完整过程见执行日志详情 run #{run_id}）。"})
+    # 两种漏交付都要标记：
+    #   (a) 整轮从没落过库（只在 stdout 说话、忘了 jian）；
+    #   (b) 落过库、但**收尾结论**产生在最后一条 jian 交付之后——典型是先发「开工通知」，
+    #       后面大段分析/决策请求只打在 stdout 里没再 jian（task 78 事故）。
+    # 目标：需要人工决策/最终结论时，必须出现在任务正文里，而不是埋在执行日志。
+    if is_cli and status == "succeeded" and final_text:
+        delivered = await _has_jian_deliverable(conv_id, slug, user_msg_id, task["id"], run_id)
+        trailing = await _has_trailing_stdout_after_deliverable(
+            conv_id, slug, task["id"], run_id)
+        if not delivered or trailing:
+            await log_activity(task["id"], "commented", "system", "",
+                               {"note": f"⚠️ {agent.get('name', slug)} 的收尾结论未通过 jian comment/subtask "
+                                        f"提交到任务正文（可能只在终端输出或忘了收尾发言，"
+                                        f"完整过程见执行日志详情 run #{run_id}）。"})
 
 
 async def _log(run_id: int, channel: str, content: str,
@@ -521,6 +530,49 @@ async def _has_jian_deliverable(conv_id: int, slug: str, since_msg_id: int,
             "AND a.action IN ('commented','status_changed') AND a.created_at >= r.started_at LIMIT 1",
             (run_id, task_id, slug))).fetchone()
         return act is not None
+    finally:
+        await db.close()
+
+
+async def _has_trailing_stdout_after_deliverable(
+        conv_id: int, slug: str, task_id: int, run_id: int) -> bool:
+    """本轮最后一次 jian 交付之后，是否还有实质 stdout 输出（说明收尾结论没落库）。
+
+    典型：Agent 先 `jian comment` 发「开工通知」，随后花大量篇幅在 stdout 里做分析/得出
+    需人工决策的结论，却没再 `jian comment` 发出去。此时正文只有开工通知、看不到结论。
+    判据：本 run 内该 Agent 最后一条落库交付（comment 消息 / commented|status_changed 活动）
+    的时间，早于本 run 最后一条 stdout 的时间（留 15s 容差，避免正常收尾发言后的零星刷新误报）。
+    """
+    db = await get_connection()
+    try:
+        last_stdout = await (await db.execute(
+            "SELECT MAX(ts) AS t FROM run_logs WHERE run_id=? AND channel='stdout' "
+            "AND length(trim(content)) > 40", (run_id,))).fetchone()
+        if not last_stdout or not last_stdout["t"]:
+            return False
+        started = await (await db.execute(
+            "SELECT started_at FROM task_runs WHERE id=?", (run_id,))).fetchone()
+        run_start = started["started_at"] if started else None
+        last_msg = await (await db.execute(
+            "SELECT MAX(created_at) AS t FROM messages WHERE conversation_id=? "
+            "AND role='assistant' AND author_slug=?", (conv_id, slug))).fetchone()
+        last_act = await (await db.execute(
+            "SELECT MAX(created_at) AS t FROM activities WHERE task_id=? AND actor_type='agent' "
+            "AND actor_name=? AND action IN ('commented','status_changed') "
+            "AND created_at >= ?", (task_id, slug, run_start or "")))
+        last_act = await last_act.fetchone()
+        deliver_ts = max([t for t in (last_msg["t"] if last_msg else None,
+                                      last_act["t"] if last_act else None) if t], default=None)
+        if deliver_ts is None:
+            return False   # 没交付由 _has_jian_deliverable 那条分支负责，这里只管「有交付但收尾漏了」
+        # 最后 stdout 明显晚于最后交付（>15s）→ 收尾结论没落库
+        from datetime import datetime, timedelta
+        fmt = "%Y-%m-%d %H:%M:%S"
+        try:
+            return datetime.strptime(last_stdout["t"][:19], fmt) - \
+                   datetime.strptime(deliver_ts[:19], fmt) > timedelta(seconds=15)
+        except (ValueError, TypeError):
+            return False
     finally:
         await db.close()
 
