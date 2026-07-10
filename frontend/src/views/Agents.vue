@@ -2,7 +2,10 @@
   <div class="agents">
     <div class="header">
       <h2>数字人才库</h2>
-      <el-button v-if="isAdmin" :icon="Refresh" @click="rescan" :loading="scanning">重新扫描</el-button>
+      <div class="header-actions">
+        <el-button v-if="isAdmin" type="primary" :icon="Plus" @click="createVisible = true">新增人才</el-button>
+        <el-button v-if="isAdmin" :icon="Refresh" @click="rescan" :loading="scanning">重新扫描</el-button>
+      </div>
     </div>
 
     <div class="toolbar">
@@ -11,6 +14,9 @@
       <el-select v-model="division" placeholder="全部分类" clearable class="div-select" @change="load">
         <el-option v-for="d in divisions" :key="d.division"
                    :label="`${d.division || '其他'} (${d.n})`" :value="d.division" />
+      </el-select>
+      <el-select v-model="tag" placeholder="全部标签" clearable filterable class="div-select" @change="load">
+        <el-option v-for="tg in tags" :key="tg.tag" :label="`${tg.tag} (${tg.n})`" :value="tg.tag" />
       </el-select>
       <span class="total">共 {{ count }} 个</span>
     </div>
@@ -23,8 +29,13 @@
           <span class="name">{{ dName(t) }}</span>
         </div>
         <div class="desc">{{ t.description }}</div>
+        <div v-if="t.tags" class="card-tags">
+          <el-tag v-for="tg in splitTags(t.tags)" :key="tg" size="small" type="info" effect="plain"
+                  class="ct-tag" @click.stop="filterByTag(tg)">{{ tg }}</el-tag>
+        </div>
         <div class="card-foot">
           <el-tag size="small" effect="plain">{{ t.division || '其他' }}</el-tag>
+          <el-tag v-if="t.origin === 'manual'" size="small" type="warning" effect="plain">手动</el-tag>
           <span v-if="t.project_count > 0" class="proj-count">🗂 {{ t.project_count }} 个项目</span>
           <span class="solved-count" :title="'已完成任务数'">✅ {{ t.solved_tasks || 0 }} 个任务</span>
         </div>
@@ -71,6 +82,7 @@
 
     <AgentProfileDialog v-if="profileAgent" v-model="profileVisible" :agent="profileAgent"
                         @saved="onProfileSaved" />
+    <CreateTalentDialog v-model="createVisible" @created="onTalentCreated" />
   </div>
 </template>
 
@@ -82,6 +94,7 @@ import { Refresh, Search, Plus } from '@element-plus/icons-vue'
 import { agentsApi, projectsApi, projectAgentsApi } from '../api'
 import AgentAvatar from '../components/AgentAvatar.vue'
 import AgentProfileDialog from '../components/AgentProfileDialog.vue'
+import CreateTalentDialog from '../components/CreateTalentDialog.vue'
 import { displayName } from '../utils/agentDisplay'
 
 const isAdmin = inject('isAdmin')
@@ -92,11 +105,18 @@ function openProfile(a) { profileAgent.value = { slug: a.slug, name: a.name, emo
 async function onProfileSaved() { await load(); if (detail.value) detail.value = await agentsApi.detail(detail.value.id) }
 const templates = ref([])
 const divisions = ref([])
+const tags = ref([])
 const count = ref(0)
 const keyword = ref('')
 const division = ref('')
+const tag = ref('')
 const loading = ref(false)
 const scanning = ref(false)
+const createVisible = ref(false)
+
+function splitTags(s) { return (s || '').split(',').map((x) => x.trim()).filter(Boolean) }
+function filterByTag(tg) { tag.value = tg; load() }
+async function onTalentCreated() { await Promise.all([load(), loadDivisions(), loadTags()]) }
 const detailVisible = ref(false)
 const detail = ref(null)
 
@@ -115,7 +135,7 @@ let searchTimer = null
 async function load() {
   loading.value = true
   try {
-    const data = await agentsApi.list({ q: keyword.value, division: division.value })
+    const data = await agentsApi.list({ q: keyword.value, division: division.value, tag: tag.value })
     templates.value = data.templates
     count.value = data.count
   } catch (e) {
@@ -128,6 +148,10 @@ async function load() {
 async function loadDivisions() {
   const data = await agentsApi.divisions()
   divisions.value = data.divisions
+}
+
+async function loadTags() {
+  try { tags.value = (await agentsApi.tags()).tags } catch { tags.value = [] }
 }
 
 function onSearch() {
@@ -181,7 +205,7 @@ async function rescan() {
   try {
     const r = await agentsApi.rescan()
     ElMessage.success(`扫描完成：新增 ${r.inserted}，更新 ${r.updated}，跳过 ${r.skipped}`)
-    await Promise.all([load(), loadDivisions()])
+    await Promise.all([load(), loadDivisions(), loadTags()])
   } catch (e) {
     ElMessage.error('扫描失败：' + (e?.response?.data?.detail || e.message))
   } finally {
@@ -192,6 +216,7 @@ async function rescan() {
 onMounted(() => {
   load()
   loadDivisions()
+  loadTags()
   loadProjects()
 })
 </script>
@@ -208,6 +233,10 @@ onMounted(() => {
 .card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .emoji { font-size: 22px; }
 .name { font-weight: 600; font-size: 17px; }
+.header-actions { display: flex; gap: 8px; }
+.card-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+.ct-tag { cursor: pointer; }
+.ct-tag:hover { opacity: 0.75; }
 .card-foot { display: flex; align-items: center; gap: 8px; }
 .proj-count { font-size: 12px; color: #e6a23c; }
 .solved-count { font-size: 12px; color: #67c23a; margin-left: auto; }

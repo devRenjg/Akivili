@@ -17,8 +17,10 @@ export const settingsApi = {
 export const agentsApi = {
   list: (params) => api.get('/agents/templates', { params }).then((r) => r.data),
   divisions: () => api.get('/agents/divisions').then((r) => r.data),
+  tags: () => api.get('/agents/tags').then((r) => r.data),
   detail: (id) => api.get(`/agents/templates/${id}`).then((r) => r.data),
   projects: (id) => api.get(`/agents/templates/${id}/projects`).then((r) => r.data),
+  create: (payload) => api.post('/agents/templates', payload).then((r) => r.data),
   rescan: () => api.post('/agents/rescan').then((r) => r.data),
 }
 
