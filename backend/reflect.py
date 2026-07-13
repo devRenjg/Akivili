@@ -244,11 +244,40 @@ async def reflect_on_task_done(task_id: int) -> None:
         # 并发让各角色复盘（互不依赖），单个失败不拖累其他
         results = await asyncio.gather(
             *(_reflect_one(task_id, m) for m in members), return_exceptions=True)
-        learned = [m for m, r in zip(members, results) if isinstance(r, int) and r > 0]
-        if learned:
-            names = "、".join((m.get("nickname") or m["name"]) for m in learned)
+
+        # 三类区分，杜绝「反思失败被静默吞掉」的可观测性盲区（火花 task78 事故：
+        # 并发调 CLI 偶发失败，被 gather(return_exceptions) 吞掉，活动流只报成功者，
+        # 干了活却没沉淀且无人知晓）：
+        #   r 是 int>0  → 成功沉淀
+        #   r 是 int==0 → 反思返回「无」（真无专业增量，正常，不报错）
+        #   r 是 Exception → 反思出错（run_oneshot 超时/CLI 冷启动等）→ 必须留痕、可重跑
+        learned, no_gain, failed = [], [], []
+        for m, r in zip(members, results):
+            who = m.get("nickname") or m["name"]
+            if isinstance(r, int) and r > 0:
+                learned.append(who)
+            elif isinstance(r, int):
+                no_gain.append(who)
+            else:
+                failed.append((who, m["slug"], type(r).__name__))
+
+        # 失败成员逐个留痕（带 slug + 错误类型，便于定位与重跑 reflect_on_task_done）
+        for who, slug, err in failed:
             await log_activity(task_id, "commented", "system", "",
-                               {"note": f"✅ 任务完成，{names} 已经沉淀本次经验"})
+                               {"note": f"⚠️ {who} 的经验沉淀失败（{err}）——本次未沉淀，"
+                                        f"可重跑本任务反思补上（slug={slug}）。"})
+
+        # 汇总一条：成功/无增量/失败三类全貌，让「有人没被处理」无所遁形
+        parts = []
+        if learned:
+            parts.append(f"{('、'.join(learned))} 已沉淀本次经验")
+        if no_gain:
+            parts.append(f"{len(no_gain)} 人本次无新增专业经验")
+        if failed:
+            parts.append(f"⚠️ {len(failed)} 人沉淀失败待重跑（{'、'.join(w for w, _, _ in failed)}）")
+        if parts:
+            await log_activity(task_id, "commented", "system", "",
+                               {"note": "✅ 任务完成，经验反思：" + "；".join(parts)})
     except Exception:  # noqa: BLE001
         pass
 

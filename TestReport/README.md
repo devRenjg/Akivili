@@ -54,6 +54,7 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 | `run_memory_hygiene_probe.py` | 11/11 | 近期动态只存净交付、Know-how 相关性精选 top-N、归属标记剥离、history 滑动窗口、反思质量门槛 |
 | `run_reflect_probe.py` | 8/8 | 任务 done 触发经验反思、按角色写入 knowhow 托管段、超上限压缩合并保血缘、测试项目跳过 |
 | `run_reflect_participants_probe.py` | 4/4 | 反思参与者口径 = 有 run ∪ 有本人发言：直接建卡型（无 run 有产出）成员也被纳入反思并沉淀 knowhow |
+| `run_reflect_observability_probe.py` | 5/5 | 反思三类结果留痕：成功列汇总、无增量计数不报错、失败逐条留痕（错误类型+slug 可重跑）+ 汇总，杜绝失败被静默吞掉 |
 
 ### 执行与运维健壮性
 | 脚本 | 实测 | 覆盖 |
