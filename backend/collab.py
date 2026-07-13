@@ -536,6 +536,20 @@ async def _run_one(item: dict) -> None:
     if had_error["v"] and not final_text:
         run_status = "failed"
 
+    # 双保险（对齐 task_runs 实际结果）：execute_dispatch 内部已把本 run 的 task_runs 落终态；
+    # 若那里已判 succeeded，则本 run 就是成功的——不能因收尾/善后阶段的异常在外层误判 failed，
+    # 否则 run_queue=failed 与 task_runs=succeeded 分叉，状态无法推进（task 82 事故根因）。
+    rid = run_id_box.get("id")
+    if run_status == "failed" and rid:
+        db2 = await get_connection()
+        try:
+            tr = await (await db2.execute(
+                "SELECT status FROM task_runs WHERE id=?", (rid,))).fetchone()
+        finally:
+            await db2.close()
+        if tr and tr["status"] == "succeeded":
+            run_status = "done"
+
     # 解析该成员发言里的 @，继续协同
     if final_text:
         leader_slug = agent["leader_slug"]
@@ -599,8 +613,16 @@ async def _process_one(item: dict) -> None:
         rs = await _run_one(item)
         if rs == "failed":
             status = "failed"
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 — 吞异常防带崩队列，但必须留痕（否则失败零线索）
         status = "failed"
+        # 留痕只能进后端进程 stderr：这里手上只有 run_queue.id（item["id"]），
+        # 而 run_logs.run_id 外键指向的是 task_runs.id——两者是各自独立的自增序列，
+        # 同一个数字在两表里指代不同 run。若把 run_queue.id 塞进 run_logs，日志会误挂到
+        # task_runs 里同号的另一个 run 上（排查 task82 时「run 80 跑了 4 小时」的假象即此类串号）。
+        # 且异常可能发生在 task_run 建立之前，此刻根本没有可关联的 task_runs.id。
+        import traceback
+        print(f"[collab] run_queue#{item.get('id')} 执行异常，落 failed："
+              f"{type(e).__name__}: {e}\n{traceback.format_exc()}", flush=True)
     finally:
         db = await get_connection()
         try:

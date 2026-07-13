@@ -49,11 +49,11 @@
             <div v-if="t.subtasks && t.subtasks.length" class="tc-subs">
               <div v-for="s in t.subtasks" :key="s.id" class="tc-sub-card"
                    @click.stop="openTask(s)">
-                <span class="scb-dot" :class="`st-${s.status}`">●</span>
+                <span class="scb-dot" :class="`st-${subEff(s)}`">●</span>
                 <span v-if="s.priority && s.priority !== 'none'" class="scb-prio">{{ prioDot(s.priority) }}</span>
                 <AgentAvatar :agent="assigneeAgent(s)" :size="16" class="scb-av" />
                 <span class="scb-title">{{ s.title }}</span>
-                <span class="scb-status">{{ statusLabel(s.status) }}</span>
+                <span class="scb-status">{{ statusLabel(subEff(s)) }}</span>
               </div>
             </div>
           </div>
@@ -160,6 +160,11 @@ function prioDot(p) {
 function statusLabel(s) {
   return { backlog: '待办', in_progress: '进行中', reviewing: '验证中',
            done: '已完成', blocked: '阻塞', archived: '归档' }[s] || s
+}
+// 子任务有效状态：与任务详情页 subEffectiveStatus 同源——run_queue 里还有 queued/running
+// 的 run（active_run>0）时按「进行中」展示，否则用其 task.status。保证两处状态一致。
+function subEff(s) {
+  return s.active_run > 0 ? 'in_progress' : s.status
 }
 // 卡片左边框色：按 id 稳定映射到一组 Trello 风配色
 const CARD_COLORS = ['#61bd4f', '#f2d600', '#ff9f1a', '#eb5a46', '#c377e0',
@@ -336,7 +341,12 @@ onMounted(() => {
   load()
   // 有执行中的任务时定时刷新状态徽标
   pollTimer = setInterval(() => {
-    const hasRunning = Object.values(board.value).flat().some((t) => t.run_status === 'running')
+    const tasks = Object.values(board.value).flat()
+    // 顶层任务在跑、或任一子任务仍在 run_queue 里（active_run），都要继续刷新，
+    // 保证子任务实时状态与详情页一致地更新
+    const hasRunning = tasks.some(
+      (t) => t.run_status === 'running' || (t.subtasks || []).some((s) => s.active_run > 0),
+    )
     if (hasRunning) load()
   }, 3000)
 })

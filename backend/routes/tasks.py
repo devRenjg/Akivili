@@ -55,7 +55,8 @@ async def list_tasks(pid: int):
         # 取每个顶层任务的子任务（看板卡片下方嵌套小卡展示）
         sub_rows = await (await db.execute(
             """SELECT c.id, c.title, c.status, c.priority, c.assignee_slug, c.parent_task_id,
-                      (SELECT status FROM task_runs r WHERE r.task_id=c.id ORDER BY r.id DESC LIMIT 1) AS run_status
+                      (SELECT status FROM task_runs r WHERE r.task_id=c.id ORDER BY r.id DESC LIMIT 1) AS run_status,
+                      (SELECT COUNT(*) FROM run_queue q WHERE q.task_id=c.id AND q.status IN ('queued','running')) AS active_run
                FROM tasks c WHERE c.project_id=? AND c.parent_task_id IS NOT NULL
                ORDER BY c.order_idx, c.id""", (pid,))).fetchall()
         subs_by_parent: dict = {}

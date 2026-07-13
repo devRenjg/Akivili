@@ -466,28 +466,40 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     # 流式文本始终作为「收工写记忆」的兜底（_persist_memory 仍优先取 jian comment 发言）。
     if run_id in _RUN_CTX:
         _RUN_CTX[run_id]["stream_text"] = final_text
+    # run 的成败以此处 task_runs 落库为准（run_id 已有明确 status）。
     await _finish_run(run_id, status)
-    await _persist_memory(run_id)
-    _RUN_PIDS.pop(run_id, None)
-    act = {"succeeded": "task_completed", "failed": "task_failed", "killed": "task_failed"}[status]
-    await log_activity(task["id"], act, "agent", agent.get("name", slug),
-                       {"run_id": run_id, "summary": final_text[:120]})
 
-    # CLI run 未产出 jian 交付的标记：CLI Agent 的真实产出必须走 jian comment/subtask 落库。
-    # 两种漏交付都要标记：
-    #   (a) 整轮从没落过库（只在 stdout 说话、忘了 jian）；
-    #   (b) 落过库、但**收尾结论**产生在最后一条 jian 交付之后——典型是先发「开工通知」，
-    #       后面大段分析/决策请求只打在 stdout 里没再 jian（task 78 事故）。
-    # 目标：需要人工决策/最终结论时，必须出现在任务正文里，而不是埋在执行日志。
-    if is_cli and status == "succeeded" and final_text:
-        delivered = await _has_jian_deliverable(conv_id, slug, user_msg_id, task["id"], run_id)
-        trailing = await _has_trailing_stdout_after_deliverable(
-            conv_id, slug, task["id"], run_id)
-        if not delivered or trailing:
-            await log_activity(task["id"], "commented", "system", "",
-                               {"note": f"⚠️ {agent.get('name', slug)} 的收尾结论未通过 jian comment/subtask "
-                                        f"提交到任务正文（可能只在终端输出或忘了收尾发言，"
-                                        f"完整过程见执行日志详情 run #{run_id}）。"})
+    # —— 收工动作（记忆/活动/漏交付标记）——
+    # 这些是「run 已定局后」的善后动作，**绝不能因它们抛异常就把已成功的 run 拖成失败**：
+    # 否则会出现 task_runs=succeeded 但外层判 failed、状态无法推进的分叉（task 82 事故）。
+    # 故整段兜底：失败只记日志，不冒泡。
+    try:
+        await _persist_memory(run_id)
+        _RUN_PIDS.pop(run_id, None)
+        act = {"succeeded": "task_completed", "failed": "task_failed", "killed": "task_failed"}[status]
+        await log_activity(task["id"], act, "agent", agent.get("name", slug),
+                           {"run_id": run_id, "summary": final_text[:120]})
+
+        # CLI run 未产出 jian 交付的标记：CLI Agent 的真实产出必须走 jian comment/subtask 落库。
+        # 两种漏交付都要标记：
+        #   (a) 整轮从没落过库（只在 stdout 说话、忘了 jian）；
+        #   (b) 落过库、但**收尾结论**产生在最后一条 jian 交付之后——典型是先发「开工通知」，
+        #       后面大段分析/决策请求只打在 stdout 里没再 jian（task 78 事故）。
+        # 目标：需要人工决策/最终结论时，必须出现在任务正文里，而不是埋在执行日志。
+        if is_cli and status == "succeeded" and final_text:
+            delivered = await _has_jian_deliverable(conv_id, slug, user_msg_id, task["id"], run_id)
+            trailing = await _has_trailing_stdout_after_deliverable(
+                conv_id, slug, task["id"], run_id)
+            if not delivered or trailing:
+                await log_activity(task["id"], "commented", "system", "",
+                                   {"note": f"⚠️ {agent.get('name', slug)} 的收尾结论未通过 jian comment/subtask "
+                                            f"提交到任务正文（可能只在终端输出或忘了收尾发言，"
+                                            f"完整过程见执行日志详情 run #{run_id}）。"})
+    except Exception as e:  # noqa: BLE001 — 善后失败不影响 run 成败
+        try:
+            await _log(run_id, "stderr", f"收工动作异常（不影响 run 成败）：{type(e).__name__}: {e}")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _log(run_id: int, channel: str, content: str,

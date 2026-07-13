@@ -222,6 +222,17 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.7 — 2026-07-08
+- 🔧 **run 状态分叉根治：`task_runs` 与 `run_queue` 不再各说各话**（能力 `agent-collaboration`/`agent-execution`）
+  - **事故（task 82→78 卡死）**：子任务 82 明明已成功（`task_runs=succeeded`），但 `run_queue` 却是 `failed`，导致父任务 78 收不了尾、迟迟出不了负责人统筹汇报。根因是 `execute_dispatch` 在 `_finish_run` 落定 `task_runs` 终态**之后**的收工动作（写记忆 / 记活动 / CLI 漏交付标记）一旦抛异常，会经异步生成器冒泡到 `collab` 外层 `except`，把已成功的 run 误判成 `failed` 写进 `run_queue`——两个数据源就此分叉，`on_execution_complete` 只认 `run_queue`，任务永远推不动。
+  - **修 A（runner）**：`_finish_run` 之后的整段收工动作用 `try/except` 兜底——**run 成败以 `task_runs` 落库为准**，善后失败只记日志、绝不冒泡改写 run 结果。
+  - **修 A（collab 双保险）**：`_run_one` 收尾前对齐 `task_runs`——若外层判 `failed` 但该 run 的 `task_runs` 已是 `succeeded`，则纠回 `done`，堵住任何残余分叉路径。
+  - **修 B（bug C·run_id 串号）**：`_process_one` 异常留痕原先把 `run_queue.id` 当作 `run_id` 写进 `run_logs`，但 `run_logs.run_id` 外键指向的是 `task_runs.id`——两者是各自独立的自增序列，同一数字在两表里指代不同 run，日志会误挂到同号的另一个 run 上（排查时「run 80 跑了 4 小时」的假象即此类串号）。且异常可能发生在 `task_run` 建立之前，根本没有可关联的 id。改为写进后端进程 stderr（带 `run_queue#N` 标识 + traceback），不再污染 `run_logs`。
+  - **历史脏数据精准回填**：全库 73 条 `run_queue=failed / task_run=succeeded` 分叉（均为修复前残留、不卡任何任务推进，仅在工作区/日志面板误显「失败」），按 `task+slug+时间就近`一一配对，69 条确认对应 `succeeded` 的回填 `done`，4 条真失败/被杀（配到 `failed`/`killed`）按预期保留；改前备份 `jianagency.db`。经查历史 `run_logs` 0 条被串号污染，无需清理。
+- 🔗 **子任务运行状态两处同源：详情页与工作区不再打架**（能力 `task-board`/`task-system`）
+  - **问题**：任务详情页（实时）与外部工作区（看板嵌套小卡）对同一子任务显示的运行状态不一致。
+  - **修**：工作区看板的子任务查询增补 `active_run`（该子任务在 `run_queue` 里 `queued/running` 的 run 数）；前端 `Workspace.vue` 新增 `subEff(s)`——`active_run>0` 时按「进行中」展示、否则用 `task.status`，与详情页 `subEffectiveStatus` 同一判据。轮询条件也纳入子任务 `active_run`，保证两处实时同步刷新。
+
 ### v0.16.6 — 2026-07-08
 - 🩹 **修复孤儿回收误伤已成功任务**（能力 `agent-collaboration`/`agent-execution`）
   - **背景**：v0.16.x 的启动孤儿回收把所有 `running` 的 `task_runs` 一刀切落 `killed`。但「进程正常结束、只是 run 没落库」型孤儿也被误标，污染了**已成功任务**的真实终态。
