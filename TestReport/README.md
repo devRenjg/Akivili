@@ -58,7 +58,7 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 | 脚本 | 实测 | 覆盖 |
 |---|---|---|
 | `run_orphan_reclaim_probe.py` | 13/13 | 启动孤儿回收两层（run_queue→failed / task_runs→killed）、状态感知不误伤已完成任务、幂等 |
-| `run_stdout_display_probe.py` | 7/8 ⚠️ | CLI stdout 不落会话正文但进日志、无 jian 打标记、API 后端照落。**场景 A「打未走 jian 标记」1 项既有 FAIL（待排查，与调度改动无关）** |
+| `run_stdout_display_probe.py` | 8/8 | CLI stdout 不落会话正文但进日志、无 jian 打标记、API 后端照落 |
 
 ### 能力包 / Skills
 | 脚本 | 实测 | 覆盖 |
