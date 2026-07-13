@@ -24,8 +24,13 @@ KNOWHOW_KEY = "knowhow"
 
 
 async def _participants(task_id: int) -> list[dict]:
-    """收集本任务（含所有子任务）里**真正跑过 run**的角色。
-    以 task_runs 为准（有 run = 真的执行过、有产出），去重返回 [{slug, name, provider_id}]。
+    """收集本任务（含所有子任务）里**真正产出过东西**的角色。
+
+    口径 = 跑过 run 的成员（task_runs）∪ 在本任务/子任务会话里留下过 assistant 发言的成员
+    （messages.author_slug）。后者覆盖「直接建子任务卡片（jian subtask --body-file）」这类
+    有真实产出但不产生 task_run 的路径——干了活就该有沉淀，不能只认执行型 run。
+    与下游 _task_context 取产出的口径（同样按 messages）一致，无产出者在 _reflect_one 里
+    context 为空自动跳过（返回 0）。去重返回 [{slug, name, provider_id}]。
     """
     db = await get_connection()
     try:
@@ -39,7 +44,14 @@ async def _participants(task_id: int) -> list[dict]:
         runs = await (await db.execute(
             f"SELECT DISTINCT agent_slug FROM task_runs WHERE task_id IN ({ph}) AND agent_slug<>''",
             task_ids)).fetchall()
-        slugs = [r["agent_slug"] for r in runs]
+        # 有本人 assistant 发言的成员（含直接建卡型产出，无 run）
+        says = await (await db.execute(
+            f"""SELECT DISTINCT m.author_slug FROM messages m
+                JOIN tasks tk ON tk.conversation_id=m.conversation_id
+                WHERE tk.id IN ({ph}) AND m.role='assistant' AND m.author_slug<>''""",
+            task_ids)).fetchall()
+        slugs = list(dict.fromkeys(  # 保序去重：run 优先，再补发言型
+            [r["agent_slug"] for r in runs] + [r["author_slug"] for r in says]))
         if not slugs:
             return []
         # 取项目内这些角色的展示名 + 生效模型

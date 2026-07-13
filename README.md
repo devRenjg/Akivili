@@ -222,6 +222,12 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.10 — 2026-07-08
+- 🧠 **修复「直接建卡型产出不被反思沉淀」的结构性盲区——干了活就得有价值沉淀**（能力 `agent-reflection`/`agent-memory`）
+  - **问题**：`reflect._participants`（决定任务 done 时哪些成员被反思）只从 `task_runs` 圈定参与者（注释写死「有 run = 真的执行过」）。但「直接建子任务卡片」（`jian subtask --body-file`，成员把分析结论直接写成卡片正文）这类产出**不产生 task_run**——只落一个 `tasks` 行 + 一条本人 `messages` 发言。于是这类成员进不了参与者名单、**从不被反思、其分析成果无法转化成可复用 knowhow**。检查项目26 时发现火花（前端）接了最多任务、大量走建卡型产出，却几乎零沉淀，正是此盲区。
+  - **修**：`_participants` 口径从「有 task_runs 的成员」扩展为「有 run 的成员 **∪** 在本任务/子任务会话里有 `author_slug=本人` assistant 发言的成员」。与下游 `_task_context`（本就按 `messages` 取产出）口径一致，无产出者在 `_reflect_one` 里 context 为空自动跳过（返回 0），不会误纳空壳成员。建卡型与执行型一视同仁走同一套反思，反思 prompt 既有的「宁缺毋滥/无专业增量回无」门槛负责过滤低质。
+  - 验证：新增 `TestReport/run_reflect_participants_probe.py` **4/4**（两类成员都进参与者名单、都沉淀 knowhow）；回归 `run_reflect_probe` 8/8（真没产出的成员仍不写，口径扩展无误伤）。
+
 ### v0.16.9 — 2026-07-08
 - 🐞 **修复「收尾漏交付」检测因 aiosqlite 误用而长期静默失效**（能力 `agent-execution`）
   - **现象**：`run_stdout_display_probe` 场景 A（CLI 无 jian 交付时应打「未通过 jian 提交」标记）一项 FAIL。
