@@ -222,6 +222,14 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.9 — 2026-07-08
+- 🐞 **修复「收尾漏交付」检测因 aiosqlite 误用而长期静默失效**（能力 `agent-execution`）
+  - **现象**：`run_stdout_display_probe` 场景 A（CLI 无 jian 交付时应打「未通过 jian 提交」标记）一项 FAIL。
+  - **根因**：`_has_trailing_stdout_after_deliverable` 里一处查询写成 `last_act = await (await db.execute(...))` —— `await db.execute()` 已返回 Cursor，外层再 `await` 抛 `TypeError: object Cursor can't be used in 'await' expression`（少了 `.fetchone()`，且下一行的 `await last_act.fetchone()` 永远到不了）。此异常被 v0.16.7 给收工动作加的 `try/except` 兜底**静默吞掉**。
+  - **影响面（比测试更重要）**：该函数是 v0.16.7（task78 事故）引入的「收尾结论没落库」监督逻辑。由于每次 CLI 收工都在此抛异常被吞，**自 v0.16.7 起这条漏交付标记从未真正生效**——CLI Agent 若把最终结论只打在 stdout、没走 jian comment，平台本应告警却一直沉默。
+  - **修**：改为与同文件其它三处一致的正确写法 `await (await db.execute(...)).fetchone()`。
+  - 验证：`run_stdout_display_probe` 8/8 全绿（此前 7/8）；逐函数探测 `_persist_memory`/`_has_jian_deliverable`/`_has_trailing_stdout_after_deliverable` 均无异常。
+
 ### v0.16.8 — 2026-07-08
 - ⚙️ **调度策略三项增强：并发度可配置 + 优先级排序 + 失败自动重试**（能力 `agent-collaboration`/`agent-execution`）
   - **并发度可配置**：`MAX_CONCURRENCY` 从写死 3 改为走 `Settings`（`config.json` + 环境变量 `AKIVILI_MAX_CONCURRENCY`），`start_loop` 时读取生效。多项目/多 Agent 规模化时可上调，不必改代码。同增 `AKIVILI_MAX_RETRY`（默认 2）。

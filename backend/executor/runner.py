@@ -571,8 +571,7 @@ async def _has_trailing_stdout_after_deliverable(
         last_act = await (await db.execute(
             "SELECT MAX(created_at) AS t FROM activities WHERE task_id=? AND actor_type='agent' "
             "AND actor_name=? AND action IN ('commented','status_changed') "
-            "AND created_at >= ?", (task_id, slug, run_start or "")))
-        last_act = await last_act.fetchone()
+            "AND created_at >= ?", (task_id, slug, run_start or ""))).fetchone()
         deliver_ts = max([t for t in (last_msg["t"] if last_msg else None,
                                       last_act["t"] if last_act else None) if t], default=None)
         if deliver_ts is None:
