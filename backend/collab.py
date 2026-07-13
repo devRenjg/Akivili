@@ -248,6 +248,27 @@ async def _run_count(task_id: int) -> int:
         await db.close()
 
 
+async def log_run_event(event: str, *, run_queue_id: int | None = None,
+                        task_run_id: int | None = None, task_id: int | None = None,
+                        agent_slug: str = "", detail: dict | None = None) -> None:
+    """记一条调度流水到 run_events（run 级可观测性，独立于面向用户的 activities）。
+    失败绝不冒泡影响调度主流程。"""
+    import json as _json
+    try:
+        db = await get_connection()
+        try:
+            await db.execute(
+                "INSERT INTO run_events (run_queue_id, task_run_id, task_id, agent_slug, event, detail) "
+                "VALUES (?,?,?,?,?,?)",
+                (run_queue_id, task_run_id, task_id, agent_slug, event,
+                 _json.dumps(detail or {}, ensure_ascii=False)))
+            await db.commit()
+        finally:
+            await db.close()
+    except Exception:  # noqa: BLE001 — 埋点失败不影响调度
+        pass
+
+
 async def enqueue_run(task_id: int, agent_slug: str, prompt: str,
                       trigger: str = "mention", is_leader: bool = False,
                       source_run_id: int | None = None,
@@ -276,9 +297,13 @@ async def enqueue_run(task_id: int, agent_slug: str, prompt: str,
             (task_id, agent_slug, trigger, 1 if is_leader else 0, prompt,
              source_run_id, source_message_id))
         await db.commit()
-        return cur.lastrowid
+        rq_id = cur.lastrowid
     finally:
         await db.close()
+    await log_run_event("enqueued", run_queue_id=rq_id, task_id=task_id, agent_slug=agent_slug,
+                        detail={"trigger": trigger, "is_leader": bool(is_leader),
+                                "source_run_id": source_run_id, "source_message_id": source_message_id})
+    return rq_id
 
 
 async def _last_run_was_leader(task_id: int, agent_slug: str) -> bool:
@@ -420,7 +445,7 @@ async def _run_one(item: dict) -> None:
     is_leader = bool(item["is_leader"])
     task, agent = await _load_task_agent(task_id, slug)
     if not task or not agent:
-        return "failed", False   # 任务/成员不存在：判定型失败，不重试
+        return "failed", False, "task_or_agent_missing"   # 任务/成员不存在：判定型失败，不重试
 
     # Leader 的 prompt：把「真实花名册 + 明确动作」直接推进正文（不让它自己去探索/查库）。
     task_brief = f"任务：{task.get('title','')}"
@@ -537,6 +562,7 @@ async def _run_one(item: dict) -> None:
     # 失败是否属于「瞬时可重试」类（dispatch/驱动层异常、error 事件无产出）。
     # 超时无交付（idle/hard_wall grace 失败）与 kill 不在此列——重试大概率仍失败且烧墙钟。
     retriable_fail = False
+    fail_reason = ""   # 结构化失败归因：timeout_idle|timeout_wall|exception|error_no_output|''
     try:
         outcome = await _drive()
         if outcome != "normal":
@@ -546,14 +572,19 @@ async def _run_one(item: dict) -> None:
             saved = await _grace_then_kill(task_id, slug, agent, rid, outcome)
             run_status = "done" if saved else "failed"   # 超时无交付：failed 且不可重试
             saved_via_grace = saved
+            if not saved:
+                fail_reason = "timeout_idle" if outcome == "idle_timeout" else "timeout_wall"
     except Exception:  # noqa: BLE001 — dispatch/驱动层异常（CLI 冷启动/连接断等瞬时故障）：可重试
         run_status = "failed"
         retriable_fail = True
+        fail_reason = "exception"
 
     final_text = "".join(collected).strip()
     if had_error["v"] and not final_text:
         run_status = "failed"
         retriable_fail = True   # error 事件且无产出（CLI/LLM 瞬时报错）：可重试
+        if not fail_reason:
+            fail_reason = "error_no_output"
 
     # 双保险（对齐 task_runs 实际结果）：execute_dispatch 内部已把本 run 的 task_runs 落终态；
     # 若那里已判 succeeded，则本 run 就是成功的——不能因收尾/善后阶段的异常在外层误判 failed，
@@ -578,6 +609,16 @@ async def _run_one(item: dict) -> None:
         if tr and tr["status"] == "succeeded":
             run_status = "done"
             retriable_fail = False   # 实为成功（状态分叉伪失败），不进重试
+            fail_reason = ""         # 实为成功，清空失败归因
+
+    # P2-2 失败结构化归因：把判定的 fail_reason 写进 task_runs（成功则保持空）
+    if run_status == "failed" and fail_reason and rid:
+        dbf = await get_connection()
+        try:
+            await dbf.execute("UPDATE task_runs SET fail_reason=? WHERE id=?", (fail_reason, rid))
+            await dbf.commit()
+        finally:
+            await dbf.close()
 
     # 解析该成员发言里的 @，继续协同（因果链：这些下游 run 由本 run 的发言触发）
     if final_text:
@@ -599,8 +640,8 @@ async def _run_one(item: dict) -> None:
         # 传本 run 的队列行 id：此刻它的 done 标记还没写（在 _process_one finally 里），
         # 需从"是否还有待跑 run"里排除自己，否则父任务永远收不了尾。
         await on_execution_complete(task_id, exclude_run_id=item.get("id"))
-    # 返回 (run_queue 终态, 是否瞬时可重试失败)。调用方 _process_one 据后者决定是否重试。
-    return run_status, retriable_fail
+    # 返回 (run_queue 终态, 是否瞬时可重试失败, 失败结构化归因)。
+    return run_status, retriable_fail, fail_reason
 
 
 async def get_leader_slug(project_id: int) -> str:
@@ -658,9 +699,12 @@ async def _claim_one() -> dict | None:
         item = dict(row)
         await db.execute("UPDATE run_queue SET status='running' WHERE id=?", (item["id"],))
         await db.commit()
-        return item
     finally:
         await db.close()
+    if item is not None:
+        await log_run_event("claimed", run_queue_id=item["id"], task_id=item["task_id"],
+                            agent_slug=item["agent_slug"], detail={"attempts": item.get("attempts", 0)})
+    return item
 
 
 # 失败重试退避阶梯（秒）：按「本次将成为第几次重试」取值，超出用最后一档。
@@ -678,14 +722,16 @@ async def _process_one(item: dict) -> None:
     """
     status = "done"
     retriable = False   # 是否瞬时可重试失败
+    fail_reason = ""    # 结构化失败归因（透传给终态调度事件）
     try:
-        rs, retriable_fail = await _run_one(item)
+        rs, retriable_fail, fail_reason = await _run_one(item)
         if rs == "failed":
             status = "failed"
             retriable = retriable_fail   # 由 _run_one 区分：异常/error 无产出=可重试；超时/kill=不可重试
     except Exception as e:  # noqa: BLE001 — _run_one 框架级异常（DB 等）：留痕 + 可重试
         status = "failed"
         retriable = True
+        fail_reason = "exception"
         # 留痕只能进后端进程 stderr：这里手上只有 run_queue.id（item["id"]），
         # 而 run_logs.run_id 外键指向的是 task_runs.id——两者是各自独立的自增序列，
         # 同一个数字在两表里指代不同 run。若把 run_queue.id 塞进 run_logs，日志会误挂到
@@ -723,6 +769,16 @@ async def _process_one(item: dict) -> None:
         finally:
             await db.close()
         _running.discard(item["id"])
+        # run 级调度流水埋点（独立于 activities）
+        if do_retry:
+            await log_run_event("retry", run_queue_id=item["id"], task_id=item["task_id"],
+                                agent_slug=item["agent_slug"],
+                                detail={"attempts": attempts, "max_retry": MAX_RETRY, "backoff_sec": backoff})
+        else:
+            await log_run_event(status, run_queue_id=item["id"], task_id=item["task_id"],
+                                agent_slug=item["agent_slug"],
+                                detail={"attempts": attempts, "fail_reason": fail_reason,
+                                        "exhausted": bool(retriable and attempts > MAX_RETRY)})
 
 
 async def _tick() -> bool:

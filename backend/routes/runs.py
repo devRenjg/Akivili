@@ -352,3 +352,82 @@ async def get_transcript(run_id: int):
             "started_at": to_beijing(m["started_at"]), "ended_at": to_beijing(m["ended_at"]),
         }
     return {"meta": meta, "items": items}
+
+
+def _dur_seconds(started: str | None, ended: str | None) -> float | None:
+    """算 started~ended 的秒数（SQLite datetime 文本，UTC）。缺失返回 None。"""
+    if not started or not ended:
+        return None
+    from datetime import datetime
+    fmt = "%Y-%m-%d %H:%M:%S"
+    try:
+        return (datetime.strptime(ended[:19], fmt) - datetime.strptime(started[:19], fmt)).total_seconds()
+    except (ValueError, TypeError):
+        return None
+
+
+@router.get("/tasks/{task_id}/lineage")
+async def get_lineage(task_id: int):
+    """端到端链路下钻（P3-2/P3-1）：一次拼出该任务（含子任务）的完整执行链——
+    每个 run_queue 项 + 关联 task_run（经 P1-1 的 task_run_id）+ 耗时 + fail_reason
+    + 因果源（P1-3 source_run_id/message_id）+ run_events 调度流水（P2-1），
+    并聚合链路级耗时。替代此前需人工跨 5 张表拼时间线的排查方式。"""
+    db = await get_connection()
+    try:
+        # 本任务 + 子任务全集
+        trows = await (await db.execute(
+            "SELECT id, title, status, parent_task_id FROM tasks WHERE id=? OR parent_task_id=?",
+            (task_id, task_id))).fetchall()
+        if not trows:
+            raise HTTPException(404, "任务不存在")
+        tids = [r["id"] for r in trows]
+        ph = ",".join("?" for _ in tids)
+        # run_queue 项（含关联 task_run 的执行信息，经 task_run_id 打通）
+        qrows = await (await db.execute(
+            f"""SELECT q.id AS rq_id, q.task_id, q.agent_slug, q.trigger, q.is_leader,
+                       q.status AS queue_status, q.attempts, q.created_at AS enqueued_at,
+                       q.task_run_id, q.source_run_id, q.source_message_id,
+                       tr.status AS run_status, tr.fail_reason,
+                       tr.started_at, tr.ended_at
+                FROM run_queue q LEFT JOIN task_runs tr ON tr.id = q.task_run_id
+                WHERE q.task_id IN ({ph}) ORDER BY q.id""", tids)).fetchall()
+        # run_events 调度流水（按 run_queue 分组）
+        erows = await (await db.execute(
+            f"SELECT run_queue_id, event, detail, ts FROM run_events "
+            f"WHERE task_id IN ({ph}) ORDER BY id", tids)).fetchall()
+    finally:
+        await db.close()
+
+    events_by_rq: dict = {}
+    for e in erows:
+        events_by_rq.setdefault(e["run_queue_id"], []).append(
+            {"event": e["event"], "detail": e["detail"], "ts": to_beijing(e["ts"])})
+
+    chain = []
+    total_run_seconds = 0.0
+    for q in qrows:
+        d = dict(q)
+        dur = _dur_seconds(d.get("started_at"), d.get("ended_at"))
+        if dur:
+            total_run_seconds += dur
+        chain.append({
+            "run_queue_id": d["rq_id"], "task_id": d["task_id"], "agent_slug": d["agent_slug"],
+            "trigger": d["trigger"], "is_leader": bool(d["is_leader"]),
+            "queue_status": d["queue_status"], "attempts": d["attempts"],
+            "enqueued_at": to_beijing(d["enqueued_at"]),
+            "task_run_id": d["task_run_id"], "run_status": d["run_status"],
+            "fail_reason": d["fail_reason"] or "",
+            "started_at": to_beijing(d["started_at"]), "ended_at": to_beijing(d["ended_at"]),
+            "duration_seconds": dur,
+            "source_run_id": d["source_run_id"], "source_message_id": d["source_message_id"],
+            "events": events_by_rq.get(d["rq_id"], []),
+        })
+
+    return {
+        "task_id": task_id,
+        "task_count": len(tids),
+        "run_count": len(chain),
+        "total_run_seconds": round(total_run_seconds, 1),
+        "failed_runs": [c for c in chain if c["run_status"] == "failed"],
+        "chain": chain,
+    }

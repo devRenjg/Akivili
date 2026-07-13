@@ -161,7 +161,21 @@ CREATE TABLE IF NOT EXISTS task_runs (
     provider_id     TEXT DEFAULT '',
     pid             INTEGER,                  -- 子进程 PID，用于 kill
     started_at      TEXT DEFAULT (datetime('now')),
-    ended_at        TEXT
+    ended_at        TEXT,
+    fail_reason     TEXT DEFAULT ''            -- 失败结构化归因：timeout_idle|timeout_wall|exception|killed|''（成功空）
+);
+
+-- 调度流水（run 级可观测性）：入队/领取/重试/退避/失败等调度事件，与面向用户的
+-- activities 分开——activities 只放任务级人看的事，调度噪声进本表供排查，不污染详情页时间线。
+CREATE TABLE IF NOT EXISTS run_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_queue_id  INTEGER,                    -- 关联 run_queue.id（调度视角主键）
+    task_run_id   INTEGER,                    -- 关联 task_runs.id（执行视角，领取后才有）
+    task_id       INTEGER,
+    agent_slug    TEXT DEFAULT '',
+    event         TEXT NOT NULL,              -- enqueued|claimed|retry|done|failed（终态用 run_queue 语义）
+    detail        TEXT DEFAULT '{}',          -- JSON：{attempts,backoff,fail_reason,source_run_id,...}
+    ts            TEXT DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS run_logs (
@@ -292,6 +306,16 @@ async def _migrate(db) -> None:
     mcols2 = {row[1] for row in await cur.fetchall()}
     if "run_id" not in mcols2:
         await db.execute("ALTER TABLE messages ADD COLUMN run_id INTEGER")
+    # task_runs 失败结构化归因
+    cur = await db.execute("PRAGMA table_info(task_runs)")
+    trcols = {row[1] for row in await cur.fetchall()}
+    if "fail_reason" not in trcols:
+        await db.execute("ALTER TABLE task_runs ADD COLUMN fail_reason TEXT DEFAULT ''")
+    # run_events 表（老库补建；executescript 的 CREATE IF NOT EXISTS 已覆盖，此处双保险）
+    await db.execute("""CREATE TABLE IF NOT EXISTS run_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, run_queue_id INTEGER, task_run_id INTEGER,
+        task_id INTEGER, agent_slug TEXT DEFAULT '', event TEXT NOT NULL,
+        detail TEXT DEFAULT '{}', ts TEXT DEFAULT (datetime('now')))""")
 
 
 async def get_connection() -> aiosqlite.Connection:

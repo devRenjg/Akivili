@@ -42,6 +42,7 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 | 脚本 | 实测 | 覆盖 |
 |---|---|---|
 | `run_scheduling_probe.py` | 10/10 | 并发度/重试上限从 Settings 读取、优先级领取（high>medium>none）、同级 FIFO、退避、异常型重试到上限、超时/error 失败分类 |
+| `run_scheduling_events_probe.py` | 6/6 | 调度流水埋点：enqueued/claimed/done 事件入 run_events、重试记 retry、失败记 failed+fail_reason=exception、流水独立于 activities（不污染成员动态） |
 | `run_concurrency_probe.py` | 7/7 | 并发池 MAX_CONCURRENCY 并行度、卡死 Agent 超时被 kill 不阻塞队列、慢 Agent 不饿死快 Agent |
 | `run_timeout_and_qa_probe.py` | 14/14 | 静默超时(A) + 宽限保成果(B) + 硬墙钟(C)、超时收尾验收路由 |
 | `run_subtask_autocomplete_probe.py` | 6/6 | 子任务执行完自动进 done、全子完成→父任务 reviewing、失败任务不推进 |
@@ -55,7 +56,7 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 | `run_reflect_probe.py` | 8/8 | 任务 done 触发经验反思、按角色写入 knowhow 托管段、超上限压缩合并保血缘、测试项目跳过 |
 | `run_reflect_participants_probe.py` | 4/4 | 反思参与者口径 = 有 run ∪ 有本人发言：直接建卡型（无 run 有产出）成员也被纳入反思并沉淀 knowhow |
 | `run_reflect_observability_probe.py` | 5/5 | 反思三类结果留痕：成功列汇总、无增量计数不报错、失败逐条留痕（错误类型+slug 可重跑）+ 汇总，杜绝失败被静默吞掉 |
-| `run_lineage_probe.py` | 6/6 | 端到端链路关联键：run_queue.task_run_id 回填打通两表、messages.run_id 产出归因、@ 触发记 source_run_id/message_id 因果链、人工发起 source 留空 |
+| `run_lineage_probe.py` | 9/9 | 端到端链路关联键（run_queue.task_run_id 回填打通两表、messages.run_id 产出归因、@ 触发记 source_run_id/message_id 因果链、人工发起 source 留空）+ 链路下钻接口拼出 run 链（含 task_run_id 关联 + run_events 流水 + total_run_seconds 耗时聚合） |
 
 ### 执行与运维健壮性
 | 脚本 | 实测 | 覆盖 |

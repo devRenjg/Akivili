@@ -222,6 +222,16 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.13 — 2026-07-08
+- 🔗 **端到端链路可观测性·阶段二+三：调度流水 + 失败归因 + 链路下钻**（能力 `agent-collaboration`/`agent-execution`）
+  - **P2-1 `run_events` 调度流水表**：run 生命周期的关键状态转移（enqueued/claimed/retry/done/failed）独立成流水，`log_run_event` 埋点写入且**吞异常不阻断主流程**。与 `activities`（成员业务动态）解耦——调度诊断数据不再污染成员动态时间线，排查队列积压/重试风暴有了专门数据源。
+  - **P2-2 `task_runs.fail_reason` 结构化失败原因**：区分 `timeout_idle`（静默超时）/`timeout_wall`（硬墙钟）/`exception`（执行抛错）/`error_no_output`（有报错无产出）；`_run_one` 返回三元组 `(status, retriable, fail_reason)` 落库，失败原因从"看日志猜"变成"读一列即知"。双保险纠正为 done 时清空，不误标。
+  - **P3-1 链路耗时聚合**：`_dur_seconds` 解析 SQLite 时间戳，`total_run_seconds` 聚合整条链路各 run 实际执行耗时，定位"哪段拖慢了链路"。
+  - **P3-2 端到端下钻接口 `GET /tasks/{id}/lineage`**：一次拼出该任务的完整 run 链——每项含 `run_queue`+`task_run`（经 task_run_id 关联）+ 耗时 + fail_reason + source 因果 + run_events 流水，附 `run_count`/`failed_runs`/`total_run_seconds` 汇总。task82 那类跨 run 排查从"人肉拼时间线"变成"一个接口直出"。
+  - **取舍**：P3-3 前端时间线视图作为独立前端工作后续排期，本次先让后端接口与数据落地。均走 `_migrate` 幂等建表/加列，历史行留空无副作用。
+  - ⚠️ **上线需重启后端**触发 `_migrate` 补 `task_runs.fail_reason` 列与 `run_events` 表。
+  - 验证：新增 `TestReport/run_scheduling_events_probe.py` **6/6**；`run_lineage_probe.py` 扩展至 **9/9**（原 6 + 阶段三下钻 3）；回归 QA 31/31、scheduling 10/10、subtask 6/6、reflect 8/8、reflect_participants 4/4、reflect_observability 5/5、stdout 8/8、orphan 13/13、skill 7/7。
+
 ### v0.16.12 — 2026-07-08
 - 🔗 **端到端链路可观测性·阶段一：三个关联键打通"数据竖井"**（能力 `agent-collaboration`/`agent-execution`）
   - **背景（可观测性缺口评估）**：一条完整链路（父任务→负责人派活→建子任务→成员执行→汇报→收尾）的数据散在 5 张表，但**全链路无贯穿关联键**——打通的只有 `run_logs→task_runs` 一段。核查确认三个致命断点：① `run_queue`↔`task_runs` **无关联列**（task82 排查被迫靠"时间就近猜配对"的根因）；② `messages` **无 run_id**（产出无法归因到执行，火花沉淀/stdout 归属排查都靠比对绕）；③ 派生关系**无因果记录**（"谁 @ 出了这个 run"无法自动重建）。结论：单 run 内部问题可观测性充分，跨 run/链路级问题只能人肉拼时间线。

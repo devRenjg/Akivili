@@ -157,6 +157,21 @@ async def run_probe(paths, keep):
                 row and row["source_run_id"] is None,
                 f"assign 入队 source_run_id={row['source_run_id'] if row else None}")
 
+    # ---- P3-2/P3-1: 端到端链路下钻接口一次拼出链路 + 耗时聚合 ----
+    from routes.runs import get_lineage
+    lin = await get_lineage(task_id)
+    probe.check("P3-2 链路接口拼出该任务的 run 链",
+                lin["run_count"] >= 1 and len(lin["chain"]) == lin["run_count"],
+                f"run_count={lin['run_count']}")
+    # 链路项应带上关联键（task_run_id）与调度流水（events）
+    first = lin["chain"][0]
+    probe.check("P3-2 链路项含 task_run_id 关联 + run_events 流水",
+                first["task_run_id"] is not None and isinstance(first["events"], list) and first["events"],
+                f"task_run_id={first['task_run_id']} events={len(first['events'])}条")
+    probe.check("P3-1 链路耗时聚合字段存在",
+                "total_run_seconds" in lin and isinstance(lin["total_run_seconds"], (int, float)),
+                f"total_run_seconds={lin['total_run_seconds']}")
+
     return probe
 
 
