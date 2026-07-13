@@ -406,7 +406,7 @@ async def _run_one(item: dict) -> None:
     is_leader = bool(item["is_leader"])
     task, agent = await _load_task_agent(task_id, slug)
     if not task or not agent:
-        return
+        return "failed", False   # 任务/成员不存在：判定型失败，不重试
 
     # Leader 的 prompt：把「真实花名册 + 明确动作」直接推进正文（不让它自己去探索/查库）。
     task_brief = f"任务：{task.get('title','')}"
@@ -520,6 +520,9 @@ async def _run_one(item: dict) -> None:
 
     run_status = "done"   # run_queue 的最终状态：done / failed
     saved_via_grace = False   # 是否经「超时保成果」落终态（此时 collected 可能为空，但 DB 里已有交付）
+    # 失败是否属于「瞬时可重试」类（dispatch/驱动层异常、error 事件无产出）。
+    # 超时无交付（idle/hard_wall grace 失败）与 kill 不在此列——重试大概率仍失败且烧墙钟。
+    retriable_fail = False
     try:
         outcome = await _drive()
         if outcome != "normal":
@@ -527,14 +530,16 @@ async def _run_one(item: dict) -> None:
             # 宽限内该 run 若被 finalize/自然结束（进程自己 jian comment 后退出），视为成功、不销毁成果。
             rid = run_id_box["id"]
             saved = await _grace_then_kill(task_id, slug, agent, rid, outcome)
-            run_status = "done" if saved else "failed"
+            run_status = "done" if saved else "failed"   # 超时无交付：failed 且不可重试
             saved_via_grace = saved
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — dispatch/驱动层异常（CLI 冷启动/连接断等瞬时故障）：可重试
         run_status = "failed"
+        retriable_fail = True
 
     final_text = "".join(collected).strip()
     if had_error["v"] and not final_text:
         run_status = "failed"
+        retriable_fail = True   # error 事件且无产出（CLI/LLM 瞬时报错）：可重试
 
     # 双保险（对齐 task_runs 实际结果）：execute_dispatch 内部已把本 run 的 task_runs 落终态；
     # 若那里已判 succeeded，则本 run 就是成功的——不能因收尾/善后阶段的异常在外层误判 failed，
@@ -549,6 +554,7 @@ async def _run_one(item: dict) -> None:
             await db2.close()
         if tr and tr["status"] == "succeeded":
             run_status = "done"
+            retriable_fail = False   # 实为成功（状态分叉伪失败），不进重试
 
     # 解析该成员发言里的 @，继续协同
     if final_text:
@@ -569,7 +575,8 @@ async def _run_one(item: dict) -> None:
         # 传本 run 的队列行 id：此刻它的 done 标记还没写（在 _process_one finally 里），
         # 需从"是否还有待跑 run"里排除自己，否则父任务永远收不了尾。
         await on_execution_complete(task_id, exclude_run_id=item.get("id"))
-    return run_status
+    # 返回 (run_queue 终态, 是否瞬时可重试失败)。调用方 _process_one 据后者决定是否重试。
+    return run_status, retriable_fail
 
 
 async def get_leader_slug(project_id: int) -> str:
@@ -586,16 +593,42 @@ async def get_leader_slug(project_id: int) -> str:
 
 # ---------- 后台循环（小并发池：卡死只占一个槽，不阻塞其他 Agent） ----------
 
-MAX_CONCURRENCY = 3          # 同时最多跑几个 Agent
+MAX_CONCURRENCY = 3          # 同时最多跑几个 Agent（start_loop 时从 Settings 覆盖，见 _apply_settings）
+MAX_RETRY = 2                # run 真失败（异常型）自动重试上限（start_loop 时从 Settings 覆盖）
 _running: set = set()        # 正在跑的 run_queue id
 
 
+def _apply_settings() -> None:
+    """从 Settings 覆盖并发度 / 重试上限（config.json + 环境变量）。start_loop 时调用一次。"""
+    global MAX_CONCURRENCY, MAX_RETRY
+    try:
+        from config import load_settings
+        s = load_settings()
+        MAX_CONCURRENCY = max(1, int(s.max_concurrency))
+        MAX_RETRY = max(0, int(s.max_retry))
+    except Exception as e:  # noqa: BLE001 — 配置异常不阻塞启动，退回默认值
+        print(f"[collab] 读取并发/重试配置失败，用默认值 MAX_CONCURRENCY={MAX_CONCURRENCY} "
+              f"MAX_RETRY={MAX_RETRY}：{type(e).__name__}: {e}", flush=True)
+
+
 async def _claim_one() -> dict | None:
-    """原子领取一个 queued run（标 running）。返回 item 或 None。"""
+    """原子领取一个可执行的 queued run（标 running）。返回 item 或 None。
+
+    领取顺序：任务优先级（high>medium>其它）降序 → 同优先级按入队 id 升序（FIFO）。
+    退避过滤：仅领取 next_retry_at 为空或已到点的行（失败重试的行在退避窗口内不被领取）。
+    优先级取自 run_queue 所属 task 的 priority；LEFT JOIN 容错（task 理论上必存在）。
+    """
     db = await get_connection()
     try:
         row = await (await db.execute(
-            "SELECT * FROM run_queue WHERE status='queued' ORDER BY id LIMIT 1")).fetchone()
+            """SELECT q.* FROM run_queue q
+               LEFT JOIN tasks t ON t.id = q.task_id
+               WHERE q.status='queued'
+                 AND (q.next_retry_at IS NULL OR q.next_retry_at <= datetime('now'))
+               ORDER BY
+                 CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END ASC,
+                 q.id ASC
+               LIMIT 1""")).fetchone()
         if not row:
             return None
         item = dict(row)
@@ -606,15 +639,29 @@ async def _claim_one() -> dict | None:
         await db.close()
 
 
+# 失败重试退避阶梯（秒）：按「本次将成为第几次重试」取值，超出用最后一档。
+_RETRY_BACKOFF = [30, 120]
+
+
 async def _process_one(item: dict) -> None:
-    """执行一个 run 并落库最终状态。（_run_one 内部已有 6 分钟超时兜底）"""
+    """执行一个 run 并落库最终状态。（_run_one 内部已有 6 分钟超时兜底）
+
+    失败分两类，只有前者自动重试：
+      - **异常型失败**（本函数 except 捕获）：CLI 冷启动 / 限流 / 连接断等外部瞬时故障，
+        重试大概率能恢复 → attempts<MAX_RETRY 时回 queued + 退避，达上限才终落 failed。
+      - **判定型失败**（_run_one 正常 return "failed"）：超时无交付（真卡死）、被 kill、
+        产出为空且标 error —— 重试通常仍失败且烧 token/墙钟，**不重试**，直接落 failed。
+    """
     status = "done"
+    retriable = False   # 是否瞬时可重试失败
     try:
-        rs = await _run_one(item)
+        rs, retriable_fail = await _run_one(item)
         if rs == "failed":
             status = "failed"
-    except Exception as e:  # noqa: BLE001 — 吞异常防带崩队列，但必须留痕（否则失败零线索）
+            retriable = retriable_fail   # 由 _run_one 区分：异常/error 无产出=可重试；超时/kill=不可重试
+    except Exception as e:  # noqa: BLE001 — _run_one 框架级异常（DB 等）：留痕 + 可重试
         status = "failed"
+        retriable = True
         # 留痕只能进后端进程 stderr：这里手上只有 run_queue.id（item["id"]），
         # 而 run_logs.run_id 外键指向的是 task_runs.id——两者是各自独立的自增序列，
         # 同一个数字在两表里指代不同 run。若把 run_queue.id 塞进 run_logs，日志会误挂到
@@ -624,10 +671,31 @@ async def _process_one(item: dict) -> None:
         print(f"[collab] run_queue#{item.get('id')} 执行异常，落 failed："
               f"{type(e).__name__}: {e}\n{traceback.format_exc()}", flush=True)
     finally:
+        attempts = int(item.get("attempts") or 0) + 1   # 本次已执行完，累计执行次数
+        do_retry = retriable and attempts <= MAX_RETRY
         db = await get_connection()
         try:
-            await db.execute("UPDATE run_queue SET status=? WHERE id=?", (status, item["id"]))
-            await db.commit()
+            if do_retry:
+                # 回 queued + 退避：next_retry_at = now + 阶梯秒数（本次将成为第 attempts 次重试）
+                backoff = _RETRY_BACKOFF[min(attempts, len(_RETRY_BACKOFF)) - 1]
+                await db.execute(
+                    "UPDATE run_queue SET status='queued', attempts=?, "
+                    "next_retry_at=datetime('now', ?) WHERE id=?",
+                    (attempts, f"+{backoff} seconds", item["id"]))
+                await db.commit()
+                from activity import log_activity
+                await log_activity(item["task_id"], "commented", "system", "",
+                                   {"note": f"run 执行异常，{backoff}s 后自动重试"
+                                            f"（第 {attempts}/{MAX_RETRY} 次）"})
+            else:
+                await db.execute(
+                    "UPDATE run_queue SET status=?, attempts=? WHERE id=?",
+                    (status, attempts, item["id"]))
+                await db.commit()
+                if retriable and attempts > MAX_RETRY:
+                    from activity import log_activity
+                    await log_activity(item["task_id"], "commented", "system", "",
+                                       {"note": f"run 重试 {MAX_RETRY} 次仍失败，终止"})
         finally:
             await db.close()
         _running.discard(item["id"])
@@ -746,6 +814,7 @@ def start_loop():
     if _loop_started:
         return
     _loop_started = True
+    _apply_settings()
     asyncio.create_task(_loop())
 
 

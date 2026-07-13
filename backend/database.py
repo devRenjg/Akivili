@@ -192,7 +192,9 @@ CREATE TABLE IF NOT EXISTS run_queue (
     is_leader   INTEGER DEFAULT 0,            -- 本次运行是否以团队负责人身份
     prompt      TEXT DEFAULT '',
     status      TEXT DEFAULT 'queued',        -- queued|running|done|failed
-    created_at  TEXT DEFAULT (datetime('now'))
+    created_at  TEXT DEFAULT (datetime('now')),
+    attempts    INTEGER DEFAULT 0,            -- 已执行次数（含首次）；失败重试时 +1
+    next_retry_at TEXT                        -- 退避可领取时间；NULL=可立即领取
 );
 """
 
@@ -267,6 +269,13 @@ async def _migrate(db) -> None:
         await db.execute("ALTER TABLE run_logs ADD COLUMN tool_input TEXT DEFAULT ''")
     if "tool_output" not in rlcols:
         await db.execute("ALTER TABLE run_logs ADD COLUMN tool_output TEXT DEFAULT ''")
+    # run_queue 失败重试字段（attempts 已执行次数 / next_retry_at 退避可领取时间）
+    cur = await db.execute("PRAGMA table_info(run_queue)")
+    rqcols = {row[1] for row in await cur.fetchall()}
+    if "attempts" not in rqcols:
+        await db.execute("ALTER TABLE run_queue ADD COLUMN attempts INTEGER DEFAULT 0")
+    if "next_retry_at" not in rqcols:
+        await db.execute("ALTER TABLE run_queue ADD COLUMN next_retry_at TEXT")
 
 
 async def get_connection() -> aiosqlite.Connection:

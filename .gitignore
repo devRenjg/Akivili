@@ -11,8 +11,12 @@ icon/
 skills/narya-data/
 skills/bilisc-*/
 
-# TestReport 内部测试脚本与运行产物（不入公开仓）
-TestReport/
+# TestReport：白名单模式——默认忽略整个目录（运行产物含真实内网地址/业务数据/截图，
+# 如 qa_results_*、collab_scenario_*、weekly_report_*、shots/ 等，绝不入公开仓），
+# 仅反选测试脚本本身入库，以单测保障平台稳定性。新增脚本按 run_*.py 命名即自动纳入。
+TestReport/*
+!TestReport/run_*.py
+!TestReport/cleanup_test_data.py
 
 # SQLite 数据库（含备份，含真实数据/凭证，绝不入仓）
 *.db

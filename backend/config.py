@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     port: int = 8100
     providers: list[Provider] = []            # 多供应商列表
     default_provider_id: str = ""             # 默认供应商
+    # 协同并发池：同时最多跑几个 Agent run。默认 3，可用环境变量 AKIVILI_MAX_CONCURRENCY 覆盖。
+    # 多项目/多 Agent 规模化时上调（受单机 CPU/内存/CLI 进程数约束，非越大越好）。
+    max_concurrency: int = int(os.environ.get("AKIVILI_MAX_CONCURRENCY", "3"))
+    # run 真失败（执行异常，非状态分叉伪失败、非人工 kill、非超时无交付）后的自动重试次数上限。
+    # 默认 2（共最多 3 次执行）。可用环境变量 AKIVILI_MAX_RETRY 覆盖。
+    max_retry: int = int(os.environ.get("AKIVILI_MAX_RETRY", "2"))
 
 
 def load_settings() -> Settings:

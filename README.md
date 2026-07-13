@@ -222,6 +222,17 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.8 — 2026-07-08
+- ⚙️ **调度策略三项增强：并发度可配置 + 优先级排序 + 失败自动重试**（能力 `agent-collaboration`/`agent-execution`）
+  - **并发度可配置**：`MAX_CONCURRENCY` 从写死 3 改为走 `Settings`（`config.json` + 环境变量 `AKIVILI_MAX_CONCURRENCY`），`start_loop` 时读取生效。多项目/多 Agent 规模化时可上调，不必改代码。同增 `AKIVILI_MAX_RETRY`（默认 2）。
+  - **优先级排序**：`_claim_one` 领取顺序从纯 FIFO（`ORDER BY id`）改为 `任务优先级 high>medium>其它 降序 → 同优先级按入队 id 升序`。高优先级任务插队，同级仍先来先服务。此前 `tasks.priority` 字段存在但调度未用。
+  - **失败自动重试 + 退避**：`run_queue` 增 `attempts`/`next_retry_at` 两列。区分两类失败——**瞬时可重试**（dispatch/驱动层异常、error 事件无产出，如 CLI 冷启动/限流/连接断）自动回 `queued` + 退避（30s→120s 阶梯）重试，达上限（默认 2 次）才终落 `failed`；**判定型失败**（超时无交付=真卡死、被 kill、状态分叉伪失败）**不重试**，避免烧墙钟/token。`_claim_one` 在退避窗口内不领取重试行。
+  - **说明**：任务如何拆分、分派给谁仍是负责人 Agent 在 prompt 引导下自主决策（按业务域匹配成员）；本次改的是「分派之后平台如何调度执行」这一确定性层。
+- 🧪 **测试脚本纳入版本控制（白名单模式）以保障平台稳定性**
+  - `.gitignore` 对 `TestReport/` 从「整目录忽略」改为白名单：默认忽略所有内容（运行产物 `qa_results_*`/`collab_scenario_*`/周报/截图 `shots/` 等含真实内网地址、业务数据，绝不入公开仓），仅反选 `run_*.py`/`cleanup_test_data.py` 测试脚本入库。新增探针按 `run_*.py` 命名即自动纳入。
+  - 顺带清除两处测试桩里的业务暗示文案（改中性），不影响断言。
+  - 新增 `TestReport/run_scheduling_probe.py` **10/10**（并发/重试配置读取、优先级领取、FIFO、退避、异常型重试到上限、超时/error 分类）；回归 concurrency 7/7、subtask 6/6、memory-hygiene 11/11、QA 31/31。
+
 ### v0.16.7 — 2026-07-08
 - 🔧 **run 状态分叉根治：`task_runs` 与 `run_queue` 不再各说各话**（能力 `agent-collaboration`/`agent-execution`）
   - **事故（task 82→78 卡死）**：子任务 82 明明已成功（`task_runs=succeeded`），但 `run_queue` 却是 `failed`，导致父任务 78 收不了尾、迟迟出不了负责人统筹汇报。根因是 `execute_dispatch` 在 `_finish_run` 落定 `task_runs` 终态**之后**的收工动作（写记忆 / 记活动 / CLI 漏交付标记）一旦抛异常，会经异步生成器冒泡到 `collab` 外层 `except`，把已成功的 run 误判成 `failed` 写进 `run_queue`——两个数据源就此分叉，`on_execution_complete` 只认 `run_queue`，任务永远推不动。
