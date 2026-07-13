@@ -55,6 +55,7 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 | `run_reflect_probe.py` | 8/8 | 任务 done 触发经验反思、按角色写入 knowhow 托管段、超上限压缩合并保血缘、测试项目跳过 |
 | `run_reflect_participants_probe.py` | 4/4 | 反思参与者口径 = 有 run ∪ 有本人发言：直接建卡型（无 run 有产出）成员也被纳入反思并沉淀 knowhow |
 | `run_reflect_observability_probe.py` | 5/5 | 反思三类结果留痕：成功列汇总、无增量计数不报错、失败逐条留痕（错误类型+slug 可重跑）+ 汇总，杜绝失败被静默吞掉 |
+| `run_lineage_probe.py` | 6/6 | 端到端链路关联键：run_queue.task_run_id 回填打通两表、messages.run_id 产出归因、@ 触发记 source_run_id/message_id 因果链、人工发起 source 留空 |
 
 ### 执行与运维健壮性
 | 脚本 | 实测 | 覆盖 |

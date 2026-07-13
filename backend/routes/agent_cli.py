@@ -22,6 +22,20 @@ async def _task_project(task_id: int):
         await db.close()
 
 
+async def _running_run_id(task_id: int, agent_slug: str) -> int | None:
+    """反查「该 task+slug 当前正在跑的 task_run.id」——用于给 CLI 成员经 jian 回调落的
+    message 补 run_id（子进程回调只有 task_id/slug，拿不到 run_id）。同一 task+slug 同时
+    只会有一个 running run（enqueue 去重保证），唯一性可靠；查不到返回 None（留空不报错）。"""
+    db = await get_connection()
+    try:
+        row = await (await db.execute(
+            "SELECT id FROM task_runs WHERE task_id=? AND agent_slug=? AND status='running' "
+            "ORDER BY id DESC LIMIT 1", (task_id, agent_slug))).fetchone()
+        return row["id"] if row else None
+    finally:
+        await db.close()
+
+
 async def _resolve_member(project_id: int, ref: str) -> str:
     """把 owner 引用（slug / 名字 / 昵称）解析成成员 slug；解析不到返回空。"""
     ref = (ref or "").strip()
@@ -96,9 +110,11 @@ async def create_subtask(req: SubtaskReq):
         if req.body.strip():
             # 自产出(assistant)：作者=建卡的 agent；委派(user 指令)：作者留空（相当于负责人下达）
             body_author = "" if delegate else req.agent_slug
+            # 产出归因：自产出的正文挂到「建卡人在父任务下当前 running 的 run」（委派指令非产出，不归因）
+            body_run_id = None if delegate else await _running_run_id(req.task_id, req.agent_slug)
             await db.execute(
-                "INSERT INTO messages (conversation_id, role, content, author_slug) VALUES (?,?,?,?)",
-                (conv.lastrowid, "assistant" if not delegate else "user", req.body.strip(), body_author))
+                "INSERT INTO messages (conversation_id, role, content, author_slug, run_id) VALUES (?,?,?,?,?)",
+                (conv.lastrowid, "assistant" if not delegate else "user", req.body.strip(), body_author, body_run_id))
         await db.commit()
     finally:
         await db.close()
@@ -128,21 +144,28 @@ async def add_comment(req: CommentReq):
     parent = await _task_project(req.task_id)
     if not parent:
         raise HTTPException(404, "任务不存在")
+    run_id = None   # 本条发言归属的 run（作因果链的 source_run_id）
+    msg_id = None   # 本条发言的 message.id（作因果链的 source_message_id）
     db = await get_connection()
     try:
         conv = await (await db.execute(
             "SELECT conversation_id FROM tasks WHERE id=?", (req.task_id,))).fetchone()
         if conv and conv["conversation_id"]:
-            await db.execute(
-                "INSERT INTO messages (conversation_id, role, content, author_slug) VALUES (?,?,?,?)",
-                (conv["conversation_id"], "assistant", req.body.strip(), req.agent_slug))
+            # 产出归因：挂到该成员在本任务当前 running 的 run（拿不到留空）
+            run_id = await _running_run_id(req.task_id, req.agent_slug)
+            mcur = await db.execute(
+                "INSERT INTO messages (conversation_id, role, content, author_slug, run_id) VALUES (?,?,?,?,?)",
+                (conv["conversation_id"], "assistant", req.body.strip(), req.agent_slug, run_id))
+            msg_id = mcur.lastrowid
             await db.commit()
     finally:
         await db.close()
     # 解析发言里的 @，继续协同（实时查负责人，团队变动即时生效）
+    # 因果链：被 @ 出的下游 run 记录 source=本条发言（run_id + message_id）
     leader = await collab.get_leader_slug(parent["project_id"])
     await collab.parse_and_enqueue_mentions(req.task_id, parent["project_id"],
-                                            req.body, req.agent_slug, leader)
+                                            req.body, req.agent_slug, leader,
+                                            source_run_id=run_id, source_message_id=msg_id)
     return {"ok": True}
 
 

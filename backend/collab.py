@@ -249,8 +249,14 @@ async def _run_count(task_id: int) -> int:
 
 
 async def enqueue_run(task_id: int, agent_slug: str, prompt: str,
-                      trigger: str = "mention", is_leader: bool = False) -> int | None:
-    """入队一个待执行 run。pending 去重 + 深度上限。返回 run_queue id 或 None（被拒）。"""
+                      trigger: str = "mention", is_leader: bool = False,
+                      source_run_id: int | None = None,
+                      source_message_id: int | None = None) -> int | None:
+    """入队一个待执行 run。pending 去重 + 深度上限。返回 run_queue id 或 None（被拒）。
+
+    source_run_id / source_message_id：因果链（谁/哪条发言触发了本次入队）。@ 触发时由
+    parse_and_enqueue_mentions 透传；人工 assign / auto-dispatch 直接发起则留空。
+    """
     if await _run_count(task_id) >= MAX_RUNS_PER_TASK:
         from activity import log_activity
         await log_activity(task_id, "commented", "system", "",
@@ -265,8 +271,10 @@ async def enqueue_run(task_id: int, agent_slug: str, prompt: str,
         if dup:
             return None
         cur = await db.execute(
-            "INSERT INTO run_queue (task_id, agent_slug, trigger, is_leader, prompt) VALUES (?,?,?,?,?)",
-            (task_id, agent_slug, trigger, 1 if is_leader else 0, prompt))
+            "INSERT INTO run_queue (task_id, agent_slug, trigger, is_leader, prompt, "
+            "source_run_id, source_message_id) VALUES (?,?,?,?,?,?,?)",
+            (task_id, agent_slug, trigger, 1 if is_leader else 0, prompt,
+             source_run_id, source_message_id))
         await db.commit()
         return cur.lastrowid
     finally:
@@ -288,8 +296,13 @@ async def _last_run_was_leader(task_id: int, agent_slug: str) -> bool:
 # ---------- @mention 解析 ----------
 
 async def parse_and_enqueue_mentions(task_id: int, project_id: int, text: str,
-                                     author_slug: str, leader_slug: str) -> list[str]:
+                                     author_slug: str, leader_slug: str,
+                                     source_run_id: int | None = None,
+                                     source_message_id: int | None = None) -> list[str]:
     """从发言解析 @成员名，为被 @ 的成员入队。返回被触发的 slug 列表。
+
+    source_run_id / source_message_id：因果链——本次 @ 出自哪个 run / 哪条发言，透传给
+    enqueue_run 落到 run_queue，供端到端链路回溯「谁拉起了这个 run」。
     - 绝不入队作者自己（防自触发/自 @）。
     - 只认项目里真实存在的成员；@ 了不存在的名字 → 记一条活动提示（不再静默丢弃）。
     - **子任务内的 @ 不唤醒负责人**：子任务是叶子工作，负责人统筹只在顶层任务发生，
@@ -338,7 +351,8 @@ async def parse_and_enqueue_mentions(task_id: int, project_id: int, text: str,
             # 子任务内 @负责人：不唤醒（子任务是叶子工作，负责人统筹只在顶层；否则层层派生）
             if in_subtask and is_leader_run:
                 continue
-            rid = await enqueue_run(task_id, m["slug"], "", "mention", is_leader_run)
+            rid = await enqueue_run(task_id, m["slug"], "", "mention", is_leader_run,
+                                    source_run_id=source_run_id, source_message_id=source_message_id)
             if rid:
                 triggered.append(m["slug"])
                 seen.add(m["slug"])
@@ -545,6 +559,15 @@ async def _run_one(item: dict) -> None:
     # 若那里已判 succeeded，则本 run 就是成功的——不能因收尾/善后阶段的异常在外层误判 failed，
     # 否则 run_queue=failed 与 task_runs=succeeded 分叉，状态无法推进（task 82 事故根因）。
     rid = run_id_box.get("id")
+    # P1-1 可观测性：把本队列项实际产生的 task_run.id 回填到 run_queue，打通两表关联
+    # （此前两表无关联列，排查只能靠 task+slug+时间就近猜配对——task82 事故根因之一）。
+    if rid:
+        db3 = await get_connection()
+        try:
+            await db3.execute("UPDATE run_queue SET task_run_id=? WHERE id=?", (rid, item.get("id")))
+            await db3.commit()
+        finally:
+            await db3.close()
     if run_status == "failed" and rid:
         db2 = await get_connection()
         try:
@@ -556,10 +579,11 @@ async def _run_one(item: dict) -> None:
             run_status = "done"
             retriable_fail = False   # 实为成功（状态分叉伪失败），不进重试
 
-    # 解析该成员发言里的 @，继续协同
+    # 解析该成员发言里的 @，继续协同（因果链：这些下游 run 由本 run 的发言触发）
     if final_text:
         leader_slug = agent["leader_slug"]
-        await parse_and_enqueue_mentions(task_id, task["project_id"], final_text, slug, leader_slug)
+        await parse_and_enqueue_mentions(task_id, task["project_id"], final_text, slug, leader_slug,
+                                         source_run_id=rid)
 
     # 执行完成后的状态流转（绝不触发经验沉淀——沉淀只在父任务人工验收 done 时发生）：
     #  - 子任务执行完 → 直接进「完成(done)」（子任务无"验证中"概念），但**不触发沉淀**。

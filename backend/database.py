@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content         TEXT DEFAULT '',
     author_slug     TEXT DEFAULT '',        -- 发言作者的成员 slug（assistant 消息用）
     author_name     TEXT DEFAULT '',        -- user 消息的发送者名（登录用户名，供时间线按人显示）
+    run_id          INTEGER,                -- 产生该消息的 task_runs.id（可观测性：产出归因到执行；NULL=非 run 产出/历史）
     created_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -194,7 +195,10 @@ CREATE TABLE IF NOT EXISTS run_queue (
     status      TEXT DEFAULT 'queued',        -- queued|running|done|failed
     created_at  TEXT DEFAULT (datetime('now')),
     attempts    INTEGER DEFAULT 0,            -- 已执行次数（含首次）；失败重试时 +1
-    next_retry_at TEXT                        -- 退避可领取时间；NULL=可立即领取
+    next_retry_at TEXT,                       -- 退避可领取时间；NULL=可立即领取
+    task_run_id INTEGER,                      -- 本队列项实际产生的 task_runs.id（可观测性：打通 run_queue↔task_runs）
+    source_run_id INTEGER,                    -- 触发本次入队的上游 task_runs.id（因果链：谁拉起了我；NULL=人工/系统直接发起）
+    source_message_id INTEGER                 -- 触发本次入队的上游 messages.id（因果链：哪条发言 @ 出了我）
 );
 """
 
@@ -276,6 +280,18 @@ async def _migrate(db) -> None:
         await db.execute("ALTER TABLE run_queue ADD COLUMN attempts INTEGER DEFAULT 0")
     if "next_retry_at" not in rqcols:
         await db.execute("ALTER TABLE run_queue ADD COLUMN next_retry_at TEXT")
+    # 可观测性关联键：run_queue↔task_runs 打通 + 因果链
+    if "task_run_id" not in rqcols:
+        await db.execute("ALTER TABLE run_queue ADD COLUMN task_run_id INTEGER")
+    if "source_run_id" not in rqcols:
+        await db.execute("ALTER TABLE run_queue ADD COLUMN source_run_id INTEGER")
+    if "source_message_id" not in rqcols:
+        await db.execute("ALTER TABLE run_queue ADD COLUMN source_message_id INTEGER")
+    # messages 产出归因到 run
+    cur = await db.execute("PRAGMA table_info(messages)")
+    mcols2 = {row[1] for row in await cur.fetchall()}
+    if "run_id" not in mcols2:
+        await db.execute("ALTER TABLE messages ADD COLUMN run_id INTEGER")
 
 
 async def get_connection() -> aiosqlite.Connection:

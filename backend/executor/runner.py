@@ -462,7 +462,7 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     # 与 _persist_memory 的判别原则一致（jian comment 发言=真实产出 > stdout 兜底）。
     is_cli = bool(provider and provider.type in ("claude-cli", "codex-cli"))
     if final_text and not is_cli:
-        await _save_assistant(conv_id, final_text, author_slug=slug)
+        await _save_assistant(conv_id, final_text, author_slug=slug, run_id=run_id)
     # 流式文本始终作为「收工写记忆」的兜底（_persist_memory 仍优先取 jian comment 发言）。
     if run_id in _RUN_CTX:
         _RUN_CTX[run_id]["stream_text"] = final_text
@@ -588,12 +588,12 @@ async def _has_trailing_stdout_after_deliverable(
         await db.close()
 
 
-async def _save_assistant(conv_id: int, content: str, author_slug: str = ""):
+async def _save_assistant(conv_id: int, content: str, author_slug: str = "", run_id: int | None = None):
     db = await get_connection()
     try:
         await db.execute(
-            "INSERT INTO messages (conversation_id, role, content, author_slug) VALUES (?,?,?,?)",
-            (conv_id, "assistant", content, author_slug))
+            "INSERT INTO messages (conversation_id, role, content, author_slug, run_id) VALUES (?,?,?,?,?)",
+            (conv_id, "assistant", content, author_slug, run_id))
         await db.commit()
     finally:
         await db.close()

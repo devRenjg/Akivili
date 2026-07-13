@@ -222,6 +222,16 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.12 — 2026-07-08
+- 🔗 **端到端链路可观测性·阶段一：三个关联键打通"数据竖井"**（能力 `agent-collaboration`/`agent-execution`）
+  - **背景（可观测性缺口评估）**：一条完整链路（父任务→负责人派活→建子任务→成员执行→汇报→收尾）的数据散在 5 张表，但**全链路无贯穿关联键**——打通的只有 `run_logs→task_runs` 一段。核查确认三个致命断点：① `run_queue`↔`task_runs` **无关联列**（task82 排查被迫靠"时间就近猜配对"的根因）；② `messages` **无 run_id**（产出无法归因到执行，火花沉淀/stdout 归属排查都靠比对绕）；③ 派生关系**无因果记录**（"谁 @ 出了这个 run"无法自动重建）。结论：单 run 内部问题可观测性充分，跨 run/链路级问题只能人肉拼时间线。
+  - **P1-1 `run_queue.task_run_id`**：run 执行后把其产生的 `task_runs.id` 回填到队列项，两表从"猜配对"变成"一个 JOIN 直出"。根治 task82 那类状态分叉排查。
+  - **P1-2 `messages.run_id`**：assistant 产出归因到具体执行 run。`_save_assistant` 直接带入；CLI 成员经 jian 回调的发言（子进程拿不到 run_id）按"该 task+slug 当前 running 的 task_run"反查回填（同 task+slug 同时仅一个 running run，唯一可靠）。
+  - **P1-3 `run_queue.source_run_id/source_message_id`**：@ 触发的因果链——`parse_and_enqueue_mentions` 透传"哪个 run 的哪条发言 @ 出了下游 run"。人工 assign/auto-dispatch 直接发起则留空（无上游）。
+  - **取舍**：不做一次性全链路 `trace_id` 大爆炸改造（改动面大、需回填历史），改用三个关联键增量打通，各自独立上线+独立单测。均走 `_migrate` 幂等 ALTER，历史行留空无副作用。
+  - **后续（未做）**：阶段二 run 级调度埋点 + 失败原因结构化；阶段三链路耗时聚合 + 端到端下钻接口 + 前端时间线视图。
+  - 验证：新增 `TestReport/run_lineage_probe.py` **6/6**；回归 QA 31/31、concurrency 7/7、scheduling 10/10、subtask 6/6、stdout 8/8、reflect_participants 4/4。
+
 ### v0.16.11 — 2026-07-08
 - 🔎 **反思沉淀失败不再沉默：三类结果全留痕**（能力 `agent-reflection`）
   - **问题（火花 task78 存量个案查出）**：`reflect_on_task_done` 用 `asyncio.gather(return_exceptions=True)` 并发让各成员复盘，但结果只挑 `>0` 的报「已沉淀」，**抛异常的成员被静默吞掉**。火花在 task78 有 16 个 succeeded run、5900+ 字高质量前端产出，却因首次验收时并发调 CLI 偶发失败（`run_oneshot` 超时/冷启动），反思异常被吞——干了活没沉淀且无人知晓，活动流只列了成功的 7 人。
