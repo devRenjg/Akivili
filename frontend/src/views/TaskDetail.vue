@@ -150,7 +150,10 @@
         </div>
 
         <div class="side-block">
-          <div class="side-block-title">执行日志</div>
+          <div class="side-block-title">
+            执行日志
+            <a class="lineage-link" title="端到端链路时间线" @click="goLineage">链路 ↗</a>
+          </div>
           <!-- 执行进度：父任务或子任务还有 Agent 在跑/排队时显示 -->
           <div v-if="progress.active" class="exec-progress">
             <div class="exec-progress-head">
@@ -491,6 +494,12 @@ function toggleFoldAll() {
 // 打开某个任务详情（子任务也是正常任务，有独立详情页）
 function openTask(id) { if (id && id !== taskId) router.push(`/projects/${pid}/tasks/${id}`) }
 
+// 跳运行时链路视图：子任务归到父任务链（链路以顶层任务为根拉全子任务）
+function goLineage() {
+  const rootId = task.value?.parent_task_id || taskId
+  router.push({ path: '/runtime', query: { project: pid, task: rootId } })
+}
+
 // 子任务状态点：进行中→暂停(kill该任务在跑的run)；失败/阻塞→重跑(唤醒owner)
 // 用有效状态：正在跑/重跑（含 done 后被重新触发）一律按进行中处理，可暂停。
 async function onDotClick(s) {
@@ -787,7 +796,9 @@ onUnmounted(stopPolling)
 .mentioned-chips .mchip { margin-left: 5px; }
 .readonly-hint { border-top: 1px solid #ebeef5; padding: 16px 0 4px; text-align: center; color: #909399; font-size: 13px; }
 .side-block { background: #fafbfc; border: 1px solid #ebeef5; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
-.side-block-title { font-size: 14px; font-weight: 600; color: #606266; margin-bottom: 12px; }
+.side-block-title { font-size: 14px; font-weight: 600; color: #606266; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }
+.side-block-title .lineage-link { font-size: 12px; font-weight: 500; color: #409eff; cursor: pointer; }
+.side-block-title .lineage-link:hover { text-decoration: underline; }
 .side-row { display: flex; align-items: center; margin-bottom: 12px; }
 .side-row:last-child { margin-bottom: 0; }
 .side-label { width: 56px; font-size: 13px; color: #909399; flex-shrink: 0; }

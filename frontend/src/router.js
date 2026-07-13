@@ -9,6 +9,7 @@ const routes = [
   { path: '/projects/:id/tasks/:taskId', name: 'task-detail', component: () => import('./views/TaskDetail.vue') },
   { path: '/agents', name: 'agents', component: () => import('./views/Agents.vue') },
   { path: '/skills', name: 'skills', component: () => import('./views/Skills.vue') },
+  { path: '/runtime', name: 'runtime', component: () => import('./views/Runtime.vue') },
   { path: '/settings', name: 'settings', component: () => import('./views/Settings.vue') },
 ]
 

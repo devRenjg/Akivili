@@ -172,6 +172,27 @@ async def run_probe(paths, keep):
                 "total_run_seconds" in lin and isinstance(lin["total_run_seconds"], (int, float)),
                 f"total_run_seconds={lin['total_run_seconds']}")
 
+    # ---- P3-3: 前端时间线视图依赖的字段契约（Runtime.vue 纯渲染 lineage 载荷）----
+    # 视图直接消费这些键，缺任一都会导致时间线渲染异常，故锁契约
+    summary_keys = {"task_id", "task_count", "run_count", "total_run_seconds", "failed_runs", "chain"}
+    probe.check("P3-3 汇总载荷含视图所需全部字段",
+                summary_keys.issubset(lin.keys()) and isinstance(lin["failed_runs"], list),
+                f"缺失={summary_keys - set(lin.keys())}")
+    item_keys = {
+        "run_queue_id", "task_id", "agent_slug", "trigger", "is_leader",
+        "queue_status", "attempts", "enqueued_at", "task_run_id", "run_status",
+        "fail_reason", "started_at", "ended_at", "duration_seconds",
+        "source_run_id", "source_message_id", "events",
+    }
+    missing = item_keys - set(first.keys())
+    probe.check("P3-3 链路项含时间线视图所需全部字段（run 头/详情/耗时/因果）",
+                not missing, f"缺失字段={missing or '无'}")
+    # 每条 event 需含 event/detail/ts（视图按此渲染调度流水行）
+    ev = first["events"][0]
+    probe.check("P3-3 调度流水项含 event/detail/ts（视图流水行渲染契约）",
+                {"event", "detail", "ts"}.issubset(ev.keys()),
+                f"event键={sorted(ev.keys())}")
+
     return probe
 
 

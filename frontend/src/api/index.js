@@ -67,6 +67,7 @@ export const tasksApi = {
   subtasks: (pid, tid) => api.get(`/projects/${pid}/tasks/${tid}/subtasks`).then((r) => r.data),
   createSubtask: (pid, tid, payload) => api.post(`/projects/${pid}/tasks/${tid}/subtasks`, payload).then((r) => r.data),
   progress: (pid, tid) => api.get(`/projects/${pid}/tasks/${tid}/progress`).then((r) => r.data),
+  lineage: (tid) => api.get(`/tasks/${tid}/lineage`).then((r) => r.data),
 }
 
 export const runsApi = {

@@ -32,6 +32,9 @@
         <el-menu-item index="/skills">
           <el-icon><MagicStick /></el-icon><span>Skills</span>
         </el-menu-item>
+        <el-menu-item index="/runtime">
+          <el-icon><Odometer /></el-icon><span>运行时</span>
+        </el-menu-item>
         <el-menu-item v-if="isAdmin" index="/settings">
           <el-icon><Setting /></el-icon><span>设置</span>
         </el-menu-item>
