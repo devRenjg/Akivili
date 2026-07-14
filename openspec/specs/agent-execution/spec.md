@@ -47,6 +47,19 @@
 - **THEN** 系统 SHALL 拒绝执行 kill 并清除该陈旧登记，绝不对被复用 pid 的进程（及其子进程树）动手
 - **注**：run 注册 pid 时同时记录 `(pid, 进程创建时间)` 双因子指纹；run 无论正常收尾还是超时兜底，SHALL 无条件清除 pid 登记，杜绝收工善后异常导致陈旧 pid 残留
 
+### Requirement: 执行终态不泄漏（孤儿回收）
+
+每次执行 SHALL 最终落到明确终态（succeeded / failed / killed），绝不长期滞留 `running`。系统 SHALL 通过多道防线保证：即使执行流被中断（客户端断连、异步任务取消、进程被硬杀），执行记录也不会永久卡在「执行中」。
+
+#### Scenario: 流式执行被中断时补落终态
+- **WHEN** 一次流式执行的生成器在产出中途被关闭或取消（如客户端断开 SSE 连接、承载任务被取消）
+- **THEN** 系统 SHALL 在中断传播前把该执行补落为终态（killed）并清理其 pid 登记，不留 `running` 孤儿
+
+#### Scenario: 运行期孤儿巡检
+- **WHEN** 某执行记录仍为 `running`，但其最后一条日志距今静默时长已超过阈值（默认 30 分钟，且 ≥ 最长静默超时，避免误伤仍在持续产出的慢任务）
+- **THEN** 后台巡检 SHALL 周期性（默认每 120 秒）将其补落终态——所属任务已 `done`/`reviewing` 的落 succeeded（保其成果）、否则落 killed——并尝试推进父任务状态；无需等待下次进程重启的启动回收
+- **注**：巡检为幂等，只对仍 `running` 的记录动手（`WHERE status='running'` 条件更新），绝不覆盖已定终态；间隔与静默阈值可配（`orphan_sweep_interval_sec` / `orphan_sweep_idle_sec`）
+
 ### Requirement: 状态与日志监控
 
 系统 SHALL 为每次执行结构化记录全过程，并以「历史运行列表 + 日志详情」两级呈现；对外文本 SHALL 统一脱敏。

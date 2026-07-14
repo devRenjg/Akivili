@@ -75,9 +75,13 @@ async def dispatch(task_id: int, req: DispatchRequest, request: Request,
     collab.start_loop()  # 确保协同后台循环在跑，能领取上面入队的成员 run（幂等）
 
     async def event_stream():
+        # 显式持有底层生成器：客户端断连时 aclose() 它，触发 execute_dispatch 的中断兜底
+        # 及时把 task_runs 补落终态，杜绝孤儿 running（run#183/#185 泄漏事故：break 后生成器被丢弃、
+        # 收尾不确定性执行，run 长期假 running）。
+        agen = runner.execute_dispatch(task, agent, req.prompt,
+                                       persist_user_msg=True, user_name=user_name)
         try:
-            async for ev in runner.execute_dispatch(task, agent, req.prompt,
-                                                     persist_user_msg=True, user_name=user_name):
+            async for ev in agen:
                 if await request.is_disconnected():
                     break
                 payload = {"type": ev.type, "text": ev.text, "meta": ev.meta}
@@ -92,6 +96,11 @@ async def dispatch(task_id: int, req: DispatchRequest, request: Request,
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
         except Exception as e:  # noqa: BLE001
             yield f"data: {json.dumps({'type':'error','text':str(e)}, ensure_ascii=False)}\n\n"
+        finally:
+            # 无论正常结束、断连 break、还是异常，都确定性关闭生成器：
+            # 若生成器仍停在 yield（断连 break 的情形），aclose() 抛入 GeneratorExit，
+            # 触发 execute_dispatch 里的中断兜底补落终态。已自然收尾则是无害空操作。
+            await agen.aclose()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

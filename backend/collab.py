@@ -739,6 +739,9 @@ async def get_leader_slug(project_id: int) -> str:
 # ---------- 后台循环（小并发池：卡死只占一个槽，不阻塞其他 Agent） ----------
 
 MAX_CONCURRENCY = 3          # 同时最多跑几个 Agent（start_loop 时从 Settings 覆盖，见 _apply_settings）
+# 运行期孤儿巡检参数（start_loop 时从 Settings 覆盖）：间隔 + 静默阈值。
+ORPHAN_SWEEP_INTERVAL_SEC = 120
+ORPHAN_SWEEP_IDLE_SEC = 1800
 MAX_RETRY = 2                # run 真失败（异常型）自动重试上限（start_loop 时从 Settings 覆盖）
 _running: set = set()        # 正在跑的 run_queue id
 
@@ -746,6 +749,7 @@ _running: set = set()        # 正在跑的 run_queue id
 def _apply_settings() -> None:
     """从 Settings 覆盖并发度 / 重试上限 / 任务运行闸（config.json + 环境变量）。start_loop 时调用一次。"""
     global MAX_CONCURRENCY, MAX_RETRY, MAX_RUNS_PER_TASK, MAX_MENTION_CHAIN
+    global ORPHAN_SWEEP_INTERVAL_SEC, ORPHAN_SWEEP_IDLE_SEC
     try:
         from config import load_settings
         s = load_settings()
@@ -753,6 +757,8 @@ def _apply_settings() -> None:
         MAX_RETRY = max(0, int(s.max_retry))
         MAX_RUNS_PER_TASK = max(1, int(s.max_runs_per_task))
         MAX_MENTION_CHAIN = max(1, int(s.max_mention_chain))
+        ORPHAN_SWEEP_INTERVAL_SEC = max(10, int(s.orphan_sweep_interval_sec))
+        ORPHAN_SWEEP_IDLE_SEC = max(60, int(s.orphan_sweep_idle_sec))
     except Exception as e:  # noqa: BLE001 — 配置异常不阻塞启动，退回默认值
         print(f"[collab] 读取并发/重试/运行闸配置失败，用默认值 MAX_CONCURRENCY={MAX_CONCURRENCY} "
               f"MAX_RETRY={MAX_RETRY} MAX_RUNS_PER_TASK={MAX_RUNS_PER_TASK} "
@@ -971,9 +977,109 @@ async def reclaim_orphan_runs() -> int:
     return len(q_rows) + len(r_rows)
 
 
+async def sweep_orphan_task_runs(idle_sec: int | None = None) -> int:
+    """运行期孤儿巡检：把 task_runs 里卡 running 但已静默超阈值的孤儿主动补落终态。
+
+    动机（run#183/#185 泄漏事故）：并发池路径有 idle/hard_wall 超时兜底，但**直接 @ 对话路径**
+    （routes/runs.py 的 SSE 流式 dispatch）没有；一旦生成器被中断/进程被硬杀，收尾跑不到，
+    task_runs 就永久卡 running，只能等下次重启的 reclaim 才清。本巡检不必等重启，周期性兜底。
+
+    判定「孤儿」的口径（宁可漏杀慢任务，不可误杀在跑的）：
+      - status='running'，且
+      - 最后一条 run_logs.ts（无日志则用 started_at）距今 > idle_sec（默认 30 分，须 ≥ 最长 idle
+        超时，确保「慢但仍在产出」的 run 不被误判——它们持续写 run_logs，last_ts 会不断刷新）。
+    终态按任务是否已收尾区分（同 reclaim_orphan_runs）：任务 done/reviewing → succeeded；否则 killed。
+    经 runner.finalize_run 幂等补落（不覆盖已定终态），并推进父任务状态。返回清理条数。"""
+    from executor import runner  # noqa: PLC0415
+    idle = idle_sec if idle_sec is not None else ORPHAN_SWEEP_IDLE_SEC
+    db = await get_connection()
+    try:
+        # 用 SQL 直接算「最后活动距今秒数」：last = max(run_logs.ts) 或 started_at。
+        # julianday 差 * 86400 = 秒。ts 存 UTC，datetime('now') 也是 UTC，口径一致。
+        rows = await (await db.execute(
+            """SELECT tr.id, tr.task_id, tr.agent_slug,
+                      (julianday('now') - julianday(
+                          COALESCE((SELECT MAX(ts) FROM run_logs WHERE run_id=tr.id), tr.started_at)
+                      )) * 86400 AS idle_s
+               FROM task_runs tr
+               WHERE tr.status='running'""")).fetchall()
+    finally:
+        await db.close()
+    # 排除并发池此刻正在管理的 run（它们有自己的超时兜底，不该被巡检抢着收）。
+    # _running 存的是 run_queue.id，与 task_runs.id 不同域；这里按「静默阈值」隔离已足够：
+    # 池内在跑的 run 持续写日志、idle_s 很小，天然不会命中。故仅按 idle 阈值判定。
+    orphans = [r for r in rows if (r["idle_s"] or 0) > idle]
+    if not orphans:
+        return 0
+    affected: set[int] = set()
+    for r in orphans:
+        rid = r["id"]
+        tid = r["task_id"]
+        # 任务已收尾 → 这条 run 是其成果，落 succeeded；否则确属被中断孤儿，落 killed。
+        db = await get_connection()
+        try:
+            trow = await (await db.execute(
+                "SELECT status FROM tasks WHERE id=?", (tid,))).fetchone()
+            tstatus = trow["status"] if trow else ""
+        finally:
+            await db.close()
+        final_status = "succeeded" if tstatus in ("done", "reviewing") else "killed"
+        try:
+            # finalize_run 内部 _finish_run 无条件落终态；但巡检要幂等且不覆盖已定终态，
+            # 故先用条件更新判定是否确实还 running，命中才补记忆/pid 清理。
+            ok = await runner._finalize_if_running(rid, final_status)
+            if ok:
+                runner.clear_pid(rid)
+                runner._KILLED.discard(rid)
+                try:
+                    await runner._persist_memory(rid)
+                except Exception:  # noqa: BLE001 — 记忆善后失败不影响回收
+                    pass
+                affected.add(tid)
+        except Exception:  # noqa: BLE001 — 单条失败不阻断整轮巡检
+            pass
+    # 记活动 + 推进父任务（清掉假「执行中」后可能可收尾）
+    if affected:
+        from activity import log_activity
+        from progress import maybe_advance_parent
+        for tid in affected:
+            try:
+                trow_finished = False
+                db = await get_connection()
+                try:
+                    tr = await (await db.execute(
+                        "SELECT status FROM tasks WHERE id=?", (tid,))).fetchone()
+                    trow_finished = bool(tr and tr["status"] in ("done", "reviewing"))
+                finally:
+                    await db.close()
+                if not trow_finished:
+                    await log_activity(tid, "task_failed", "system", "",
+                                       {"note": "运行期孤儿巡检：卡「执行中」且长时间静默的记录已回收"
+                                                "（进程已不在活动），非真正在执行"})
+                await maybe_advance_parent(tid)
+            except Exception:  # noqa: BLE001
+                pass
+    return len([r for r in orphans])
+
+
+_sweep_started = False
+
+
+async def _orphan_sweep_loop():
+    """后台周期巡检循环。间隔 ORPHAN_SWEEP_INTERVAL_SEC；单轮异常不终止循环。"""
+    while True:
+        await asyncio.sleep(ORPHAN_SWEEP_INTERVAL_SEC)
+        try:
+            n = await sweep_orphan_task_runs()
+            if n:
+                print(f"[collab] 运行期孤儿巡检回收 {n} 条卡死 running", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[collab] 孤儿巡检异常（不影响循环）：{type(e).__name__}: {e}", flush=True)
+
+
 def start_loop():
     """FastAPI 启动时调用，拉起后台协同循环（幂等）。"""
-    global _loop_started
+    global _loop_started, _sweep_started
     if _loop_started:
         return
     _loop_started = True
@@ -981,5 +1087,8 @@ def start_loop():
     from executor import runner as _runner
     _runner._apply_history_limits()   # 历史回灌双限也从 Settings 生效
     asyncio.create_task(_loop())
+    if not _sweep_started:
+        _sweep_started = True
+        asyncio.create_task(_orphan_sweep_loop())   # 运行期孤儿巡检（不必等重启回收）
 
 

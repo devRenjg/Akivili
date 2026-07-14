@@ -530,6 +530,17 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
                 had_error = True
                 await _log(run_id, "stderr", ev.text)
             yield ev
+    except (GeneratorExit, __import__("asyncio").CancelledError):
+        # 🔴 生成器被中断/取消：客户端断连（event_stream 里 break→aclose）或 asyncio 任务被取消，
+        #   会在此处 yield 点抛 GeneratorExit/CancelledError，导致下方正常收尾（_finish_run）全被跳过，
+        #   task_runs 永久卡 running 成孤儿（run#183/#185 泄漏事故根因）。此处必须补落终态再让异常传播。
+        #   进程可能已死/正被杀，收尾按 killed 记；用 _finalize_if_running 幂等（不覆盖已定终态）。
+        try:
+            await _finalize_if_running(run_id, "killed")
+        finally:
+            clear_pid(run_id)
+            _RUN_CTX.pop(run_id, None)
+        raise
     except Exception as e:  # noqa: BLE001 — 兜底，绝不让执行把整个请求带崩
         had_error = True
         await _log(run_id, "stderr", f"执行异常：{type(e).__name__}: {e}")
@@ -699,6 +710,22 @@ async def _finish_run(run_id: int, status: str):
         await db.execute("UPDATE task_runs SET status=?, ended_at=datetime('now') WHERE id=?",
                          (status, run_id))
         await db.commit()
+    finally:
+        await db.close()
+
+
+async def _finalize_if_running(run_id: int, status: str) -> bool:
+    """仅当 run 仍 `running` 时补落终态（幂等）。返回是否实际落库。
+    供「生成器被中断/取消」兜底：客户端断连、asyncio 任务取消时，execute_dispatch 的正常收尾
+    （_finish_run）跑不到，task_runs 会永久卡 running 成孤儿（run#183/#185 泄漏事故）。
+    用 `WHERE status='running'` 条件更新，绝不覆盖已定终态的 run（succeeded/failed/killed 幂等安全）。"""
+    db = await get_connection()
+    try:
+        cur = await db.execute(
+            "UPDATE task_runs SET status=?, ended_at=datetime('now') WHERE id=? AND status='running'",
+            (status, run_id))
+        await db.commit()
+        return cur.rowcount > 0
     finally:
         await db.close()
 

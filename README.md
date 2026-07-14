@@ -89,6 +89,7 @@ ExecutorBackend.run(agent, prompt, project_dir, on_event) → 流式事件(SSE)
 
 - 单个 Agent 执行设超时，**按角色可配**：默认 30 分钟，数据类等长耗时角色（如经外部取数服务拉数）放宽到 60 分钟。超时即 `runner.kill_run` 杀**整棵进程树**（Windows `taskkill /F /T`，非仅父进程，否则子进程成孤儿继续跑）+ `runner.finalize_run` 主动把 `task_runs` 落成终态（生成器被取消时收尾代码跑不到，需外部补落库，杜绝孤儿 `running`）+ 记 `task_failed` 活动（以角色昵称呈现）+ 释放并发槽。卡死成员只占一个槽、到点清理，**绝不拖垮队列或留僵尸**。
 - **pid 复用防护**（杜绝 kill 误杀）：注册 pid 时同时记 `(pid, 进程创建时间)` 双因子指纹；`kill_run` 在 `taskkill /F /T` 前重校验身份——进程已退出或 pid 被 OS 复用（创建时间不符）即**拒杀**，绝不对被复用 pid 的进程树动手；run 无论正常收尾还是超时兜底都**无条件清 pid 登记**（清理挪出易抛异常的善后块），防陈旧 pid 残留后误杀无辜进程（含后端自身，曾致平台 502）。
+- **执行终态不泄漏**（孤儿双防线，覆盖直接 @ 对话路径——它无并发池超时兜底）：① 进程内中断兜底——`execute_dispatch` 捕获生成器 `GeneratorExit`/`CancelledError`（客户端断连 `aclose`/任务取消），补落终态再传播，不留 `running` 孤儿；② 运行期孤儿巡检——后台周期（默认 120s）扫 `task_runs` 里卡 `running` 但最后日志静默超阈值（默认 30 分，≥ 最长 idle 超时不误伤慢任务）的孤儿，主动补落终态（任务已收尾→succeeded 保成果、否则→killed）并推进父任务，**不必等重启**，兜底覆盖进程被硬杀等进程内代码跑不到的场景。幂等基石 `_finalize_if_running` 只在仍 `running` 时落库，绝不覆盖已定终态。
 - CLI 执行供应商默认全权限放开（跳过授权/沙箱确认、`stdin` 关交互），从源头避免 Agent 因交互提示挂起。
 
 **多层防死循环**：
@@ -222,6 +223,16 @@ JianAgency/
 > ⚠️ **安全提醒**：管理员触发 Agent 执行时为放开权限模式，Agent 能在本机改文件、跑命令。请仅在可信内网开放，妥善设置并保管管理员密码。如需真正的域名，请让内网 DNS 把名称解析到本机 IP。
 
 ## 版本记录
+
+### v0.16.19 — 2026-07-14
+- 🐛 **修复运行期孤儿泄漏——task_runs 长期假「执行中」**（能力 `agent-execution`）
+  - **背景（事故复盘）**：排查 502 时发现 run#183/#185 两条 run 从下午 14:4x「运行」到 18:0x（3.3 小时），但其最后日志停在 14:49、且它们 14:42/14:51 就已正常发出交付消息——即**任务早已干完、进程早已退出，task_runs 却一直卡 `running` 成孤儿**，直到后端重启的启动回收才补落终态。根因：**直接 @ 对话路径**（`routes/runs.py` 的 SSE 流式 dispatch）没有超时兜底——一旦 `execute_dispatch` 生成器被中断（客户端断连 `break`→生成器被丢弃、异步任务取消）或进程被硬杀，收尾落库那步跑不到，run 就永久假 running。并发池路径有 idle/hard_wall 超时兜底覆盖，这条路径没有，形成治理盲区。
+  - **Prong 1 修复（进程内中断兜底）**：`execute_dispatch` 显式捕获 `GeneratorExit`/`CancelledError`（生成器 `aclose`/任务取消时在 `yield` 点抛出，原 `except Exception` 接不住、导致收尾全跳过），补落终态（killed）+ 清 pid 后再传播；`routes/runs.py` 的 `event_stream` 改为显式持有生成器并在 `finally` 里 `aclose()`，客户端断连时确定性触发上述兜底。
+  - **Prong 2 修复（运行期孤儿巡检）**：新增 `collab.sweep_orphan_task_runs` + 后台巡检循环 `_orphan_sweep_loop`（`start_loop` 时拉起）——周期扫 `task_runs` 里卡 `running` 但最后 `run_logs.ts` 静默超阈值的孤儿，主动补落终态（任务已 done/reviewing→succeeded 保成果、否则→killed）并推进父任务，**不必等重启**。这是覆盖任何路径泄漏的真正兜底（含进程被硬杀——那时进程内代码根本跑不到）。间隔 120s / 静默阈值 1800s（≥ 最长 idle 超时，不误伤慢任务），均可配。
+  - **幂等基石**：新增 `runner._finalize_if_running`，`WHERE status='running'` 条件更新，绝不覆盖已定终态（succeeded/killed/failed）。
+  - ⚠️ **上线需重启后端**触发 `_apply_settings` 读取巡检配置并拉起巡检循环。
+  - 说明：本缺陷独立于 v0.16.18 的 pid 复用误杀——那是 kill 误杀，这是孤儿泄漏，两回事。
+  - 验证：新增 `TestReport/run_orphan_leak_probe.py` **11/11**（幂等基石、生成器中断兜底走通 execute_dispatch 全链路、运行期巡检回收+保成果+不误伤新鲜 run+幂等）；回归 QA 31/31、orphan_reclaim 13/13、concurrency 7/7、timeout_and_qa 14/14、subtask 6/6、reactivate 5/5、scheduling 10/10、mention_prompt 11/11、task_gates 10/10。
 
 ### v0.16.18 — 2026-07-14
 - 🐛 **修复陈旧 pid 复用误杀（平台 502 事故根因）**（能力 `agent-execution`）

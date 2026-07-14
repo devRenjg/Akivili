@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     # 条数上限 + 字符预算上限，取更严者。可用环境变量 AKIVILI_HISTORY_MAX_MSGS / _CHARS 覆盖。
     history_max_msgs: int = int(os.environ.get("AKIVILI_HISTORY_MAX_MSGS", "20"))
     history_max_chars: int = int(os.environ.get("AKIVILI_HISTORY_MAX_CHARS", "12000"))
+    # 运行期孤儿巡检：定期扫 task_runs 里卡 running 但最后日志已静默超阈值的孤儿，主动补落终态，
+    # 不必等下次重启的启动回收。覆盖任何路径的泄漏（含进程被硬杀——那时进程内兜底跑不到）。
+    # 巡检间隔（秒，默认 120）；静默阈值（秒，默认 1800=30分，须 ≥ 最长 idle 超时以免误伤慢但在跑的 run）。
+    orphan_sweep_interval_sec: int = int(os.environ.get("AKIVILI_ORPHAN_SWEEP_INTERVAL", "120"))
+    orphan_sweep_idle_sec: int = int(os.environ.get("AKIVILI_ORPHAN_SWEEP_IDLE", "1800"))
 
 
 def load_settings() -> Settings:
