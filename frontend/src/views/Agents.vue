@@ -274,9 +274,15 @@ onMounted(() => {
 .name { font-weight: 600; font-size: 17px; }
 .header-actions { display: flex; gap: 8px; }
 .detail-div-select { width: 200px; margin-top: 2px; }
-.card-foot { display: flex; align-items: center; gap: 8px; }
-.proj-count { font-size: 12px; color: #e6a23c; }
-.solved-count { font-size: 12px; color: #67c23a; margin-left: auto; }
+/* 底部：分类标签 + 项目数 + 任务数。允许整块换行（放不下时项目/任务数整体下移，
+   而非中文逐字拗断）；每个计数项自身 nowrap 保持完整；分类标签超长时截断防挤压。 */
+.card-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.card-foot :deep(.el-tag) { max-width: 100%; }
+.card-foot :deep(.el-tag__content) {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.proj-count { font-size: 12px; color: #e6a23c; white-space: nowrap; }
+.solved-count { font-size: 12px; color: #67c23a; white-space: nowrap; margin-left: auto; }
 .desc {
   color: #606266; font-size: 13px; line-height: 1.5; margin-bottom: 10px;
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
