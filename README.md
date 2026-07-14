@@ -222,6 +222,14 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.15 — 2026-07-14
+- ⚙️ **并发度上调 + 单任务运行闸可配置化 & 长程友好熔断**（能力 `agent-collaboration`/`agent-execution`）
+  - **并发 3→6**：`max_concurrency` 上调（config.json）。本机 Ryzen 9 9950X3D（16C/32T）+ 31GB 内存，硬件远非瓶颈，真正天花板是 CLI 上游账号的并发/token 限流，故先调至 6 观察 429。重启后端生效。
+  - **`MAX_RUNS_PER_TASK` 抽成可配置 + 放大（20→200）**：原为硬编码常量，长程项目做完整项目时会撞 20 次上限即停。现抽成 `max_runs_per_task`（config.json + 环境变量 `AKIVILI_MAX_RUNS_PER_TASK`），默认放大到 200，`_apply_settings` 启动时读取（同 max_concurrency 机制）。
+  - **熔断口径重构：单闸累计 → 双闸（总量闸 + 循环闸）**：原熔断数「任务累计 run 总数」，对长程项目天然不友好（放大总量闸=同时放大失控保险）。改为：① **总量闸** `MAX_RUNS_PER_TASK`（绝对失控最后兜底）；② **循环闸** `MAX_MENTION_CHAIN`（默认 8，可配）——专盯 Agent 互相 @ 死循环，统计任务末尾**连续的 mention 链式自动 run**（`trigger='mention'` 且 `source_run_id` 非空）。正常长程项目靠 assign/collaborate/人工重派推进，任何人工介入即打断链、清零重来，故不受循环闸误伤；而两个 Agent 互相 @ 的死循环会快速累积 mention 链，几次即掐断。人工直接 @（source 留空）不计入循环闸。
+  - ⚠️ **上线需重启后端**触发 `_apply_settings` 读取新配置值（max_concurrency=6 / max_runs_per_task=200 / max_mention_chain=8）。
+  - 验证：新增 `TestReport/run_task_gates_probe.py` **10/10**（双闸从 Settings 生效、循环闸熔断 @ 死循环、人工介入打断链清零、人工直接@不误伤、总量闸放大后长程可跑）；回归 QA 31/31、scheduling 10/10、scheduling_events 6/6、subtask 6/6、lineage 12/12、reflect 8/8。
+
 ### v0.16.14 — 2026-07-08
 - 📈 **端到端链路可观测性·阶段三 P3-3：运行时可视化时间线**（能力 `agent-collaboration`/`agent-execution`）
   - **侧边栏新增「运行时」Tab**（Skills 下方）：`/runtime` 视图，选项目 + 任务即拉出该任务（含全部子任务）的端到端执行链。

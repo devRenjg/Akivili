@@ -11,8 +11,10 @@ import re
 
 from database import get_connection
 
-# 单个任务的协同累计运行上限，防失控烧钱
-MAX_RUNS_PER_TASK = 20
+# 单任务累计 run 总量闸（绝对失控的最后兜底）。start_loop 时从 Settings 覆盖，见 _apply_settings。
+MAX_RUNS_PER_TASK = 200
+# 循环闸：连续 mention 链式自动 run 上限（防 Agent 互相 @ 死循环）。start_loop 时从 Settings 覆盖。
+MAX_MENTION_CHAIN = 8
 
 # —— 执行超时策略（A 静默超时 + B 保成果 + 硬墙钟兜底）——
 #
@@ -248,6 +250,29 @@ async def _run_count(task_id: int) -> int:
         await db.close()
 
 
+async def _mention_chain_len(task_id: int) -> int:
+    """该任务末尾「连续 mention 链式自动 run」的长度（循环闸口径）。
+
+    从最新 run 往回数，只统计 `trigger='mention' 且 source_run_id 非空`（即由另一个 run 的
+    发言 @ 触发的自动 run）；一旦遇到非此类 run（assign/collaborate/人工重派，或人工直接 @
+    的 source 留空 mention）即停止计数。含义：Agent 互相 @ 的死循环会让链持续增长，而任何
+    人工介入或负责人统筹都会打断链、清零重来——故正常长程项目不受限，只掐断纯自动 @ 循环。"""
+    db = await get_connection()
+    try:
+        rows = await (await db.execute(
+            "SELECT trigger, source_run_id FROM run_queue WHERE task_id=? ORDER BY id DESC",
+            (task_id,))).fetchall()
+    finally:
+        await db.close()
+    n = 0
+    for r in rows:
+        if r["trigger"] == "mention" and r["source_run_id"] is not None:
+            n += 1
+        else:
+            break
+    return n
+
+
 async def log_run_event(event: str, *, run_queue_id: int | None = None,
                         task_run_id: int | None = None, task_id: int | None = None,
                         agent_slug: str = "", detail: dict | None = None) -> None:
@@ -278,11 +303,20 @@ async def enqueue_run(task_id: int, agent_slug: str, prompt: str,
     source_run_id / source_message_id：因果链（谁/哪条发言触发了本次入队）。@ 触发时由
     parse_and_enqueue_mentions 透传；人工 assign / auto-dispatch 直接发起则留空。
     """
+    # 双闸熔断：① 总量闸（绝对失控兜底）② 循环闸（专掐 Agent 互相 @ 死循环，长程项目友好）。
     if await _run_count(task_id) >= MAX_RUNS_PER_TASK:
         from activity import log_activity
         await log_activity(task_id, "commented", "system", "",
-                           {"note": f"协同已达上限（{MAX_RUNS_PER_TASK} 次运行），自动停止以防失控"})
+                           {"note": f"协同已达累计上限（{MAX_RUNS_PER_TASK} 次运行），自动停止以防失控"})
         return None
+    # 循环闸只拦「本次也是 mention 链式自动触发」的入队；人工/负责人/指派入队不受此闸约束。
+    if trigger == "mention" and source_run_id is not None:
+        if await _mention_chain_len(task_id) >= MAX_MENTION_CHAIN:
+            from activity import log_activity
+            await log_activity(task_id, "commented", "system", "",
+                               {"note": f"检测到连续 {MAX_MENTION_CHAIN} 次 @ 链式自动协同"
+                                        f"（疑似循环），自动停止以防烧钱；如需继续请人工重新指派"})
+            return None
     db = await get_connection()
     try:
         # pending 去重：同一 (task, agent) 已有 queued/running 就不重复入队
@@ -664,16 +698,19 @@ _running: set = set()        # 正在跑的 run_queue id
 
 
 def _apply_settings() -> None:
-    """从 Settings 覆盖并发度 / 重试上限（config.json + 环境变量）。start_loop 时调用一次。"""
-    global MAX_CONCURRENCY, MAX_RETRY
+    """从 Settings 覆盖并发度 / 重试上限 / 任务运行闸（config.json + 环境变量）。start_loop 时调用一次。"""
+    global MAX_CONCURRENCY, MAX_RETRY, MAX_RUNS_PER_TASK, MAX_MENTION_CHAIN
     try:
         from config import load_settings
         s = load_settings()
         MAX_CONCURRENCY = max(1, int(s.max_concurrency))
         MAX_RETRY = max(0, int(s.max_retry))
+        MAX_RUNS_PER_TASK = max(1, int(s.max_runs_per_task))
+        MAX_MENTION_CHAIN = max(1, int(s.max_mention_chain))
     except Exception as e:  # noqa: BLE001 — 配置异常不阻塞启动，退回默认值
-        print(f"[collab] 读取并发/重试配置失败，用默认值 MAX_CONCURRENCY={MAX_CONCURRENCY} "
-              f"MAX_RETRY={MAX_RETRY}：{type(e).__name__}: {e}", flush=True)
+        print(f"[collab] 读取并发/重试/运行闸配置失败，用默认值 MAX_CONCURRENCY={MAX_CONCURRENCY} "
+              f"MAX_RETRY={MAX_RETRY} MAX_RUNS_PER_TASK={MAX_RUNS_PER_TASK} "
+              f"MAX_MENTION_CHAIN={MAX_MENTION_CHAIN}：{type(e).__name__}: {e}", flush=True)
 
 
 async def _claim_one() -> dict | None:

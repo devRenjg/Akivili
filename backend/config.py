@@ -53,6 +53,13 @@ class Settings(BaseSettings):
     # run 真失败（执行异常，非状态分叉伪失败、非人工 kill、非超时无交付）后的自动重试次数上限。
     # 默认 2（共最多 3 次执行）。可用环境变量 AKIVILI_MAX_RETRY 覆盖。
     max_retry: int = int(os.environ.get("AKIVILI_MAX_RETRY", "2"))
+    # 单任务累计 run 总量闸：一个任务生命周期内最多入队多少个 run（绝对失控的最后兜底）。
+    # 默认 200（原 20，为长程项目放大）。可用环境变量 AKIVILI_MAX_RUNS_PER_TASK 覆盖。
+    max_runs_per_task: int = int(os.environ.get("AKIVILI_MAX_RUNS_PER_TASK", "200"))
+    # 循环闸：该任务「连续的 mention 链式自动 run」上限（防 Agent 互相 @ 死循环烧 token）。
+    # 只要中途有 assign/collaborate/人工重派介入即清零，故正常长程项目不受限，仅掐断纯 @ 死循环。
+    # 默认 8。可用环境变量 AKIVILI_MAX_MENTION_CHAIN 覆盖。
+    max_mention_chain: int = int(os.environ.get("AKIVILI_MAX_MENTION_CHAIN", "8"))
 
 
 def load_settings() -> Settings:
