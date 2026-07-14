@@ -40,7 +40,12 @@
 
 #### Scenario: Kill 运行
 - **WHEN** 用户对运行中的执行点击 Kill
-- **THEN** 系统终止其子进程，执行状态置为 killed
+- **THEN** 系统终止其子进程（含整棵子进程树，Windows `taskkill /F /T`，避免子进程成孤儿），执行状态置为 killed
+
+#### Scenario: 陈旧 pid 不得被误杀（pid 复用防护）
+- **WHEN** 系统在 kill 前发现目标 pid 对应的进程已退出，或该 pid 已被操作系统复用给另一个进程（进程创建时间与注册时记录的指纹不符）
+- **THEN** 系统 SHALL 拒绝执行 kill 并清除该陈旧登记，绝不对被复用 pid 的进程（及其子进程树）动手
+- **注**：run 注册 pid 时同时记录 `(pid, 进程创建时间)` 双因子指纹；run 无论正常收尾还是超时兜底，SHALL 无条件清除 pid 登记，杜绝收工善后异常导致陈旧 pid 残留
 
 ### Requirement: 状态与日志监控
 

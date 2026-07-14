@@ -88,6 +88,7 @@ ExecutorBackend.run(agent, prompt, project_dir, on_event) → 流式事件(SSE)
 **卡死兜底**（保障 Agent「持续工作不卡壳」）：
 
 - 单个 Agent 执行设超时，**按角色可配**：默认 30 分钟，数据类等长耗时角色（如经外部取数服务拉数）放宽到 60 分钟。超时即 `runner.kill_run` 杀**整棵进程树**（Windows `taskkill /F /T`，非仅父进程，否则子进程成孤儿继续跑）+ `runner.finalize_run` 主动把 `task_runs` 落成终态（生成器被取消时收尾代码跑不到，需外部补落库，杜绝孤儿 `running`）+ 记 `task_failed` 活动（以角色昵称呈现）+ 释放并发槽。卡死成员只占一个槽、到点清理，**绝不拖垮队列或留僵尸**。
+- **pid 复用防护**（杜绝 kill 误杀）：注册 pid 时同时记 `(pid, 进程创建时间)` 双因子指纹；`kill_run` 在 `taskkill /F /T` 前重校验身份——进程已退出或 pid 被 OS 复用（创建时间不符）即**拒杀**，绝不对被复用 pid 的进程树动手；run 无论正常收尾还是超时兜底都**无条件清 pid 登记**（清理挪出易抛异常的善后块），防陈旧 pid 残留后误杀无辜进程（含后端自身，曾致平台 502）。
 - CLI 执行供应商默认全权限放开（跳过授权/沙箱确认、`stdin` 关交互），从源头避免 Agent 因交互提示挂起。
 
 **多层防死循环**：
@@ -221,6 +222,13 @@ JianAgency/
 > ⚠️ **安全提醒**：管理员触发 Agent 执行时为放开权限模式，Agent 能在本机改文件、跑命令。请仅在可信内网开放，妥善设置并保管管理员密码。如需真正的域名，请让内网 DNS 把名称解析到本机 IP。
 
 ## 版本记录
+
+### v0.16.18 — 2026-07-14
+- 🐛 **修复陈旧 pid 复用误杀（平台 502 事故根因）**（能力 `agent-execution`）
+  - **背景（事故复盘）**：内网访问平台突发 502。排查确认后端进程被**外部强杀**（崩溃日志无 reload 重启、无 `Shutting down`/`Finished server process` 收尾行——不是代码崩溃，是被 `taskkill /F` 级信号当场打死）。根因定位到 `runner.kill_run` 的 pid 复用漏洞：进程退出后 OS 会回收 pid 号再分配给别的进程，若注册表 `_RUN_PIDS` 残留陈旧 pid，日后 kill 会拿被复用的同号 pid 去 `taskkill /F /T`（`/T` 连整棵子进程树一起强杀），误杀无辜进程（甚至可能是后端自己重启后的新进程）。触发场景正是 task140 事故任务反复重跑成员 run。
+  - **Bug A 修复（pid 身份双因子校验）**：`register_pid` 现在存 `(pid, 进程创建时间)` 双因子指纹（Windows 用 ctypes 调 `GetProcessTimes`、零依赖不引 psutil；POSIX 读 `/proc/<pid>/stat`）。`kill_run` 在 `taskkill` 前重读该 pid 的创建时间：进程已消失（取不到）或创建时间与登记不符（pid 被复用）→ **拒杀并清登记**，绝不对被复用 pid 的进程动手。
+  - **Bug B 修复（pid 无条件清理）**：新增 `clear_pid`，正常收尾路径把 pid 清理**挪到善后 try 块之前**（原来在 `_persist_memory` 之后、被 `except` 覆盖，一旦善后抛异常 pop 就被跳过 → 陈旧 pid 残留）；`finalize_run` 同步改用 `clear_pid`。run 无论正常收尾还是超时兜底都无条件清 pid。
+  - 验证：新增 `TestReport/run_stale_pid_kill_probe.py` **12/12**（真实短命子进程验证：身份匹配的存活进程正常被杀、复用 pid/已死 pid 拒杀、clear_pid 无条件清、未知 run_id 空操作）；回归 QA 31/31、concurrency 7/7、timeout_and_qa 14/14。
 
 ### v0.16.17 — 2026-07-14
 - 🐛 **修复 @ 触发丢失发言正文（task140 事故根因）+ 历史回灌双限**（能力 `agent-collaboration`）

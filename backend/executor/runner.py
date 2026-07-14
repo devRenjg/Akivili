@@ -14,10 +14,51 @@ from executor.claude_code import ClaudeCodeBackend
 from executor.codex import CodexBackend
 from executor.api_llm import ApiLlmBackend
 
-# run_id -> pid，用于 kill
-_RUN_PIDS: dict[int, int] = {}
+# run_id -> (pid, 进程创建时间戳)，用于 kill。
+# 存创建时间是为了防「pid 复用误杀」：进程退出后 OS 会把 pid 号回收再分配给别的进程，
+# 若注册表残留陈旧 pid，日后 kill_run 用 `taskkill /F /T` 会把冒名顶替该 pid 的无辜进程
+# （甚至可能是平台后端自己重启后的新进程）连同其整棵子进程树强杀（task140 事故根因）。
+# kill 前用 (pid, 创建时间) 双因子校验目标身份，创建时间对不上即拒杀。
+_RUN_PIDS: dict[int, tuple[int, float | None]] = {}
 # 被主动 kill 的 run_id 集合，用于标记最终状态
 _KILLED: set[int] = set()
+
+
+def _proc_create_time(pid: int) -> float | None:
+    """取进程创建时间（用于 pid 身份校验，杜绝 pid 复用误杀）。取不到返回 None。
+    - Windows：ctypes 调 GetProcessTimes 拿 creation FILETIME（零依赖，不引 psutil）。
+    - POSIX：读 /proc/<pid>/stat 的 starttime（第 22 字段，单位 clock tick）。
+    None 表示无法确证身份——调用方据此保守处理（宁可不杀，不可误杀）。"""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return None
+            try:
+                creation = wintypes.FILETIME()
+                exit_t = wintypes.FILETIME()
+                kernel_t = wintypes.FILETIME()
+                user_t = wintypes.FILETIME()
+                ok = k32.GetProcessTimes(
+                    h, ctypes.byref(creation), ctypes.byref(exit_t),
+                    ctypes.byref(kernel_t), ctypes.byref(user_t))
+                if not ok:
+                    return None
+                return (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+            finally:
+                k32.CloseHandle(h)
+        else:
+            with open(f"/proc/{pid}/stat", "r") as f:
+                # 第 22 字段是 starttime；comm 可能含空格/括号，从最后一个 ')' 后切
+                data = f.read()
+                after = data[data.rfind(")") + 1:].split()
+                return float(after[19])  # starttime（(pid) comm 之后，fields 从 state 起）
+    except Exception:  # noqa: BLE001 — 拿不到就返回 None，交由调用方保守处理
+        return None
 # run_id -> 写记忆所需上下文（slug/task/prompt/起始消息id）。
 # 让「收工写记忆」无论从正常收尾还是超时兜底（finalize_run）触发，都能拿到同一份上下文，
 # 且谁先写谁 pop，天然幂等、不重复写。
@@ -102,12 +143,31 @@ JIAN_CLI_USAGE = """## 平台操作：jian CLI（唯一有效方式）
 
 
 def register_pid(run_id: int, pid: int) -> None:
-    _RUN_PIDS[run_id] = pid
+    # 注册时立刻抓创建时间做身份指纹；kill 前比对，防 pid 复用误杀。
+    _RUN_PIDS[run_id] = (pid, _proc_create_time(pid))
+
+
+def clear_pid(run_id: int) -> None:
+    """无条件清理 run 的 pid 注册（正常收尾/兜底都应调用）。
+    绝不能包在会抛异常的 try 块里——一旦漏清，陈旧 pid 残留 → 日后 kill 误杀被复用该 pid 的进程。"""
+    _RUN_PIDS.pop(run_id, None)
 
 
 def kill_run(run_id: int) -> bool:
-    pid = _RUN_PIDS.get(run_id)
-    if not pid:
+    entry = _RUN_PIDS.get(run_id)
+    if not entry:
+        return False
+    pid, reg_ctime = entry
+    # 🔴 pid 身份校验：进程退出后 pid 会被 OS 复用，注册表残留的陈旧 pid 可能已指向无辜进程。
+    #   用 (pid, 创建时间) 双因子确认目标仍是当初注册的那个进程，对不上/进程已消失 → 拒杀。
+    now_ctime = _proc_create_time(pid)
+    if now_ctime is None:
+        # 进程已不存在（或无权查询）：无需杀，也绝不能对一个可能被复用的 pid 动手。
+        _RUN_PIDS.pop(run_id, None)
+        return False
+    if reg_ctime is not None and now_ctime != reg_ctime:
+        # 创建时间变了 = 这个 pid 已是另一个进程（复用）。拒杀，清掉陈旧登记。
+        _RUN_PIDS.pop(run_id, None)
         return False
     _KILLED.add(run_id)
     try:
@@ -139,8 +199,8 @@ async def finalize_run(run_id: int, status: str) -> None:
     需外部补齐，否则 task_runs 永远卡在 running（孤儿记录）、且做完的任务不沉淀记忆。
     与 execute_dispatch 正常收尾共用 _persist_memory（谁先跑谁 pop 上下文），天然幂等、不重复写。"""
     await _finish_run(run_id, status)
+    clear_pid(run_id)  # 无条件先清 pid，避免 _persist_memory 抛异常导致陈旧 pid 残留
     await _persist_memory(run_id)
-    _RUN_PIDS.pop(run_id, None)
     _KILLED.discard(run_id)
 
 
@@ -499,6 +559,10 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
         _RUN_CTX[run_id]["stream_text"] = final_text
     # run 的成败以此处 task_runs 落库为准（run_id 已有明确 status）。
     await _finish_run(run_id, status)
+    # 🔴 pid 清理必须在善后 try 之前、无条件执行：进程此刻已退出，注册表须立即清掉，
+    #   否则一旦下面 _persist_memory 抛异常被 except 吞掉，陈旧 pid 就残留在 _RUN_PIDS，
+    #   日后 kill_run 会拿被 OS 复用的同号 pid 去 taskkill /F /T 误杀无辜进程（task140 事故根因）。
+    clear_pid(run_id)
 
     # —— 收工动作（记忆/活动/漏交付标记）——
     # 这些是「run 已定局后」的善后动作，**绝不能因它们抛异常就把已成功的 run 拖成失败**：
@@ -506,7 +570,6 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     # 故整段兜底：失败只记日志，不冒泡。
     try:
         await _persist_memory(run_id)
-        _RUN_PIDS.pop(run_id, None)
         act = {"succeeded": "task_completed", "failed": "task_failed", "killed": "task_failed"}[status]
         await log_activity(task["id"], act, "agent", agent.get("name", slug),
                            {"run_id": run_id, "summary": final_text[:120]})
