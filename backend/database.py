@@ -162,7 +162,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     pid             INTEGER,                  -- 子进程 PID，用于 kill
     started_at      TEXT DEFAULT (datetime('now')),
     ended_at        TEXT,
-    fail_reason     TEXT DEFAULT ''            -- 失败结构化归因：timeout_idle|timeout_wall|exception|killed|''（成功空）
+    fail_reason     TEXT DEFAULT ''            -- 失败结构化归因：timeout_idle|timeout_wall|exception|error_no_output|rate_limited|killed|''（成功空）
 );
 
 -- 调度流水（run 级可观测性）：入队/领取/重试/退避/失败等调度事件，与面向用户的

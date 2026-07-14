@@ -222,6 +222,14 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.16 — 2026-07-14
+- 🚦 **限流/429 命中率观测点**（能力 `agent-execution`/`agent-collaboration`）
+  - **背景**：并发调至 6 后，真正的瓶颈可能是 CLI 上游账号的并发/token 限流而非本机硬件。此前 429/限流信号藏在 CLI 子进程 error 事件文本里，代码只记 `had_error=True` 就丢弃了文本，无法区分「撞限流」与普通失败。
+  - **限流识别 + 结构化归因**：`_drive` 捕获 error 事件文本，`_is_rate_limit_error` 保守匹配 429/rate limit/overloaded/quota/usage limit/capacity/throttl/retry-after 等信号；命中且无产出 → `fail_reason` 归为新枚举值 **`rate_limited`**（区别于 `error_no_output`）。自动流入 `task_runs.fail_reason` 与 `run_events` 终态埋点，claude/codex 两个 CLI 错误路径一致。
+  - **聚合接口 `GET /runs/rate-limit-metrics?hours=N`**：统计窗口内终态 run 的 total/failed/rate_limited + 命中率（rate_limited/total）+ 失败占比（rate_limited/failed）+ 各失败归因分布。命中率高即说明瓶颈在账号侧，加并发只会更多撞 429。
+  - **运行时视图限流面板**：`/runtime` 顶部新增全局限流命中率卡——终态 run / 失败 / 限流命中 / 命中率四项，按命中率分级着色（>15% 红：建议多账号分流；>3% 橙：观察；否则绿：健康）并给行动建议，支持 1h/6h/24h/7d 窗口切换。
+  - 验证：新增 `TestReport/run_rate_limit_probe.py` **8/8**（限流信号识别不误伤、限流归因 rate_limited、普通错误归 error_no_output、metrics 聚合与命中率计算）；前端 `npm run build` 通过；回归 QA 31/31、task_gates 10/10、scheduling 10/10、scheduling_events 6/6、lineage 12/12。
+
 ### v0.16.15 — 2026-07-14
 - ⚙️ **并发度上调 + 单任务运行闸可配置化 & 长程友好熔断**（能力 `agent-collaboration`/`agent-execution`）
   - **并发 3→6**：`max_concurrency` 上调（config.json）。本机 Ryzen 9 9950X3D（16C/32T）+ 31GB 内存，硬件远非瓶颈，真正天花板是 CLI 上游账号的并发/token 限流，故先调至 6 观察 429。重启后端生效。

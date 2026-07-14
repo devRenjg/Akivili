@@ -431,3 +431,46 @@ async def get_lineage(task_id: int):
         "failed_runs": [c for c in chain if c["run_status"] == "failed"],
         "chain": chain,
     }
+
+
+@router.get("/runs/rate-limit-metrics")
+async def rate_limit_metrics(hours: int = 24):
+    """限流/429 命中率观测（判断并发是否撞上游账号限流）。
+
+    统计最近 `hours` 小时内进入终态的 run（task_runs.ended_at 落在窗口内）：
+      - total_runs：窗口内终态 run 总数
+      - failed_runs：其中失败数
+      - rate_limited_runs：失败归因为 rate_limited（撞 429/限流/overload/quota）的数量
+      - rate_limit_hit_rate：rate_limited / total_runs（占全部执行的比例）
+      - rate_limit_fail_share：rate_limited / failed_runs（占失败的比例）
+      - by_fail_reason：窗口内各失败归因分布（便于对比限流 vs 其它失败）
+    命中率高说明瓶颈在 CLI 账号侧，加并发只会更多撞 429——此时应考虑多账号分流而非加并发。
+    """
+    hours = max(1, min(int(hours), 720))   # 1h~30d
+    since = f"-{hours} hours"
+    db = await get_connection()
+    try:
+        total = (await (await db.execute(
+            "SELECT COUNT(*) c FROM task_runs WHERE ended_at IS NOT NULL "
+            "AND ended_at >= datetime('now', ?)", (since,))).fetchone())["c"]
+        failed = (await (await db.execute(
+            "SELECT COUNT(*) c FROM task_runs WHERE status='failed' AND ended_at IS NOT NULL "
+            "AND ended_at >= datetime('now', ?)", (since,))).fetchone())["c"]
+        rl = (await (await db.execute(
+            "SELECT COUNT(*) c FROM task_runs WHERE fail_reason='rate_limited' AND ended_at IS NOT NULL "
+            "AND ended_at >= datetime('now', ?)", (since,))).fetchone())["c"]
+        dist_rows = await (await db.execute(
+            "SELECT COALESCE(NULLIF(fail_reason,''),'(none)') fr, COUNT(*) c FROM task_runs "
+            "WHERE status='failed' AND ended_at IS NOT NULL AND ended_at >= datetime('now', ?) "
+            "GROUP BY fr ORDER BY c DESC", (since,))).fetchall()
+    finally:
+        await db.close()
+    return {
+        "window_hours": hours,
+        "total_runs": total,
+        "failed_runs": failed,
+        "rate_limited_runs": rl,
+        "rate_limit_hit_rate": round(rl / total, 4) if total else 0.0,
+        "rate_limit_fail_share": round(rl / failed, 4) if failed else 0.0,
+        "by_fail_reason": {r["fr"]: r["c"] for r in dist_rows},
+    }

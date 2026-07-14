@@ -16,6 +16,18 @@ MAX_RUNS_PER_TASK = 200
 # 循环闸：连续 mention 链式自动 run 上限（防 Agent 互相 @ 死循环）。start_loop 时从 Settings 覆盖。
 MAX_MENTION_CHAIN = 8
 
+# 限流/429 识别：CLI(claude/codex) 撞上游账号并发或 token 限流时，错误文本里的典型信号。
+# 命中即把 fail_reason 归为 rate_limited，供限流命中率观测（区别于普通 error_no_output）。
+_RATE_LIMIT_RE = re.compile(
+    r"\b429\b|rate[\s_-]?limit|too\s+many\s+requests|overloaded|"
+    r"quota|usage\s+limit|capacity|throttl|retry[\s_-]?after",
+    re.IGNORECASE)
+
+
+def _is_rate_limit_error(text: str) -> bool:
+    """错误文本是否为上游限流/429 信号（保守匹配 CLI/LLM 常见措辞）。"""
+    return bool(text) and bool(_RATE_LIMIT_RE.search(text))
+
 # —— 执行超时策略（A 静默超时 + B 保成果 + 硬墙钟兜底）——
 #
 # 旧策略是「固定墙钟超时」：不管在不在干活，到点就 kill+标 failed。对慢取数角色（数据工程师
@@ -533,7 +545,7 @@ async def _run_one(item: dict) -> None:
 
     collected = []
     run_id_box = {"id": None}
-    had_error = {"v": False}
+    had_error = {"v": False, "text": ""}   # text: 最近一次 error 事件文本（限流识别用）
 
     async def _drive():
         """逐事件消费执行流，返回「结束原因」：
@@ -588,6 +600,8 @@ async def _run_one(item: dict) -> None:
                     collected.append(ev.text)
                 elif ev.type == "error":
                     had_error["v"] = True
+                    if ev.text:
+                        had_error["text"] = ev.text   # 存错误文本供限流/429 归因
         finally:
             await agen.aclose()
 
@@ -596,7 +610,7 @@ async def _run_one(item: dict) -> None:
     # 失败是否属于「瞬时可重试」类（dispatch/驱动层异常、error 事件无产出）。
     # 超时无交付（idle/hard_wall grace 失败）与 kill 不在此列——重试大概率仍失败且烧墙钟。
     retriable_fail = False
-    fail_reason = ""   # 结构化失败归因：timeout_idle|timeout_wall|exception|error_no_output|''
+    fail_reason = ""   # 结构化失败归因：timeout_idle|timeout_wall|exception|error_no_output|rate_limited|''
     try:
         outcome = await _drive()
         if outcome != "normal":
@@ -618,7 +632,8 @@ async def _run_one(item: dict) -> None:
         run_status = "failed"
         retriable_fail = True   # error 事件且无产出（CLI/LLM 瞬时报错）：可重试
         if not fail_reason:
-            fail_reason = "error_no_output"
+            # 限流/429 单独归因（供命中率观测），其余归 error_no_output
+            fail_reason = "rate_limited" if _is_rate_limit_error(had_error["text"]) else "error_no_output"
 
     # 双保险（对齐 task_runs 实际结果）：execute_dispatch 内部已把本 run 的 task_runs 落终态；
     # 若那里已判 succeeded，则本 run 就是成功的——不能因收尾/善后阶段的异常在外层误判 failed，

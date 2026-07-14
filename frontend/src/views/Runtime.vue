@@ -8,6 +8,29 @@
     <el-alert type="info" :closable="false" class="tip"
       title="端到端追一条任务的完整执行链：负责人派活 → 建子任务 → 成员执行 → 汇报 → 收尾。每个 run 的排队/执行/重试/失败流水、耗时、因果来源一次拼出，替代跨表人肉拼时间线。" />
 
+    <!-- 全局限流/429 命中率观测：判断并发是否撞上游 CLI 账号限流 -->
+    <div class="rl-panel" v-if="rl">
+      <div class="rl-head">
+        <span class="rl-title">🚦 限流 / 429 命中率</span>
+        <el-select v-model="rlHours" size="small" class="rl-win" @change="loadRateLimit">
+          <el-option :value="1" label="近 1 小时" />
+          <el-option :value="6" label="近 6 小时" />
+          <el-option :value="24" label="近 24 小时" />
+          <el-option :value="168" label="近 7 天" />
+        </el-select>
+        <el-button :icon="Refresh" text size="small" @click="loadRateLimit">刷新</el-button>
+      </div>
+      <div class="rl-stats">
+        <div class="rl-stat"><span class="rl-num">{{ rl.total_runs }}</span><span class="rl-lbl">终态 run</span></div>
+        <div class="rl-stat"><span class="rl-num">{{ rl.failed_runs }}</span><span class="rl-lbl">失败</span></div>
+        <div class="rl-stat" :class="rlClass"><span class="rl-num">{{ rl.rate_limited_runs }}</span><span class="rl-lbl">限流命中</span></div>
+        <div class="rl-stat" :class="rlClass">
+          <span class="rl-num">{{ (rl.rate_limit_hit_rate * 100).toFixed(1) }}%</span><span class="rl-lbl">命中率</span>
+        </div>
+      </div>
+      <div class="rl-hint" :class="rlClass">{{ rlHint }}</div>
+    </div>
+
     <div class="toolbar">
       <el-select v-model="projectId" placeholder="选择项目" class="sel" filterable @change="onProject">
         <el-option v-for="p in projects" :key="p.id" :label="p.title" :value="p.id" />
@@ -96,10 +119,10 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Refresh } from '@element-plus/icons-vue'
-import { projectsApi, tasksApi } from '../api'
+import { projectsApi, tasksApi, runsApi } from '../api'
 import RunTranscriptDialog from '../components/RunTranscriptDialog.vue'
 
 const route = useRoute()
@@ -112,6 +135,28 @@ const taskId = ref(null)
 const data = ref(null)
 const loading = ref(false)
 const open = reactive({})
+
+// 全局限流命中率
+const rl = ref(null)
+const rlHours = ref(24)
+async function loadRateLimit() {
+  try { rl.value = await runsApi.rateLimitMetrics(rlHours.value) } catch { rl.value = null }
+}
+// 命中率分级：>15% 危险(该多账号分流)、>3% 警戒、否则健康
+const rlClass = computed(() => {
+  const r = rl.value?.rate_limit_hit_rate || 0
+  if (r > 0.15) return 'rl-bad'
+  if (r > 0.03) return 'rl-warn'
+  return 'rl-ok'
+})
+const rlHint = computed(() => {
+  if (!rl.value) return ''
+  const r = rl.value.rate_limit_hit_rate || 0
+  if (rl.value.total_runs === 0) return '窗口内暂无执行记录'
+  if (r > 0.15) return '限流命中偏高：瓶颈在 CLI 账号侧，继续加并发只会更多撞 429，建议多账号分流'
+  if (r > 0.03) return '限流偶有命中：可观察，若持续升高再考虑降并发或多账号'
+  return '限流命中低：当前并发未撞上游账号瓶颈'
+})
 
 const transcriptVisible = ref(false)
 const transcriptRunId = ref(null)
@@ -207,6 +252,7 @@ function syncQuery() {
 }
 
 onMounted(async () => {
+  loadRateLimit()
   await loadProjects()
   const qp = route.query.project ? Number(route.query.project) : null
   const qt = route.query.task ? Number(route.query.task) : null
@@ -225,6 +271,25 @@ onMounted(async () => {
 .runtime { width: 100%; }
 .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .tip { margin-bottom: 16px; }
+
+/* 全局限流命中率面板 */
+.rl-panel { background: #f7f8fa; border: 1px solid #ebeef5; border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+.rl-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.rl-title { font-weight: 600; font-size: 14px; color: #303133; }
+.rl-win { width: 130px; }
+.rl-head .el-button { margin-left: auto; }
+.rl-stats { display: flex; gap: 24px; margin-bottom: 8px; }
+.rl-stat { display: flex; flex-direction: column; gap: 2px; }
+.rl-num { font-size: 20px; font-weight: 700; color: #303133; line-height: 1.1; }
+.rl-lbl { font-size: 12px; color: #909399; }
+.rl-stat.rl-bad .rl-num { color: #f56c6c; }
+.rl-stat.rl-warn .rl-num { color: #e6a23c; }
+.rl-stat.rl-ok .rl-num { color: #67c23a; }
+.rl-hint { font-size: 12px; }
+.rl-hint.rl-bad { color: #f56c6c; }
+.rl-hint.rl-warn { color: #e6a23c; }
+.rl-hint.rl-ok { color: #909399; }
+
 .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
 .sel { width: 240px; }
 .sel-task { width: 380px; }
