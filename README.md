@@ -222,6 +222,16 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.17 — 2026-07-14
+- 🐛 **修复 @ 触发丢失发言正文（task140 事故根因）+ 历史回灌双限**（能力 `agent-collaboration`）
+  - **背景（事故复盘）**：项目 29 task140 让成员「启动服务并提交 Git」，但花火/卡芙卡等成员全部空转拒绝，理由是「当前禁止读文件、未提供启动命令」。排查确认：`parse_and_enqueue_mentions` 给被 @ 成员入队时 **prompt 硬编码传空串 `""`**，成员收不到发言正文，只能落到 `_run_one` 里「【不要探索项目、不要读任何文件、不要研究目录】」的兜底模板——于是需要读文件才能做的任务（启动服务/验收复算/提交代码）被这条约束绑死。用户从未下过「不要读文件」的约束，那是被丢失的原话所触发的系统兜底。
+  - **Bug A 修复**：`parse_and_enqueue_mentions` 新增 `_build_mention_prompt`，把「谁 @ 了你 + 发言原话 + 任务标题/描述」作为明确指令传给成员（3 个调用点均已传入完整 `text`，签名不变、无需改调用方）。成员现在收到的是用户原话，而非通用模板。
+  - **Bug B 修复**：`_run_one` 兜底模板（仅 prompt 意外为空时才用）去掉「不要读任何文件」绝对禁令，改为「需要读文件/跑命令/启动服务/提交代码/验收复算就正常去做，只是不要漫无目的通读整个代码库」，把判断权还给成员。
+  - **历史回灌双限**：`_clip_history` 从单一条数限升级为「条数 + 字符预算」双限（默认 20 条 / 12000 字符，取更严者，至少留最新 1 条），`history_max_msgs`/`history_max_chars` 可配（config.json + 环境变量），启动时 `_apply_history_limits` 生效。保证成员上下文可控、不因单条超长消息撑爆、防 lost-in-the-middle 幻觉。会话历史仍由 `execute_dispatch` 回灌，本次不引入摘要压缩（历史量实测 KB 级，双限足够）。
+  - 说明：卡芙卡/星用 Claude CLI、花火/姬子用 Codex CLI——根因是共通的 prompt 传递缺陷，非 provider 差异；Codex 只是更「听话」地服从了错误的兜底指令、放大了后果。
+  - ⚠️ **上线需重启后端**触发 `_apply_history_limits` 读取历史窗口配置。
+  - 验证：新增 `TestReport/run_mention_prompt_probe.py` **11/11**（@ 传原话+上下文、去绝对禁令、多人@各自拿到、历史双限从 Settings 生效）；回归 QA 31/31、task_gates 10/10、scheduling 10/10、lineage 12/12、subtask 6/6、reflect 8/8、rate_limit 8/8。
+
 ### v0.16.16 — 2026-07-14
 - 🚦 **限流/429 命中率观测点**（能力 `agent-execution`/`agent-collaboration`）
   - **背景**：并发调至 6 后，真正的瓶颈可能是 CLI 上游账号的并发/token 限流而非本机硬件。此前 429/限流信号藏在 CLI 子进程 error 事件文本里，代码只记 `had_error=True` 就丢弃了文本，无法区分「撞限流」与普通失败。

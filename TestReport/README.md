@@ -45,6 +45,7 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 | `run_scheduling_events_probe.py` | 6/6 | 调度流水埋点：enqueued/claimed/done 事件入 run_events、重试记 retry、失败记 failed+fail_reason=exception、流水独立于 activities（不污染成员动态） |
 | `run_task_gates_probe.py` | 10/10 | 单任务运行双闸熔断：总量闸/循环闸从 Settings 生效、mention 链达上限拒入队（防 @ 死循环）、assign/人工介入打断链清零、人工直接@（source 留空）不误伤、总量闸放大后长程任务可持续入队 |
 | `run_rate_limit_probe.py` | 8/8 | 限流/429 观测：错误文本识别（429/rate limit/overloaded/quota/retry-after，不误伤普通错误）、限流 error 无产出归因 fail_reason=rate_limited、普通错误仍归 error_no_output、/runs/rate-limit-metrics 聚合窗口内 total/failed/rate_limited + 命中率 + 失败归因分布 |
+| `run_mention_prompt_probe.py` | 11/11 | @ 触发把发言原话+任务上下文作为 prompt 传给成员（修 task140 事故：此前硬传空串→成员落「不要读任何文件」兜底模板收不到指令）、prompt 明示需要读文件/启动服务就正常做（去绝对禁令）、多人@各自拿到、_clip_history 历史回灌双限（条数+字符预算，至少留最新1条）从 Settings 生效 |
 | `run_concurrency_probe.py` | 7/7 | 并发池 MAX_CONCURRENCY 并行度、卡死 Agent 超时被 kill 不阻塞队列、慢 Agent 不饿死快 Agent |
 | `run_timeout_and_qa_probe.py` | 14/14 | 静默超时(A) + 宽限保成果(B) + 硬墙钟(C)、超时收尾验收路由 |
 | `run_subtask_autocomplete_probe.py` | 6/6 | 子任务执行完自动进 done、全子完成→父任务 reviewing、失败任务不推进 |

@@ -24,15 +24,46 @@ _KILLED: set[int] = set()
 _RUN_CTX: dict[int, dict] = {}
 
 # 会话历史回灌的滑动窗口上限：协同长 thread 全量回灌会撑爆上下文、诱发 lost-in-the-middle 幻觉。
-# 只保留最近 N 条消息（早期丢弃），够恢复近况即可；更早的靠记忆/knowhow 承载。
+# 双限（条数 + 字符预算），保证上下文可控：
+#   - _HISTORY_MAX_MSGS：最多保留最近 N 条消息（早期丢弃），够恢复近况即可。
+#   - _HISTORY_MAX_CHARS：最近若干条的总字符预算；即使未到条数上限，超预算也从最早侧继续丢，
+#     防单条超长消息把上下文撑爆。更早的靠记忆/knowhow 承载。
+# 二者启动时可被 Settings 覆盖（history_max_msgs / history_max_chars），见 _apply_history_limits。
 _HISTORY_MAX_MSGS = 20
+_HISTORY_MAX_CHARS = 12000
 
 
 def _clip_history(history: list) -> list:
-    """把回灌历史裁到最近 _HISTORY_MAX_MSGS 条（保留时间序，丢弃更早的）。"""
-    if len(history) <= _HISTORY_MAX_MSGS:
-        return history
-    return history[-_HISTORY_MAX_MSGS:]
+    """双限裁剪回灌历史（保留时间序，从最早侧丢弃）：
+      1) 条数：最多最近 _HISTORY_MAX_MSGS 条；
+      2) 字符预算：从最新往回累加 content 字符，超 _HISTORY_MAX_CHARS 即停（至少保留最新 1 条）。
+    两限取更严者，保证上下文可控、不因单条超长消息撑爆。"""
+    # 先按条数裁
+    clipped = history[-_HISTORY_MAX_MSGS:] if len(history) > _HISTORY_MAX_MSGS else list(history)
+    # 再按字符预算从最新往回收（至少留 1 条，避免空历史）
+    kept: list = []
+    total = 0
+    for msg in reversed(clipped):
+        clen = len(str(msg.get("content", "")))
+        if kept and total + clen > _HISTORY_MAX_CHARS:
+            break
+        kept.append(msg)
+        total += clen
+    kept.reverse()
+    return kept
+
+
+def _apply_history_limits() -> None:
+    """启动时从 Settings 覆盖历史回灌双限（config.json + 环境变量）。"""
+    global _HISTORY_MAX_MSGS, _HISTORY_MAX_CHARS
+    try:
+        from config import load_settings
+        s = load_settings()
+        _HISTORY_MAX_MSGS = max(1, int(s.history_max_msgs))
+        _HISTORY_MAX_CHARS = max(500, int(s.history_max_chars))
+    except Exception as e:  # noqa: BLE001 — 配置异常不阻塞启动，退回默认值
+        print(f"[runner] 读取历史窗口配置失败，用默认值 msgs={_HISTORY_MAX_MSGS} "
+              f"chars={_HISTORY_MAX_CHARS}：{type(e).__name__}: {e}", flush=True)
 
 
 # 平台 CLI 使用说明（注入所有 Agent 的系统提示，教它用 jian 在平台上真正操作）

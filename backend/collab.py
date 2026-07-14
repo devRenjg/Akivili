@@ -366,6 +366,28 @@ async def _last_run_was_leader(task_id: int, agent_slug: str) -> bool:
 
 # ---------- @mention 解析 ----------
 
+def _build_mention_prompt(text: str, task_title: str, task_desc: str) -> str:
+    """构造被 @ 成员的执行 prompt：把发言原话 + 任务上下文作为「当前明确指令」传过去。
+
+    关键：不再用「不要读任何文件」的兜底模板（那会把需要读文件/启动服务/验收的任务绑死）。
+    改为明示「需要读文件/跑命令/启动服务/提交代码就正常去做」，把判断权还给成员。
+    会话历史由 execute_dispatch 单独回灌（滑动窗口双限），此处只给当前动作指令。"""
+    brief = f"任务：{task_title}".strip()
+    if task_desc:
+        brief += f"\n任务描述：{task_desc}"
+    return (
+        f"团队成员在任务对话里 @ 了你，下面是给你的指令原话：\n\n"
+        f"「{(text or '').strip()}」\n\n"
+        f"{brief}\n\n"
+        f"上文对话历史已在你的上下文里（最近若干条），请结合历史理解来龙去脉，"
+        f"就地完成属于你的这份工作、只做你职责范围内的部分。\n"
+        f"**若任务需要读项目文件、跑命令、启动服务、提交代码或做验收复算，就正常去做**"
+        f"（这类工作本就需要接触代码/数据，不要拒绝）；只是不要漫无目的地通读整个代码库。\n"
+        f"完成后用 `jian comment \"结论\"`（长内容用 --body-file）汇报；"
+        f"要产出交付物就用 `jian subtask --title \"…\" --body-file <文件>` 建卡。"
+    )
+
+
 async def parse_and_enqueue_mentions(task_id: int, project_id: int, text: str,
                                      author_slug: str, leader_slug: str,
                                      source_run_id: int | None = None,
@@ -384,8 +406,10 @@ async def parse_and_enqueue_mentions(task_id: int, project_id: int, text: str,
     db0 = await get_connection()
     try:
         prow = await (await db0.execute(
-            "SELECT parent_task_id FROM tasks WHERE id=?", (task_id,))).fetchone()
+            "SELECT parent_task_id, title, description FROM tasks WHERE id=?", (task_id,))).fetchone()
         in_subtask = bool(prow and prow["parent_task_id"])
+        task_title = (prow["title"] if prow else "") or ""
+        task_desc = (prow["description"] if prow else "") or ""
     finally:
         await db0.close()
     db = await get_connection()
@@ -422,7 +446,11 @@ async def parse_and_enqueue_mentions(task_id: int, project_id: int, text: str,
             # 子任务内 @负责人：不唤醒（子任务是叶子工作，负责人统筹只在顶层；否则层层派生）
             if in_subtask and is_leader_run:
                 continue
-            rid = await enqueue_run(task_id, m["slug"], "", "mention", is_leader_run,
+            # 把「谁 @ 了你、原话是什么、什么任务」作为明确指令传给成员——
+            # 此前这里硬传空串，成员只能落到「不要读文件」的兜底模板、收不到发言正文（事故根因）。
+            # 会话历史已由 execute_dispatch 回灌（双限可控），此处只给「当前该做什么」的清晰指令。
+            mention_prompt = _build_mention_prompt(text, task_title, task_desc)
+            rid = await enqueue_run(task_id, m["slug"], mention_prompt, "mention", is_leader_run,
                                     source_run_id=source_run_id, source_message_id=source_message_id)
             if rid:
                 triggered.append(m["slug"])
@@ -528,14 +556,17 @@ async def _run_one(item: dict) -> None:
         # 负责人收尾汇总等带完整指令的 run：直接用该指令（maybe_advance_parent 已写清「不再派活/@」）
         prompt = item["prompt"]
     else:
-        # 成员被 @ 唤醒：开头就是强指令，禁止探索项目，直接产出并用 jian 落库
+        # 成员被 @ 唤醒：正常情况下 item["prompt"] 已由 parse_and_enqueue_mentions 带上发言原话+上下文。
+        # 仅当 prompt 意外为空时才用兜底模板——不再一刀切「禁止读文件」（那会把需要读文件/
+        # 启动服务/验收的任务绑死，见 task140 事故），改为把判断权还给成员。
         prompt = item["prompt"] or (
-            f"【立即执行，不要探索项目、不要读任何文件、不要研究目录】\n"
-            f"团队负责人在对话里 @ 了你，请你就地完成属于你的那份工作，"
-            f"完全凭你自己的角色人格与职责作答。\n\n{task_brief}\n\n"
+            f"团队成员在对话里 @ 了你，请你就地完成属于你的那份工作，"
+            f"结合上下文历史、凭你的角色职责作答。\n\n{task_brief}\n\n"
+            f"若任务需要读项目文件、跑命令、启动服务、提交代码或验收复算，就正常去做"
+            f"（不要拒绝）；只是不要漫无目的地通读整个代码库。\n"
             f"步骤：\n"
-            f"1) 若负责人要你产出一份东西（如自我介绍、你负责的方案），先把内容写进一个 .md 文件，"
-            f"再执行 `jian subtask --title \"标题\" --body-file 文件路径` 建成子任务卡片（Owner 默认是你自己）。\n"
+            f"1) 若要产出一份东西（自我介绍/方案/交付物），先写进 .md 文件，"
+            f"再 `jian subtask --title \"标题\" --body-file 文件路径` 建卡（Owner 默认你自己）。\n"
             f"2) 否则直接 `jian comment \"你的结论\"` 汇报。\n"
             f"3) 完成即结束，不要 @ 任何人（除非确实要别人接力）。")
 
@@ -947,6 +978,8 @@ def start_loop():
         return
     _loop_started = True
     _apply_settings()
+    from executor import runner as _runner
+    _runner._apply_history_limits()   # 历史回灌双限也从 Settings 生效
     asyncio.create_task(_loop())
 
 

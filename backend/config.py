@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     # 只要中途有 assign/collaborate/人工重派介入即清零，故正常长程项目不受限，仅掐断纯 @ 死循环。
     # 默认 8。可用环境变量 AKIVILI_MAX_MENTION_CHAIN 覆盖。
     max_mention_chain: int = int(os.environ.get("AKIVILI_MAX_MENTION_CHAIN", "8"))
+    # 会话历史回灌双限（保证成员上下文可控、不撑爆、防 lost-in-the-middle 幻觉）：
+    # 条数上限 + 字符预算上限，取更严者。可用环境变量 AKIVILI_HISTORY_MAX_MSGS / _CHARS 覆盖。
+    history_max_msgs: int = int(os.environ.get("AKIVILI_HISTORY_MAX_MSGS", "20"))
+    history_max_chars: int = int(os.environ.get("AKIVILI_HISTORY_MAX_CHARS", "12000"))
 
 
 def load_settings() -> Settings:
