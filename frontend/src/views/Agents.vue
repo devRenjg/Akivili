@@ -274,9 +274,11 @@ onMounted(() => {
 .name { font-weight: 600; font-size: 17px; }
 .header-actions { display: flex; gap: 8px; }
 .detail-div-select { width: 200px; margin-top: 2px; }
-.card-foot { display: flex; align-items: center; gap: 8px; }
-.proj-count { font-size: 12px; color: #e6a23c; }
-.solved-count { font-size: 12px; color: #67c23a; margin-left: auto; }
+/* 底部三项文字缩小 + 各自 nowrap，统一间隔、左对齐（与上方文本区左缘齐）：一行放下不折行 */
+.card-foot { display: flex; align-items: center; justify-content: flex-start; gap: 10px; }
+.card-foot :deep(.el-tag) { font-size: 11px; }
+.proj-count { font-size: 11px; color: #e6a23c; white-space: nowrap; }
+.solved-count { font-size: 11px; color: #67c23a; white-space: nowrap; }
 .desc {
   color: #606266; font-size: 13px; line-height: 1.5; margin-bottom: 10px;
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
