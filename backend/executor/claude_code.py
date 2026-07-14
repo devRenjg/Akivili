@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 import threading
 
-from .base import ExecutorBackend, ExecContext, ExecEvent, build_cli_prompt
+from .base import ExecutorBackend, ExecContext, ExecEvent, build_cli_prompt, _StderrDrainer
 
 
 class ClaudeCodeBackend(ExecutorBackend):
@@ -105,14 +105,17 @@ class ClaudeCodeBackend(ExecutorBackend):
             # 本次 run 内维护 tool_use_id → 工具名 的映射：
             # Claude 的 tool_result 块只带 tool_use_id、不带工具名，靠它回填出「Bash」等标签。
             tool_names: dict[str, str] = {}
+            # stderr 并发抽干（防双管道死锁，同 codex）：即便 claude stream-json 主要走 stdout，
+            # stderr 一旦写满仍会把子进程憋死、拖垮 stdout 读取。统一用独立线程抽干，杜绝隐患。
+            stderr_drainer = _StderrDrainer(proc.stderr)
             for line in proc.stdout:
                 line = line.strip()
                 if not line:
                     continue
                 for ev in _parse_line(line, tool_names):
                     loop.call_soon_threadsafe(queue.put_nowait, ev)
-            err = proc.stderr.read()
             proc.wait()
+            err = stderr_drainer.result()
             # 清理临时系统提示文件
             if _sp_path:
                 try:

@@ -47,6 +47,14 @@
 - **THEN** 系统 SHALL 拒绝执行 kill 并清除该陈旧登记，绝不对被复用 pid 的进程（及其子进程树）动手
 - **注**：run 注册 pid 时同时记录 `(pid, 进程创建时间)` 双因子指纹；run 无论正常收尾还是超时兜底，SHALL 无条件清除 pid 登记，杜绝收工善后异常导致陈旧 pid 残留
 
+### Requirement: CLI 子进程输出完整捕获
+
+对 CLI 执行后端（claude / codex），系统 SHALL 完整、无死锁地捕获子进程的 stdout 与 stderr，绝不因两个管道的读取次序而互相阻塞。
+
+#### Scenario: stderr 大量输出不阻塞 stdout 读取
+- **WHEN** CLI 子进程同时向 stdout 与 stderr 写出，且 stderr 输出量超过操作系统管道缓冲区（如 codex `--json` 把大量日志打到 stderr）
+- **THEN** 系统 SHALL 用独立读者并发抽干 stderr，使子进程不会因 stderr 缓冲写满而阻塞、进而拖住 stdout；stdout 事件 SHALL 被完整、及时地捕获，不出现「进程实际已完成却收不到其输出、被误判静默超时」
+
 ### Requirement: 执行终态不泄漏（孤儿回收）
 
 每次执行 SHALL 最终落到明确终态（succeeded / failed / killed），绝不长期滞留 `running`。系统 SHALL 通过多道防线保证：即使执行流被中断（客户端断连、异步任务取消、进程被硬杀），执行记录也不会永久卡在「执行中」。

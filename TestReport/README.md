@@ -68,6 +68,7 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 | `run_stale_pid_kill_probe.py` | 12/12 | 陈旧 pid 不得被 kill（task140 502 事故根因）：register_pid 存 (pid, 创建时间) 双因子指纹、kill_run 前校验身份（进程已退出/pid 被 OS 复用创建时间不符→拒杀，防 `taskkill /F /T` 误杀无辜进程树）、身份匹配的存活进程仍正常被杀、clear_pid 无条件清理（正常收尾路径挪出易抛异常的善后 try 块，杜绝 _persist_memory 异常导致陈旧 pid 残留）、拒杀后清登记 |
 | `run_orphan_leak_probe.py` | 11/11 | 运行期孤儿泄漏防线（run#183/#185 泄漏事故）：`_finalize_if_running` 只在仍 running 时落终态（幂等，绝不覆盖 succeeded/killed）、execute_dispatch 生成器被中断兜底（客户端断连 aclose→抛 GeneratorExit 时补落终态再传播，不留 running 孤儿 + 清 pid）、运行期巡检 `sweep_orphan_task_runs`（扫 running 且最后日志静默超阈值的孤儿主动回收：未收尾任务→killed、已 done/reviewing→succeeded 保成果、新鲜在跑的不误杀、重复巡检幂等） |
 | `run_stdout_display_probe.py` | 8/8 | CLI stdout 不落会话正文但进日志、无 jian 打标记、API 后端照落 |
+| `run_pipe_deadlock_probe.py` | 5/5 | CLI 双管道死锁防护（run#243 事故根因）：`_StderrDrainer` 并发抽干 stderr——真实子进程狂写 stderr(~200KB 撑爆管道缓冲)+ 吐 stdout 时，用 drainer 后 stdout 完整读到/stderr 完整抽干/进程正常退出全程不挂起；对照组「读完 stdout 才读 stderr」在同负载下如期死锁（超时未完成，反证 bug 真实） |
 
 ### 能力包 / Skills
 | 脚本 | 实测 | 覆盖 |

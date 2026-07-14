@@ -52,6 +52,44 @@ class ExecutorBackend:
         yield  # pragma: no cover
 
 
+class _StderrDrainer:
+    """在独立线程里持续抽干 stderr 管道，防双管道死锁（run#243 事故根因）。
+
+    CLI 子进程同时往 stdout + stderr 写。若主读取线程只读 stdout、等 stdout 读完（进程结束）
+    才 `stderr.read()`，一旦子进程先把 stderr 管道缓冲区写满（Windows 默认仅 4-8KB），它会
+    阻塞在写 stderr 上、不再写 stdout → 主线程永远读不到 stdout 下一行、也等不到进程退出 →
+    双方互等死锁，直到平台 idle 超时误杀（codex `--json` 把大量日志打到 stderr 时必现）。
+    解法：stderr 用独立线程并发抽干，两个管道各有读者，谁都不会把对方憋死。
+
+    用法：
+        drainer = _StderrDrainer(proc.stderr)   # 立即开始并发抽干
+        for line in proc.stdout: ...            # 主线程安心读 stdout，不会被 stderr 憋死
+        proc.wait()
+        err = drainer.result()                   # join 线程后取完整 stderr 文本
+    """
+    def __init__(self, pipe):
+        import threading
+        self._box: list[str] = []
+        self._pipe = pipe
+
+        def _drain():
+            try:
+                for chunk in iter(lambda: pipe.read(4096), ""):
+                    if not chunk:
+                        break
+                    self._box.append(chunk)
+            except (OSError, ValueError):
+                pass
+
+        self._thread = threading.Thread(target=_drain, daemon=True)
+        self._thread.start()
+
+    def result(self, timeout: float = 5.0) -> str:
+        """join 抽干线程并返回累计的 stderr 文本（超时兜底，不无限等）。"""
+        self._thread.join(timeout=timeout)
+        return "".join(self._box)
+
+
 def build_cli_prompt(ctx: ExecContext) -> str:
     """CLI 后端（claude/codex）不吃独立的 history 参数，故把本轮指令 + 会话历史
     拼成一段完整 prompt 文本。**本轮指令放最前**（CLI 优先执行，避免被长历史淹没），

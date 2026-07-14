@@ -224,6 +224,15 @@ JianAgency/
 
 ## 版本记录
 
+### v0.16.20 — 2026-07-14
+- 🐛 **修复 CLI 双管道死锁——Agent 干完活平台却收不到输出、被误判超时**（能力 `agent-execution`）
+  - **背景（事故复盘）**：恢复 task140 复验的 run#243（高级开发者 · Codex CLI）被平台标 killed，排查发现是**误伤**——查 Codex 自己的 rollout 会话日志，它 18:58 开工、**19:12:54 已 `task_complete` 正常结束**，还成功 `jian comment` 提交了「不放行」复验结论（消息 #432 已落库、并引爆了完整的第四轮返工协同）。但平台侧 run_logs **只收到第一行 stdout（18:58:52 开场白），之后 Codex 的 100+ 事件一条没收到**，run 一直假 `running` 到被孤儿巡检回收。
+  - **根因（双管道死锁）**：`executor/codex.py` 与 `claude_code.py` 的读取线程都是「`for line in proc.stdout` 读到进程结束，之后才 `proc.stderr.read()`」。CLI 子进程同时往 stdout+stderr 写，Codex `--json` 会把大量日志打到 stderr；一旦 stderr 管道缓冲写满（Windows 默认仅 4-8KB），子进程阻塞在写 stderr、不再吐 stdout → 平台读取线程死等 stdout 下一行、也等不到进程退出 → **双方互等死锁**，直到平台 idle 超时（30 分）误杀。
+  - **修复**：`executor/base.py` 新增 `_StderrDrainer`——子进程一启动就用**独立线程并发抽干 stderr**，主线程安心读 stdout，两个管道各有读者，谁都不会把对方憋死；进程结束后 `drainer.result()` 取完整 stderr 供报错。codex/claude 两个 CLI 后端统一接入（claude 虽主要走 stdout，同属隐患，一并根治）。
+  - 说明：这是比孤儿泄漏（v0.16.19）更上游的 bug——输出稍多的 CLI run 都会被它卡到超时误杀；v0.16.19 的孤儿巡检只是把它造成的假 running 兜底清掉，本次才是治本。
+  - ⚠️ **上线需重启后端**加载新的 CLI 读取逻辑。
+  - 验证：新增 `TestReport/run_pipe_deadlock_probe.py` **5/5**（真实子进程狂写 stderr+吐 stdout，drainer 全程不挂起/stdout 完整/stderr 抽干；对照组旧姿势在同负载下如期死锁，反证 bug 真实）；回归 QA 31/31、stdout_display 8/8、concurrency 7/7、timeout_and_qa 14/14、orphan_leak 11/11、stale_pid_kill 12/12。
+
 ### v0.16.19 — 2026-07-14
 - 🐛 **修复运行期孤儿泄漏——task_runs 长期假「执行中」**（能力 `agent-execution`）
   - **背景（事故复盘）**：排查 502 时发现 run#183/#185 两条 run 从下午 14:4x「运行」到 18:0x（3.3 小时），但其最后日志停在 14:49、且它们 14:42/14:51 就已正常发出交付消息——即**任务早已干完、进程早已退出，task_runs 却一直卡 `running` 成孤儿**，直到后端重启的启动回收才补落终态。根因：**直接 @ 对话路径**（`routes/runs.py` 的 SSE 流式 dispatch）没有超时兜底——一旦 `execute_dispatch` 生成器被中断（客户端断连 `break`→生成器被丢弃、异步任务取消）或进程被硬杀，收尾落库那步跑不到，run 就永久假 running。并发池路径有 idle/hard_wall 超时兜底覆盖，这条路径没有，形成治理盲区。

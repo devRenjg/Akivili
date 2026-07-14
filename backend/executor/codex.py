@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import threading
 
-from .base import ExecutorBackend, ExecContext, ExecEvent, build_cli_prompt
+from .base import ExecutorBackend, ExecContext, ExecEvent, build_cli_prompt, _StderrDrainer
 
 
 class CodexBackend(ExecutorBackend):
@@ -78,6 +78,10 @@ class CodexBackend(ExecutorBackend):
                 return
             if on_pid:
                 loop.call_soon_threadsafe(on_pid, proc.pid)
+            # stderr 并发抽干（防双管道死锁）：codex --json 会把大量日志打到 stderr，
+            # 若不并发读、等 stdout 读完才读 stderr，stderr 缓冲写满会把子进程憋死在写 stderr、
+            # 不再吐 stdout → 主线程读 stdout 死等到超时被误杀（run#243 事故根因）。
+            stderr_drainer = _StderrDrainer(proc.stderr)
             for line in proc.stdout:
                 line = line.strip()
                 if not line:
@@ -85,8 +89,8 @@ class CodexBackend(ExecutorBackend):
                 ev = _parse_line(line)
                 if ev:
                     loop.call_soon_threadsafe(queue.put_nowait, ev)
-            err = proc.stderr.read()
             proc.wait()
+            err = stderr_drainer.result()
             if proc.returncode != 0:
                 loop.call_soon_threadsafe(queue.put_nowait,
                                           ExecEvent("error", (err or "").strip()[:500] or f"退出码 {proc.returncode}"))
