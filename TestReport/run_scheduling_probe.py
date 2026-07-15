@@ -108,6 +108,10 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
     class _FakeSettings:
         max_concurrency = 5
         max_retry = 1
+        max_runs_per_task = 200
+        max_mention_chain = 8
+        orphan_sweep_interval_sec = 120
+        orphan_sweep_idle_sec = 1800
 
     config_mod.load_settings = lambda: _FakeSettings()
     try:

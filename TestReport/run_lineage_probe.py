@@ -179,14 +179,18 @@ async def run_probe(paths, keep):
                 summary_keys.issubset(lin.keys()) and isinstance(lin["failed_runs"], list),
                 f"缺失={summary_keys - set(lin.keys())}")
     item_keys = {
-        "run_queue_id", "task_id", "agent_slug", "trigger", "is_leader",
+        "run_queue_id", "task_id", "agent_slug", "agent_display", "trigger", "is_leader",
         "queue_status", "attempts", "enqueued_at", "task_run_id", "run_status",
         "fail_reason", "started_at", "ended_at", "duration_seconds",
         "source_run_id", "source_message_id", "events",
     }
     missing = item_keys - set(first.keys())
-    probe.check("P3-3 链路项含时间线视图所需全部字段（run 头/详情/耗时/因果）",
+    probe.check("P3-3 链路项含时间线视图所需全部字段（run 头/详情/耗时/因果/展示名）",
                 not missing, f"缺失字段={missing or '无'}")
+    # agent_display 是「昵称（角色名）」统一展示名，杜绝前端露 slug
+    probe.check("P3-3 链路项 agent_display 为展示名（非裸 slug）",
+                isinstance(first.get("agent_display"), str) and first["agent_display"] != "",
+                f"agent_display={first.get('agent_display')!r}")
     # 每条 event 需含 event/detail/ts（视图按此渲染调度流水行）
     ev = first["events"][0]
     probe.check("P3-3 调度流水项含 event/detail/ts（视图流水行渲染契约）",

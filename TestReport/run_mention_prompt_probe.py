@@ -149,6 +149,42 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
     finally:
         config_mod.load_settings = orig
 
+    # ---- Test 6: @昵称触发；只写名字不带 @ 不触发（task140/#451 停链治本口径）----
+    from database import get_connection  # noqa: PLC0415
+    db = await get_connection()
+    try:
+        cur = await db.execute(
+            "INSERT INTO tasks (project_id, title, description, status, priority, assignee_slug) "
+            "VALUES (?,?,?,?,?,?)",
+            (pid, "收口指令", "继续收口", "in_progress", "none", "specialized-project-owner"))
+        tid2 = cur.lastrowid
+        await db.commit()
+    finally:
+        await db.close()
+    # 6a: @昵称（卡芙卡）应触发后端架构师
+    trig_nick = await collab.parse_and_enqueue_mentions(
+        tid2, pid, "@卡芙卡 补映射后重出终版包", author_slug="specialized-project-owner",
+        leader_slug="specialized-project-owner", source_run_id=1001)
+    probe.check("@昵称（卡芙卡）触发对应成员（后端架构师）",
+                "engineering-backend-architect" in trig_nick, f"triggered={trig_nick}")
+
+    # 6b: 只写名字不带 @（#451 停链真因）→ 不触发任何人
+    db = await get_connection()
+    try:
+        cur = await db.execute(
+            "INSERT INTO tasks (project_id, title, description, status, priority, assignee_slug) "
+            "VALUES (?,?,?,?,?,?)",
+            (pid, "喊名字没@", "", "in_progress", "none", "specialized-project-owner"))
+        tid3 = cur.lastrowid
+        await db.commit()
+    finally:
+        await db.close()
+    trig_bare = await collab.parse_and_enqueue_mentions(
+        tid3, pid, "卡芙卡，你把终版包重出一下", author_slug="specialized-project-owner",
+        leader_slug="specialized-project-owner", source_run_id=1002)
+    probe.check("只写名字不带 @（#451 停链真因）→ 不触发任何人",
+                trig_bare == [], f"triggered={trig_bare}（应为空）")
+
     return probe
 
 

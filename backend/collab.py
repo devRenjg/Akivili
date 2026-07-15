@@ -139,7 +139,7 @@ TEAM_LEADER_PROTOCOL = """## 团队负责人协作协议
 ### 🚫 四条铁律（违反即失败）
 
 1. **绝不 @ 你自己、绝不委派给自己**。你的发言里**不许出现指向你自己的 @**。你被唤醒就是让你决策，不是让你喊自己。
-2. **只能 @ 下方「团队花名册」里真实列出的成员**，用花名册里 `委派用 @xxx` 给出的**确切名字**。**绝不允许编造、虚构、想象任何不在花名册里的成员**（不要凭领域知识杜撰角色名）。花名册里有谁，你才能点谁。
+2. **点名/委派必须带 `@` 符号 + 花名册里的确切名字**（角色名或昵称都行，如 `@后端架构师` 或 `@卡芙卡`，但**一定要有 `@`**）。**只在文字里喊名字而不带 `@`（如"卡芙卡，你来做…"）系统识别不到、没人会被唤醒，等于没派活、任务会就此停住**。**绝不允许编造、虚构任何不在花名册里的成员**。花名册里有谁，你才能 @ 谁。
 3. 需要成员出力时，**必须真的通过下面的方式点名/建卡**，让系统真正唤醒他们；不要只在文字里描述"团队有谁"就当作完成了。
 4. **只能用 `jian` 命令在平台上操作**。**绝不用 Bash/脚本/SQL 直接读写数据库、绝不用你内置的任务/待办/子代理工具（TaskCreate、TodoWrite、内置 Agent 等）来"模拟"建卡或成员**。你替成员写的内容不是他本人的产出——要成员真正干活，只能 `jian subtask --owner <成员名> --assign` 让平台唤醒他本人。
 
@@ -184,6 +184,32 @@ async def _member_names(project_id: int, exclude_slug: str = "") -> list[str]:
             continue
         names.append((r["nickname"] or r["name"] or "").strip())
     return [n for n in names if n]
+
+
+async def resolve_agent_displays(slugs) -> dict:
+    """批量把 agent slug 解析成展示名「昵称（角色名）」（无昵称则角色名，查不到则回退 slug）。
+    供 runtime/lineage 等只存 slug 的接口统一展示，杜绝页面直接露出 slug 这种「奇怪名字」。"""
+    uniq = [s for s in {(s or "").strip() for s in slugs} if s]
+    if not uniq:
+        return {}
+    db = await get_connection()
+    try:
+        ph = ",".join("?" for _ in uniq)
+        rows = await (await db.execute(
+            f"""SELECT pa.slug, pa.name, p.nickname AS nickname
+                FROM project_agents pa LEFT JOIN agent_profiles p ON p.slug = pa.slug
+                WHERE pa.slug IN ({ph})""", tuple(uniq))).fetchall()
+    finally:
+        await db.close()
+    out: dict = {}
+    for r in rows:
+        name = (r["name"] or r["slug"] or "").strip()
+        nick = (r["nickname"] or "").strip()
+        out[r["slug"]] = f"{nick}（{name}）" if nick else name
+    # 查不到的 slug 回退为自身，避免前端显示空
+    for s in uniq:
+        out.setdefault(s, s)
+    return out
 
 
 async def build_roster(project_id: int, viewer_slug: str = "") -> str:
@@ -244,7 +270,10 @@ async def build_roster(project_id: int, viewer_slug: str = "") -> str:
         tag = "（← 就是你自己）" if m["slug"] == viewer_slug else ""
         lines.append(f"- {emoji} **{who}** — {role}{tag}")
         lines.append(f"  专长：{profile_summary(m['persona'])}")
-        lines.append(f"  技能：{sk}　委派/点名用 `@{m['name']}`")
+        # 点名必须带 @ 前缀；角色名与昵称都能触发（任选其一，但一定要打 @）。
+        nick = (m["nickname"] or "").strip()
+        alias = f"`@{m['name']}`" + (f" 或 `@{nick}`" if nick else "")
+        lines.append(f"  技能：{sk}　委派/点名用 {alias}（**必须带 @ 符号**，只写名字不带 @ 不会唤醒任何人）")
     if len(members) <= 1:
         lines.append("（团队暂无其他成员）")
     return "\n".join(lines)

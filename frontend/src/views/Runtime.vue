@@ -67,7 +67,7 @@
             <div class="tl-head" @click="toggle(r.run_queue_id)">
               <span class="caret">{{ open[r.run_queue_id] ? '▾' : '▸' }}</span>
               <el-tag v-if="r.is_leader" size="small" type="warning" effect="dark" class="chip">负责人</el-tag>
-              <span class="slug">{{ r.agent_slug || '—' }}</span>
+              <span class="slug">{{ r.agent_display || r.agent_slug || '—' }}</span>
               <el-tag size="small" effect="plain" class="chip">{{ triggerCn(r.trigger) }}</el-tag>
               <el-tag size="small" :type="statusType(r)" effect="light" class="chip">{{ statusCn(r) }}</el-tag>
               <el-tag v-if="r.fail_reason" size="small" type="danger" effect="plain" class="chip">{{ failCn(r.fail_reason) }}</el-tag>

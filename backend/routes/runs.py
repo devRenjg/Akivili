@@ -357,6 +357,8 @@ async def get_transcript(run_id: int):
                 prov_label = "（供应商已删除）"
         meta = {
             "run_id": m["id"], "task_id": m["task_id"], "agent_slug": m["agent_slug"],
+            "agent_display": (await collab.resolve_agent_displays([m["agent_slug"]])).get(
+                m["agent_slug"], m["agent_slug"]),
             "status": m["status"], "provider_id": pid_str, "provider_label": prov_label,
             "started_at": to_beijing(m["started_at"]), "ended_at": to_beijing(m["ended_at"]),
         }
@@ -412,6 +414,9 @@ async def get_lineage(task_id: int):
         events_by_rq.setdefault(e["run_queue_id"], []).append(
             {"event": e["event"], "detail": e["detail"], "ts": to_beijing(e["ts"])})
 
+    # 统一展示名：slug → 「昵称（角色名）」，杜绝前端露 slug
+    displays = await collab.resolve_agent_displays([q["agent_slug"] for q in qrows])
+
     chain = []
     total_run_seconds = 0.0
     for q in qrows:
@@ -421,6 +426,7 @@ async def get_lineage(task_id: int):
             total_run_seconds += dur
         chain.append({
             "run_queue_id": d["rq_id"], "task_id": d["task_id"], "agent_slug": d["agent_slug"],
+            "agent_display": displays.get(d["agent_slug"], d["agent_slug"]),
             "trigger": d["trigger"], "is_leader": bool(d["is_leader"]),
             "queue_status": d["queue_status"], "attempts": d["attempts"],
             "enqueued_at": to_beijing(d["enqueued_at"]),

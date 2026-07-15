@@ -103,38 +103,40 @@ async def run_probe(paths):
             yield _Ev("text", f"chunk{i}")
         # 之后自然结束
         return
-    # monkeypatch：极小 hard_wall / 大 idle（不静默），活性探测应触发续期
     orig_hard = collab._hard_wall; orig_idle = collab._idle_timeout
-    collab._hard_wall = lambda slug: 0  # 硬墙钟立刻到点，每轮都触发活性探测
-    collab._idle_timeout = lambda slug: 5  # idle 足够大，事件不断→不静默
     ext_notes = []
     async def fake_log(tid, action, atype, aname, detail):
         if isinstance(detail, dict) and "续期" in str(detail.get("note","")): ext_notes.append(detail)
     import activity as _act
     orig_actlog = _act.log_activity; _act.log_activity = fake_log
-    # 直接测 _drive 的续期分支：借 _run_one 内部逻辑不便，单测一个等价 mini-driver
-    # 复用真实 _drive 需要完整 task/agent 上下文，这里改测「续期日志被触发」这一可观察行为：
-    # 用一个精简驱动复刻 _drive 的硬墙钟活性探测语义。
+    # 用一个精简驱动复刻 _drive 的硬墙钟活性探测语义（collab.py:663-685）：
+    # 硬墙钟检查在循环顶部，produced_since_wall 初始 False；正的硬墙钟下首个事件必先被消费。
+    # 为确定性复现「跨墙时仍在产出 → 续期」，用可控假时钟：每消费一个事件推进 1 个刻度，
+    # 硬墙钟设为 2 刻度 → 消费到第 3 个事件时跨墙且 produced=True → 续期；生成器耗尽 → normal。
     async def mini_drive():
-        import time as _t
-        idle=collab._idle_timeout("x"); hard=collab._hard_wall("x")
-        start=_t.monotonic(); produced=False; ext=0
-        agen=gen_forever()
+        hard = 2         # 正的硬墙钟（刻度），非 0，忠实于真实语义
+        idle = 999       # idle 足够大→事件不断永不静默
+        clock = {"t": 0.0}
+        def now(): return clock["t"]
+        start = now(); produced = False; ext = 0
+        agen = gen_forever()
         try:
             while True:
-                if _t.monotonic()-start>hard:
-                    if produced:
-                        ext+=1; produced=False; start=_t.monotonic()
-                        await _act.log_activity(btask,"commented","system","",{"note":f"⏱️ 数据工程师 长跑续期（第 {ext} 次）"})
+                if now() - start > hard:
+                    if produced:                       # 活性探测：本周期有产出 → 续期
+                        ext += 1; produced = False; start = now()
+                        await _act.log_activity(btask, "commented", "system", "",
+                                                {"note": f"⏱️ 数据工程师 长跑续期（第 {ext} 次）"})
                         continue
-                    return ("hard_wall", ext)
+                    return ("hard_wall", ext)          # 跨墙且本周期无产出 → 收尾
                 try:
-                    ev=await asyncio.wait_for(agen.__anext__(), timeout=idle)
+                    ev = await asyncio.wait_for(agen.__anext__(), timeout=idle)
                 except StopAsyncIteration:
                     return ("normal", ext)
                 except asyncio.TimeoutError:
                     return ("idle_timeout", ext)
-                produced=True
+                produced = True
+                clock["t"] += 1.0                      # 消费一个事件 = 推进一个时间刻度
         finally:
             await agen.aclose()
     d_outcome, d_ext = await mini_drive()
