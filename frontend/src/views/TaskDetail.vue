@@ -479,6 +479,7 @@ function relTime(ts) {
 }
 
 // 动态折叠
+const FOLD_WINDOW = 1   // 滑动窗口：默认只展开最后 1 条消息，其余默认折叠
 const folded = ref({})
 function isFolded(i) { return !!folded.value[i] }
 function toggleFold(i) { folded.value[i] = !folded.value[i] }
@@ -489,6 +490,27 @@ function toggleFoldAll() {
   const nf = {}
   timeline.value.forEach((it, i) => { if (it.kind === 'message') nf[i] = allFolded.value })
   folded.value = nf
+}
+
+// 折叠默认策略：进入任务时按滑动窗口——最近 FOLD_WINDOW 条消息默认展开、更早的默认折叠；
+// 消息数 ≤ 窗口则全展开。仅对「尚未处理过的消息索引」套默认值，用户手动折叠/展开的保留；
+// 轮询新增的消息在窗口末端（最新），默认展开，符合窗口语义。
+let foldProcessedLen = 0
+function applyFoldDefaults() {
+  const tl = timeline.value
+  if (tl.length <= foldProcessedLen) return    // 无新增，别动用户已有的折叠态
+  // 全部消息索引（含历史）；窗口作用于「全体消息」，保证进入时只有最近 N 条展开
+  const msgIdxs = []
+  tl.forEach((it, i) => { if (it.kind === 'message') msgIdxs.push(i) })
+  const keepOpen = new Set(msgIdxs.slice(-FOLD_WINDOW))   // 最近 N 条展开
+  const nf = { ...folded.value }
+  for (let i = foldProcessedLen; i < tl.length; i++) {
+    if (tl[i].kind !== 'message') continue
+    nf[i] = !keepOpen.has(i)    // 不在窗口内 → 折叠
+  }
+  folded.value = nf
+  foldProcessedLen = tl.length
+  allFolded.value = msgIdxs.length > 0 && msgIdxs.every((i) => nf[i])
 }
 
 // 打开某个任务详情（子任务也是正常任务，有独立详情页）
@@ -575,7 +597,10 @@ async function loadAll() {
     loading.value = false
   }
 }
-async function loadTimeline() { timeline.value = (await tasksApi.activities(pid, taskId)).timeline }
+async function loadTimeline() {
+  timeline.value = (await tasksApi.activities(pid, taskId)).timeline
+  applyFoldDefaults()
+}
 async function loadSubtasks() { subtasks.value = (await tasksApi.subtasks(pid, taskId)).subtasks }
 async function loadRuns() { runs.value = (await tasksApi.runs(taskId)).runs }
 async function loadProgress() {
@@ -692,6 +717,10 @@ watch(() => route.params.taskId, (nv) => {
   stopPolling()
   pid = Number(route.params.id)
   taskId = nid
+  // 切到另一张任务卡：重置折叠态，让新任务按滑动窗口重新初始化
+  folded.value = {}
+  foldProcessedLen = 0
+  allFolded.value = false
   loadAll()
 })
 

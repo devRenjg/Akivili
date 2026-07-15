@@ -383,10 +383,10 @@ onBeforeUnmount(() => { if (ovTimer) clearInterval(ovTimer) })
 .ov-stat.live .ov-num { color: #e6a23c; }
 
 .ov-group { margin-top: 10px; }
-.ov-gtitle { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: #606266; margin-bottom: 8px; }
+.ov-gtitle { display: flex; align-items: center; gap: 6px; font-size: 16px; font-weight: 600; color: #606266; margin-bottom: 8px; }
 .ov-gtitle.clickable { cursor: pointer; user-select: none; width: fit-content; }
 .ov-gtitle.clickable:hover { color: #303133; }
-.ov-caret { color: #c0c4cc; font-size: 12px; width: 12px; }
+.ov-caret { color: #c0c4cc; font-size: 14px; width: 14px; }
 .dot-live { width: 8px; height: 8px; border-radius: 50%; background: #e6a23c; box-shadow: 0 0 0 3px rgba(230,162,60,.18); }
 .dot-idle { width: 8px; height: 8px; border-radius: 50%; background: #c0c4cc; }
 
