@@ -9,10 +9,11 @@
           <el-select v-model="ovDaysPreset" size="small" class="ov-win" @change="onPreset">
             <el-option :value="30" label="最近一个月" />
             <el-option :value="180" label="最近半年" />
+            <el-option :value="365" label="最近一年" />
             <el-option :value="'custom'" label="自定义天数" />
           </el-select>
           <el-input-number v-if="ovDaysPreset === 'custom'" v-model="ovDaysCustom" size="small"
-            :min="1" :max="100" :step="1" controls-position="right" class="ov-days" @change="onCustomDays" />
+            :min="1" :max="365" :step="1" controls-position="right" class="ov-days" @change="onCustomDays" />
           <el-button :icon="Refresh" text size="small" @click="loadOverview" :loading="ovLoading">刷新</el-button>
         </div>
       </div>
@@ -185,7 +186,7 @@ let ovTimer = null
 // 生效窗口天数：预设直接用其值，自定义用输入框（clamp 1~100）
 function ovDays() {
   if (ovDaysPreset.value === 'custom') {
-    return Math.min(100, Math.max(1, Number(ovDaysCustom.value) || 1))
+    return Math.min(365, Math.max(1, Number(ovDaysCustom.value) || 1))
   }
   return ovDaysPreset.value
 }

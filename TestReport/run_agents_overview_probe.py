@@ -172,9 +172,9 @@ async def run_probe(paths, keep):
     probe.check("window_days=180 总时长含 40 天前那条（10+20+100=130）",
                 abs(st180["total_run_seconds"] - 130) < 1.0,
                 f"total_run_seconds={st180['total_run_seconds']}")
-    probe.check("days 参数越界被 clamp（0→1，10000→3650）",
+    probe.check("days 参数越界被 clamp（0→1，10000→365，上限为最近一年）",
                 (await runs_route.agents_overview(days=0))["window_days"] == 1
-                and (await runs_route.agents_overview(days=10000))["window_days"] == 3650,
+                and (await runs_route.agents_overview(days=10000))["window_days"] == 365,
                 "clamp 生效")
 
     # --- running：正在运行的 Agent，带项目/任务 + 展示名 ---

@@ -503,9 +503,9 @@ async def agents_overview(days: int = 30):
     - idle：启用中的团队成员里，此刻没有 running run 的，显示为 idle。**实时态，不受窗口影响。**
       身份粒度为 (project_id, slug)——同一花名册成员在不同项目算不同在岗实例。
 
-    `days`：时间窗口天数，clamp 到 1..3650（覆盖最近一个月=30、最近半年=180，及用户自填）。
+    `days`：时间窗口天数，clamp 到 1..365（覆盖最近一个月=30、最近半年=180、最近一年=365，及用户自填）。
     """
-    days = max(1, min(int(days), 3650))
+    days = max(1, min(int(days), 365))
     since = f"-{days} days"
     db = await get_connection()
     try:
