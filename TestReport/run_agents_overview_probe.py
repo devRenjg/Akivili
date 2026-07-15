@@ -92,10 +92,33 @@ async def _mk_run(task_id, slug, status):
     from database import get_connection
     db = await get_connection()
     try:
-        started = "datetime('now')"
         c = await db.execute(
-            f"INSERT INTO task_runs (task_id, agent_slug, provider_id, status, started_at) "
-            f"VALUES (?,?,?,?,{started})", (task_id, slug, "p", status))
+            "INSERT INTO task_runs (task_id, agent_slug, provider_id, status, started_at) "
+            "VALUES (?,?,?,?, datetime('now'))", (task_id, slug, "p", status))
+        rid = c.lastrowid
+        await db.commit()
+        return rid
+    finally:
+        await db.close()
+
+
+async def _mk_run_at(task_id, slug, status, started_offset, dur_seconds=None):
+    """建一个 task_runs 行，started_at = now + started_offset（如 '-40 days'）；
+    dur_seconds 给定时 ended_at = started_at + 该秒数。用于测窗口过滤与总时长。"""
+    from database import get_connection
+    db = await get_connection()
+    try:
+        if dur_seconds is not None:
+            ended = f"datetime('now', ?, '+{int(dur_seconds)} seconds')"
+            c = await db.execute(
+                f"INSERT INTO task_runs (task_id, agent_slug, provider_id, status, started_at, ended_at) "
+                f"VALUES (?,?,?,?, datetime('now', ?), {ended})",
+                (task_id, slug, "p", status, started_offset, started_offset))
+        else:
+            c = await db.execute(
+                "INSERT INTO task_runs (task_id, agent_slug, provider_id, status, started_at) "
+                "VALUES (?,?,?,?, datetime('now', ?))",
+                (task_id, slug, "p", status, started_offset))
         rid = c.lastrowid
         await db.commit()
         return rid
@@ -110,28 +133,49 @@ async def run_probe(paths, keep):
 
     ids = await seed(paths)
 
-    # 造历史：甲 top 上后端架构师一条成功、一条失败（累计 stats 口径）
-    await _mk_run(ids["top_a"], "engineering-backend-architect", "succeeded")
-    await _mk_run(ids["top_a"], "engineering-frontend-developer", "failed")
-    # 造实时：甲子任务上后端架构师「正在运行」
+    # 造窗口内历史：甲 top 上后端架构师一条成功(时长10s)、一条失败(时长20s)
+    await _mk_run_at(ids["top_a"], "engineering-backend-architect", "succeeded", "-1 days", dur_seconds=10)
+    await _mk_run_at(ids["top_a"], "engineering-frontend-developer", "failed", "-2 days", dur_seconds=20)
+    # 造窗口外历史：40 天前一条成功(时长100s)——默认 30 天窗口应排除，扩到 180 天应计入
+    await _mk_run_at(ids["top_a"], "qa-test-engineer", "succeeded", "-40 days", dur_seconds=100)
+    # 造实时：甲子任务上后端架构师「正在运行」（无 ended_at，不计入总时长）
     running_rid = await _mk_run(ids["sub_a"], "engineering-backend-architect", "running")
 
-    ov = await runs_route.agents_overview()
+    ov = await runs_route.agents_overview()   # 默认 30 天
 
-    # --- stats：累计口径，不含限流字段 ---
+    # --- stats：窗口口径（默认 30 天），不含限流字段 ---
     st = ov.get("stats", {})
-    probe.check("stats 含 total_runs/failed_runs/distinct_agents",
-                {"total_runs", "failed_runs", "distinct_agents"}.issubset(st.keys()),
+    probe.check("stats 含 total_runs/failed_runs/distinct_agents/total_run_seconds",
+                {"total_runs", "failed_runs", "distinct_agents", "total_run_seconds"}.issubset(st.keys()),
                 f"keys={sorted(st.keys())}")
-    probe.check("total_runs 计入全部 run（3 条：成功+失败+运行中）",
+    probe.check("默认窗口 window_days=30",
+                ov.get("window_days") == 30, f"window_days={ov.get('window_days')}")
+    probe.check("total_runs 计入 30 天窗口内 run（成功+失败+运行中=3，排除40天前那条）",
                 st.get("total_runs") == 3, f"total_runs={st.get('total_runs')}")
-    probe.check("failed_runs 只计失败（1 条）",
+    probe.check("failed_runs 只计窗口内失败（1 条）",
                 st.get("failed_runs") == 1, f"failed_runs={st.get('failed_runs')}")
-    probe.check("distinct_agents 去重（后端架构师+前端=2）",
+    probe.check("distinct_agents 去重窗口内（后端架构师+前端=2，排除40天前的测试）",
                 st.get("distinct_agents") == 2, f"distinct_agents={st.get('distinct_agents')}")
+    probe.check("total_run_seconds 为窗口内已结束 run 时长和（10+20=30，运行中/窗口外不计）",
+                abs(st.get("total_run_seconds", 0) - 30) < 1.0,
+                f"total_run_seconds={st.get('total_run_seconds')}")
     probe.check("不再暴露限流/429 字段（rate_limit* / by_fail_reason 已移除）",
                 not any(k in ov for k in ("rate_limited_runs", "rate_limit_hit_rate", "by_fail_reason")),
                 f"顶层键={sorted(ov.keys())}")
+
+    # --- 时间窗口筛选：扩到 180 天应把 40 天前那条计入 ---
+    ov180 = await runs_route.agents_overview(days=180)
+    st180 = ov180["stats"]
+    probe.check("window_days=180 时把 40 天前的 run 计入（total_runs=4）",
+                ov180.get("window_days") == 180 and st180["total_runs"] == 4,
+                f"window_days={ov180.get('window_days')} total_runs={st180['total_runs']}")
+    probe.check("window_days=180 总时长含 40 天前那条（10+20+100=130）",
+                abs(st180["total_run_seconds"] - 130) < 1.0,
+                f"total_run_seconds={st180['total_run_seconds']}")
+    probe.check("days 参数越界被 clamp（0→1，10000→3650）",
+                (await runs_route.agents_overview(days=0))["window_days"] == 1
+                and (await runs_route.agents_overview(days=10000))["window_days"] == 3650,
+                "clamp 生效")
 
     # --- running：正在运行的 Agent，带项目/任务 + 展示名 ---
     run = ov.get("running", [])

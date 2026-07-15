@@ -46,7 +46,7 @@
 
 ### Requirement: 实时 Agent 总览
 
-系统 SHALL 提供一个全局实时视角，展示当前正在运行的 Agent 与空闲 Agent，与「按任务筛选查看历史执行链路」并存（后者用于事后复盘，前者不取代它）。运行态以 `task_runs.status='running'` 为准（覆盖并发池与直接 @ 两条执行路径）。在岗身份粒度为 `(project_id, slug)`——同一成员在不同项目视为不同在岗实例。正在运行与空闲两个分区 SHALL 互斥。总览 SHALL 同时给出累计口径大数字（跑过的 run 数、失败数、涉及的去重 Agent 数）。
+系统 SHALL 提供一个全局实时视角，展示当前正在运行的 Agent 与空闲 Agent，与「按任务筛选查看历史执行链路」并存（后者用于事后复盘，前者不取代它）。运行态以 `task_runs.status='running'` 为准（覆盖并发池与直接 @ 两条执行路径）。在岗身份粒度为 `(project_id, slug)`——同一成员在不同项目视为不同在岗实例。正在运行与空闲两个分区 SHALL 互斥。总览 SHALL 同时给出可按时间窗口筛选的累计口径大数字（跑过的 run 数、失败数、涉及的去重 Agent 数、所有 Agent 累计运行总时长）。
 
 #### Scenario: 正在运行的 Agent
 - **WHEN** 某 Agent 正在执行（其 `task_runs` 行处于 running）
@@ -56,9 +56,13 @@
 - **WHEN** 某启用中的团队成员此刻没有任何 running run
 - **THEN** 总览的 idle 分区列出该在岗实例并标为 idle；禁用成员不出现；同一 slug 在其它项目有运行不影响本项目实例判定为空闲
 
-#### Scenario: 累计大数字始终展示
+#### Scenario: 累计大数字与运行总时长
 - **WHEN** 打开运行时总览
-- **THEN** 展示历史累计的运行 run 数、失败数与去重 Agent 数（不含限流/429 相关指标）
+- **THEN** 展示所选时间窗口内的运行 run 数、失败数、去重 Agent 数，以及所有 Agent 累计运行总时长（已结束 run 的 `ended_at - started_at` 求和）；不含限流/429 相关指标
+
+#### Scenario: 累计口径按时间窗口筛选
+- **WHEN** 用户选择时间窗口（最近一个月、最近半年，或自填天数，范围 1..100）
+- **THEN** 累计大数字按 run 的开始时间落在该窗口内重新统计；实时的 running / idle 分区不受时间窗口影响
 
 ### Requirement: 并发池调度
 

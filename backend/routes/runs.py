@@ -492,24 +492,41 @@ async def rate_limit_metrics(hours: int = 24):
 
 
 @router.get("/runs/agents-overview")
-async def agents_overview():
+async def agents_overview(days: int = 30):
     """实时 Agent 总览：与「按任务筛选看历史链路」并存，提供一个全局实时视角。
 
-    - stats：累计口径——历史上跑过多少个 run、多少失败、涉及多少个（去重）Agent。
-      不再暴露限流/429（暂无需求）；总数字保留供体量感知。
+    - stats：选定时间窗口（最近 `days` 天，按 run 的 started_at 过滤）内的累计口径——
+      跑过多少个 run、多少失败、涉及多少个（去重）Agent、所有 Agent 累计运行总时长
+      （已结束 run 的 ended_at-started_at 求和，秒）。不暴露限流/429（暂无需求）。
     - running：当前正在执行的 Agent（task_runs.status='running'，覆盖并发池 + 直接 @ 两条
-      路径），带项目/任务信息与开始时间。
-    - idle：启用中的团队成员里，此刻没有 running run 的，显示为 idle。
+      路径），带项目/任务信息与开始时间。**实时态，不受时间窗口影响。**
+    - idle：启用中的团队成员里，此刻没有 running run 的，显示为 idle。**实时态，不受窗口影响。**
       身份粒度为 (project_id, slug)——同一花名册成员在不同项目算不同在岗实例。
+
+    `days`：时间窗口天数，clamp 到 1..3650（覆盖最近一个月=30、最近半年=180，及用户自填）。
     """
+    days = max(1, min(int(days), 3650))
+    since = f"-{days} days"
     db = await get_connection()
     try:
+        # 累计 stats：限定 started_at 落在最近 days 天内
         total_runs = (await (await db.execute(
-            "SELECT COUNT(*) c FROM task_runs")).fetchone())["c"]
+            "SELECT COUNT(*) c FROM task_runs "
+            "WHERE started_at IS NOT NULL AND started_at >= datetime('now', ?)",
+            (since,))).fetchone())["c"]
         failed_runs = (await (await db.execute(
-            "SELECT COUNT(*) c FROM task_runs WHERE status='failed'")).fetchone())["c"]
+            "SELECT COUNT(*) c FROM task_runs "
+            "WHERE status='failed' AND started_at IS NOT NULL AND started_at >= datetime('now', ?)",
+            (since,))).fetchone())["c"]
         distinct_agents = (await (await db.execute(
-            "SELECT COUNT(DISTINCT agent_slug) c FROM task_runs")).fetchone())["c"]
+            "SELECT COUNT(DISTINCT agent_slug) c FROM task_runs "
+            "WHERE started_at IS NOT NULL AND started_at >= datetime('now', ?)",
+            (since,))).fetchone())["c"]
+        # 累计运行总时长：已结束 run 的 (ended_at - started_at) 求和（秒）
+        total_seconds = (await (await db.execute(
+            "SELECT COALESCE(SUM((julianday(ended_at) - julianday(started_at)) * 86400), 0) s "
+            "FROM task_runs WHERE ended_at IS NOT NULL AND started_at IS NOT NULL "
+            "AND started_at >= datetime('now', ?)", (since,))).fetchone())["s"]
 
         # 正在运行：task_runs.status='running' → 关联任务、项目
         run_rows = await (await db.execute(
@@ -562,10 +579,12 @@ async def agents_overview():
         })
 
     return {
+        "window_days": days,
         "stats": {
             "total_runs": total_runs,
             "failed_runs": failed_runs,
             "distinct_agents": distinct_agents,
+            "total_run_seconds": round(total_seconds, 1),
         },
         "running_count": len(running),
         "idle_count": len(idle),
