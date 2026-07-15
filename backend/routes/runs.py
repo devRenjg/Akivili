@@ -492,7 +492,7 @@ async def rate_limit_metrics(hours: int = 24):
 
 
 @router.get("/runs/agents-overview")
-async def agents_overview(days: int = 7):
+async def agents_overview(days: int = 30):
     """实时 Agent 总览：与「按任务筛选看历史链路」并存，提供一个全局实时视角。
 
     - stats：选定时间窗口（最近 `days` 天，按 run 的 started_at 过滤）内的累计口径——

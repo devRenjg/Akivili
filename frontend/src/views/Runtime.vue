@@ -30,8 +30,11 @@
       <div class="ov-win-note">累计口径为最近 {{ ov.window_days }} 天（按 run 开始时间过滤）；下方运行中/空闲为实时状态，不受窗口影响</div>
       <!-- 正在运行 -->
       <div class="ov-group">
-        <div class="ov-gtitle"><span class="dot-live"></span>正在运行（{{ ov.running_count }}）</div>
-        <div v-if="ov.running.length" class="ov-list">
+        <div class="ov-gtitle clickable" @click="runningOpen = !runningOpen">
+          <span class="ov-caret">{{ runningOpen ? '▾' : '▸' }}</span>
+          <span class="dot-live"></span>正在运行（{{ ov.running_count }}）
+        </div>
+        <div v-if="runningOpen && ov.running.length" class="ov-list">
           <div v-for="r in ov.running" :key="r.task_run_id" class="ov-row running"
                @click="jumpLineage(r.project_id, r.task_id)">
             <span class="ov-pulse"></span>
@@ -44,12 +47,15 @@
             <span class="ov-row-state running">运行中</span>
           </div>
         </div>
-        <el-empty v-else :image-size="48" description="当前没有正在运行的 Agent" />
+        <el-empty v-else-if="runningOpen" :image-size="48" description="当前没有正在运行的 Agent" />
       </div>
       <!-- 空闲 -->
       <div class="ov-group">
-        <div class="ov-gtitle"><span class="dot-idle"></span>空闲（{{ ov.idle_count }}）</div>
-        <div v-if="ov.idle.length" class="ov-list">
+        <div class="ov-gtitle clickable" @click="idleOpen = !idleOpen">
+          <span class="ov-caret">{{ idleOpen ? '▾' : '▸' }}</span>
+          <span class="dot-idle"></span>空闲（{{ ov.idle_count }}）
+        </div>
+        <div v-if="idleOpen && ov.idle.length" class="ov-list">
           <div v-for="a in ov.idle" :key="a.project_id + ':' + a.agent_slug" class="ov-row idle"
                @click="jumpProject(a.project_id)">
             <span class="ov-dot-idle"></span>
@@ -60,7 +66,7 @@
             <span class="ov-row-state idle">idle</span>
           </div>
         </div>
-        <el-empty v-else :image-size="48" description="没有空闲成员" />
+        <el-empty v-else-if="idleOpen" :image-size="48" description="没有空闲成员" />
       </div>
     </div>
 
@@ -181,7 +187,9 @@ const open = reactive({})
 const OV_REFRESH_SEC = 10
 const ov = ref(null)
 const ovLoading = ref(false)
-const ovDaysPreset = ref(7)      // 默认最近一周；7/30/180/365/'custom'=自填
+const runningOpen = ref(true)    // 运行中默认展开
+const idleOpen = ref(false)      // 空闲默认折叠，可手动展开
+const ovDaysPreset = ref(30)     // 默认最近一个月；7/30/180/365/'custom'=自填
 const ovDaysCustom = ref(7)      // 自定义天数，1~100
 let ovTimer = null
 // 生效窗口天数：预设直接用其值，自定义用输入框（clamp 1~100）
@@ -376,6 +384,9 @@ onBeforeUnmount(() => { if (ovTimer) clearInterval(ovTimer) })
 
 .ov-group { margin-top: 10px; }
 .ov-gtitle { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: #606266; margin-bottom: 8px; }
+.ov-gtitle.clickable { cursor: pointer; user-select: none; width: fit-content; }
+.ov-gtitle.clickable:hover { color: #303133; }
+.ov-caret { color: #c0c4cc; font-size: 12px; width: 12px; }
 .dot-live { width: 8px; height: 8px; border-radius: 50%; background: #e6a23c; box-shadow: 0 0 0 3px rgba(230,162,60,.18); }
 .dot-idle { width: 8px; height: 8px; border-radius: 50%; background: #c0c4cc; }
 

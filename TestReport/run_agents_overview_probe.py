@@ -136,21 +136,21 @@ async def run_probe(paths, keep):
     # 造窗口内历史：甲 top 上后端架构师一条成功(时长10s)、一条失败(时长20s)
     await _mk_run_at(ids["top_a"], "engineering-backend-architect", "succeeded", "-1 days", dur_seconds=10)
     await _mk_run_at(ids["top_a"], "engineering-frontend-developer", "failed", "-2 days", dur_seconds=20)
-    # 造窗口外历史：40 天前一条成功(时长100s)——默认 7 天窗口应排除，扩到 180 天应计入
+    # 造窗口外历史：40 天前一条成功(时长100s)——默认 30 天窗口应排除，扩到 180 天应计入
     await _mk_run_at(ids["top_a"], "qa-test-engineer", "succeeded", "-40 days", dur_seconds=100)
     # 造实时：甲子任务上后端架构师「正在运行」（无 ended_at，不计入总时长）
     running_rid = await _mk_run(ids["sub_a"], "engineering-backend-architect", "running")
 
-    ov = await runs_route.agents_overview()   # 默认 7 天
+    ov = await runs_route.agents_overview()   # 默认 30 天
 
-    # --- stats：窗口口径（默认 7 天），不含限流字段 ---
+    # --- stats：窗口口径（默认 30 天），不含限流字段 ---
     st = ov.get("stats", {})
     probe.check("stats 含 total_runs/failed_runs/distinct_agents/total_run_seconds",
                 {"total_runs", "failed_runs", "distinct_agents", "total_run_seconds"}.issubset(st.keys()),
                 f"keys={sorted(st.keys())}")
-    probe.check("默认窗口 window_days=7",
-                ov.get("window_days") == 7, f"window_days={ov.get('window_days')}")
-    probe.check("total_runs 计入 7 天窗口内 run（成功+失败+运行中=3，排除40天前那条）",
+    probe.check("默认窗口 window_days=30",
+                ov.get("window_days") == 30, f"window_days={ov.get('window_days')}")
+    probe.check("total_runs 计入 30 天窗口内 run（成功+失败+运行中=3，排除40天前那条）",
                 st.get("total_runs") == 3, f"total_runs={st.get('total_runs')}")
     probe.check("failed_runs 只计窗口内失败（1 条）",
                 st.get("failed_runs") == 1, f"failed_runs={st.get('failed_runs')}")
