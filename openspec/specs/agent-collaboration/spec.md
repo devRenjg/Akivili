@@ -44,6 +44,22 @@
 - **WHEN** 运行时页、执行链路（lineage）或转写元信息接口返回某 Agent 身份
 - **THEN** 接口/页面以「昵称（角色名）」呈现（无昵称则角色名），查不到成员时回退 slug；不直接暴露裸 slug
 
+### Requirement: 实时 Agent 总览
+
+系统 SHALL 提供一个全局实时视角，展示当前正在运行的 Agent 与空闲 Agent，与「按任务筛选查看历史执行链路」并存（后者用于事后复盘，前者不取代它）。运行态以 `task_runs.status='running'` 为准（覆盖并发池与直接 @ 两条执行路径）。在岗身份粒度为 `(project_id, slug)`——同一成员在不同项目视为不同在岗实例。正在运行与空闲两个分区 SHALL 互斥。总览 SHALL 同时给出累计口径大数字（跑过的 run 数、失败数、涉及的去重 Agent 数）。
+
+#### Scenario: 正在运行的 Agent
+- **WHEN** 某 Agent 正在执行（其 `task_runs` 行处于 running）
+- **THEN** 总览的 running 分区列出该在岗实例，附项目、任务（含是否子任务）、开始时间与展示名；该实例不出现在 idle 分区
+
+#### Scenario: 空闲 Agent 显示 idle
+- **WHEN** 某启用中的团队成员此刻没有任何 running run
+- **THEN** 总览的 idle 分区列出该在岗实例并标为 idle；禁用成员不出现；同一 slug 在其它项目有运行不影响本项目实例判定为空闲
+
+#### Scenario: 累计大数字始终展示
+- **WHEN** 打开运行时总览
+- **THEN** 展示历史累计的运行 run 数、失败数与去重 Agent 数（不含限流/429 相关指标）
+
 ### Requirement: 并发池调度
 
 系统 SHALL 用并发池执行协同中的各次 Agent 运行，允许多个 Agent 同时执行，同时最多 `MAX_CONCURRENCY` 个。

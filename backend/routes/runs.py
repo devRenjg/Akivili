@@ -489,3 +489,86 @@ async def rate_limit_metrics(hours: int = 24):
         "rate_limit_fail_share": round(rl / failed, 4) if failed else 0.0,
         "by_fail_reason": {r["fr"]: r["c"] for r in dist_rows},
     }
+
+
+@router.get("/runs/agents-overview")
+async def agents_overview():
+    """实时 Agent 总览：与「按任务筛选看历史链路」并存，提供一个全局实时视角。
+
+    - stats：累计口径——历史上跑过多少个 run、多少失败、涉及多少个（去重）Agent。
+      不再暴露限流/429（暂无需求）；总数字保留供体量感知。
+    - running：当前正在执行的 Agent（task_runs.status='running'，覆盖并发池 + 直接 @ 两条
+      路径），带项目/任务信息与开始时间。
+    - idle：启用中的团队成员里，此刻没有 running run 的，显示为 idle。
+      身份粒度为 (project_id, slug)——同一花名册成员在不同项目算不同在岗实例。
+    """
+    db = await get_connection()
+    try:
+        total_runs = (await (await db.execute(
+            "SELECT COUNT(*) c FROM task_runs")).fetchone())["c"]
+        failed_runs = (await (await db.execute(
+            "SELECT COUNT(*) c FROM task_runs WHERE status='failed'")).fetchone())["c"]
+        distinct_agents = (await (await db.execute(
+            "SELECT COUNT(DISTINCT agent_slug) c FROM task_runs")).fetchone())["c"]
+
+        # 正在运行：task_runs.status='running' → 关联任务、项目
+        run_rows = await (await db.execute(
+            """SELECT tr.id AS task_run_id, tr.agent_slug, tr.task_id, tr.started_at,
+                      t.title AS task_title, t.parent_task_id,
+                      t.project_id, p.title AS project_title
+               FROM task_runs tr
+               LEFT JOIN tasks t ON t.id = tr.task_id
+               LEFT JOIN projects p ON p.id = t.project_id
+               WHERE tr.status='running'
+               ORDER BY tr.started_at""")).fetchall()
+
+        # 在岗成员花名册：启用中的 (project_id, slug)，附项目名 + 角色名 + is_leader
+        roster_rows = await (await db.execute(
+            """SELECT pa.project_id, pa.slug, pa.name, pa.is_leader,
+                      p.title AS project_title
+               FROM project_agents pa
+               LEFT JOIN projects p ON p.id = pa.project_id
+               WHERE pa.enabled=1
+               ORDER BY pa.project_id, pa.is_leader DESC, pa.slug""")).fetchall()
+    finally:
+        await db.close()
+
+    slugs = list({r["agent_slug"] for r in run_rows} | {r["slug"] for r in roster_rows})
+    displays = await collab.resolve_agent_displays(slugs)
+
+    running = []
+    busy_keys = set()   # (project_id, slug) 正在忙的在岗实例
+    for r in run_rows:
+        busy_keys.add((r["project_id"], r["agent_slug"]))
+        running.append({
+            "task_run_id": r["task_run_id"],
+            "agent_slug": r["agent_slug"],
+            "agent_display": displays.get(r["agent_slug"], r["agent_slug"]),
+            "project_id": r["project_id"], "project_title": r["project_title"],
+            "task_id": r["task_id"], "task_title": r["task_title"],
+            "is_subtask": r["parent_task_id"] is not None,
+            "started_at": to_beijing(r["started_at"]),
+        })
+
+    idle = []
+    for r in roster_rows:
+        if (r["project_id"], r["slug"]) in busy_keys:
+            continue
+        idle.append({
+            "agent_slug": r["slug"],
+            "agent_display": displays.get(r["slug"], r["slug"]),
+            "project_id": r["project_id"], "project_title": r["project_title"],
+            "is_leader": bool(r["is_leader"]),
+        })
+
+    return {
+        "stats": {
+            "total_runs": total_runs,
+            "failed_runs": failed_runs,
+            "distinct_agents": distinct_agents,
+        },
+        "running_count": len(running),
+        "idle_count": len(idle),
+        "running": running,
+        "idle": idle,
+    }

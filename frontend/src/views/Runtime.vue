@@ -8,28 +8,62 @@
     <el-alert type="info" :closable="false" class="tip"
       title="端到端追一条任务的完整执行链：负责人派活 → 建子任务 → 成员执行 → 汇报 → 收尾。每个 run 的排队/执行/重试/失败流水、耗时、因果来源一次拼出，替代跨表人肉拼时间线。" />
 
-    <!-- 全局限流/429 命中率观测：判断并发是否撞上游 CLI 账号限流 -->
-    <div class="rl-panel" v-if="rl">
-      <div class="rl-head">
-        <span class="rl-title">🚦 限流 / 429 命中率</span>
-        <el-select v-model="rlHours" size="small" class="rl-win" @change="loadRateLimit">
-          <el-option :value="1" label="近 1 小时" />
-          <el-option :value="6" label="近 6 小时" />
-          <el-option :value="24" label="近 24 小时" />
-          <el-option :value="168" label="近 7 天" />
-        </el-select>
-        <el-button :icon="Refresh" text size="small" @click="loadRateLimit">刷新</el-button>
+    <!-- 实时 Agent 总览：全局实时视角，与下方按任务筛选的历史链路并存 -->
+    <div class="ov-panel" v-if="ov">
+      <div class="ov-head">
+        <span class="ov-title">🛰️ 实时 Agent 总览</span>
+        <span class="ov-auto">每 {{ OV_REFRESH_SEC }}s 自动刷新</span>
+        <el-button :icon="Refresh" text size="small" @click="loadOverview" :loading="ovLoading">刷新</el-button>
       </div>
-      <div class="rl-stats">
-        <div class="rl-stat"><span class="rl-num">{{ rl.total_runs }}</span><span class="rl-lbl">终态 run</span></div>
-        <div class="rl-stat"><span class="rl-num">{{ rl.failed_runs }}</span><span class="rl-lbl">失败</span></div>
-        <div class="rl-stat" :class="rlClass"><span class="rl-num">{{ rl.rate_limited_runs }}</span><span class="rl-lbl">限流命中</span></div>
-        <div class="rl-stat" :class="rlClass">
-          <span class="rl-num">{{ (rl.rate_limit_hit_rate * 100).toFixed(1) }}%</span><span class="rl-lbl">命中率</span>
+      <!-- 累计大数字 -->
+      <div class="ov-stats">
+        <div class="ov-stat"><span class="ov-num">{{ ov.stats.total_runs }}</span><span class="ov-lbl">累计运行 Agent（run）</span></div>
+        <div class="ov-stat" :class="{ bad: ov.stats.failed_runs }"><span class="ov-num">{{ ov.stats.failed_runs }}</span><span class="ov-lbl">累计失败</span></div>
+        <div class="ov-stat"><span class="ov-num">{{ ov.stats.distinct_agents }}</span><span class="ov-lbl">涉及 Agent 数</span></div>
+        <div class="ov-stat live"><span class="ov-num">{{ ov.running_count }}</span><span class="ov-lbl">正在运行</span></div>
+        <div class="ov-stat"><span class="ov-num">{{ ov.idle_count }}</span><span class="ov-lbl">空闲 idle</span></div>
+      </div>
+      <!-- 正在运行 -->
+      <div class="ov-group">
+        <div class="ov-gtitle"><span class="dot-live"></span>正在运行（{{ ov.running_count }}）</div>
+        <div v-if="ov.running.length" class="ov-cards">
+          <div v-for="r in ov.running" :key="r.task_run_id" class="ov-card running"
+               @click="jumpLineage(r.project_id, r.task_id)">
+            <div class="ov-card-top">
+              <span class="ov-pulse"></span>
+              <span class="ov-name">{{ r.agent_display }}</span>
+              <span class="ov-state running">运行中</span>
+            </div>
+            <div class="ov-meta">
+              <span class="ov-proj">{{ r.project_title || '项目#' + r.project_id }}</span>
+              <span class="ov-sep">·</span>
+              <span class="ov-task">
+                <el-tag v-if="r.is_subtask" size="small" effect="plain" class="ov-subtag">子任务</el-tag>
+                #{{ r.task_id }} {{ r.task_title || '—' }}
+              </span>
+            </div>
+            <div class="ov-since" v-if="r.started_at">开始于 {{ r.started_at }}</div>
+          </div>
         </div>
+        <el-empty v-else :image-size="48" description="当前没有正在运行的 Agent" />
       </div>
-      <div class="rl-hint" :class="rlClass">{{ rlHint }}</div>
+      <!-- 空闲 -->
+      <div class="ov-group">
+        <div class="ov-gtitle"><span class="dot-idle"></span>空闲（{{ ov.idle_count }}）</div>
+        <div v-if="ov.idle.length" class="ov-idle-list">
+          <span v-for="a in ov.idle" :key="a.project_id + ':' + a.agent_slug" class="ov-idle-chip"
+                @click="jumpProject(a.project_id)">
+            <el-tag v-if="a.is_leader" size="small" type="warning" effect="dark" class="ov-lead">负责人</el-tag>
+            {{ a.agent_display }}
+            <span class="ov-idle-proj">@ {{ a.project_title || '项目#' + a.project_id }}</span>
+            <span class="ov-idle-state">idle</span>
+          </span>
+        </div>
+        <el-empty v-else :image-size="48" description="没有空闲成员" />
+      </div>
     </div>
+
+    <el-divider content-position="left" class="ov-div">按任务下钻历史链路</el-divider>
 
     <div class="toolbar">
       <el-select v-model="projectId" placeholder="选择项目" class="sel" filterable @change="onProject">
@@ -119,7 +153,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { Refresh } from '@element-plus/icons-vue'
 import { projectsApi, tasksApi, runsApi } from '../api'
@@ -136,27 +170,37 @@ const data = ref(null)
 const loading = ref(false)
 const open = reactive({})
 
-// 全局限流命中率
-const rl = ref(null)
-const rlHours = ref(24)
-async function loadRateLimit() {
-  try { rl.value = await runsApi.rateLimitMetrics(rlHours.value) } catch { rl.value = null }
+// 实时 Agent 总览（累计大数字 + 运行中 + 空闲）
+const OV_REFRESH_SEC = 10
+const ov = ref(null)
+const ovLoading = ref(false)
+let ovTimer = null
+async function loadOverview() {
+  ovLoading.value = true
+  try { ov.value = await runsApi.agentsOverview() } catch { /* 保留上次快照，不清空 */ }
+  finally { ovLoading.value = false }
 }
-// 命中率分级：>15% 危险(该多账号分流)、>3% 警戒、否则健康
-const rlClass = computed(() => {
-  const r = rl.value?.rate_limit_hit_rate || 0
-  if (r > 0.15) return 'rl-bad'
-  if (r > 0.03) return 'rl-warn'
-  return 'rl-ok'
-})
-const rlHint = computed(() => {
-  if (!rl.value) return ''
-  const r = rl.value.rate_limit_hit_rate || 0
-  if (rl.value.total_runs === 0) return '窗口内暂无执行记录'
-  if (r > 0.15) return '限流命中偏高：瓶颈在 CLI 账号侧，继续加并发只会更多撞 429，建议多账号分流'
-  if (r > 0.03) return '限流偶有命中：可观察，若持续升高再考虑降并发或多账号'
-  return '限流命中低：当前并发未撞上游账号瓶颈'
-})
+// 从总览卡片跳到对应任务的历史链路
+async function jumpLineage(pid, tid) {
+  if (!pid) return
+  projectId.value = pid
+  await loadTopTasks()
+  if (tid && topTasks.value.some((t) => t.id === tid)) {
+    taskId.value = tid
+    await loadLineage()
+  } else {
+    // 运行中的可能是子任务，其父任务未必在顶层列表——退化为仅选中项目
+    taskId.value = null
+    syncQuery()
+  }
+}
+async function jumpProject(pid) {
+  if (!pid) return
+  projectId.value = pid
+  taskId.value = null
+  await loadTopTasks()
+  syncQuery()
+}
 
 const transcriptVisible = ref(false)
 const transcriptRunId = ref(null)
@@ -252,7 +296,8 @@ function syncQuery() {
 }
 
 onMounted(async () => {
-  loadRateLimit()
+  loadOverview()
+  ovTimer = setInterval(loadOverview, OV_REFRESH_SEC * 1000)
   await loadProjects()
   const qp = route.query.project ? Number(route.query.project) : null
   const qt = route.query.task ? Number(route.query.task) : null
@@ -265,6 +310,8 @@ onMounted(async () => {
     }
   }
 })
+
+onBeforeUnmount(() => { if (ovTimer) clearInterval(ovTimer) })
 </script>
 
 <style scoped>
@@ -272,23 +319,48 @@ onMounted(async () => {
 .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .tip { margin-bottom: 16px; }
 
-/* 全局限流命中率面板 */
-.rl-panel { background: #f7f8fa; border: 1px solid #ebeef5; border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
-.rl-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
-.rl-title { font-weight: 600; font-size: 14px; color: #303133; }
-.rl-win { width: 130px; }
-.rl-head .el-button { margin-left: auto; }
-.rl-stats { display: flex; gap: 24px; margin-bottom: 8px; }
-.rl-stat { display: flex; flex-direction: column; gap: 2px; }
-.rl-num { font-size: 20px; font-weight: 700; color: #303133; line-height: 1.1; }
-.rl-lbl { font-size: 12px; color: #909399; }
-.rl-stat.rl-bad .rl-num { color: #f56c6c; }
-.rl-stat.rl-warn .rl-num { color: #e6a23c; }
-.rl-stat.rl-ok .rl-num { color: #67c23a; }
-.rl-hint { font-size: 12px; }
-.rl-hint.rl-bad { color: #f56c6c; }
-.rl-hint.rl-warn { color: #e6a23c; }
-.rl-hint.rl-ok { color: #909399; }
+/* 实时 Agent 总览 */
+.ov-panel { background: #f7f8fa; border: 1px solid #ebeef5; border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
+.ov-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.ov-title { font-weight: 600; font-size: 14px; color: #303133; }
+.ov-auto { font-size: 12px; color: #c0c4cc; }
+.ov-head .el-button { margin-left: auto; }
+.ov-stats { display: flex; gap: 24px; margin-bottom: 14px; flex-wrap: wrap; }
+.ov-stat { display: flex; flex-direction: column; gap: 2px; }
+.ov-num { font-size: 20px; font-weight: 700; color: #303133; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.ov-lbl { font-size: 12px; color: #909399; }
+.ov-stat.bad .ov-num { color: #f56c6c; }
+.ov-stat.live .ov-num { color: #e6a23c; }
+
+.ov-group { margin-top: 10px; }
+.ov-gtitle { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: #606266; margin-bottom: 8px; }
+.dot-live { width: 8px; height: 8px; border-radius: 50%; background: #e6a23c; box-shadow: 0 0 0 3px rgba(230,162,60,.18); }
+.dot-idle { width: 8px; height: 8px; border-radius: 50%; background: #c0c4cc; }
+
+.ov-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
+.ov-card { background: #fff; border: 1px solid #ebeef5; border-radius: 8px; padding: 10px 12px; cursor: pointer; transition: box-shadow .15s, border-color .15s; }
+.ov-card.running { border-left: 3px solid #e6a23c; }
+.ov-card:hover { box-shadow: 0 2px 10px rgba(0,0,0,.06); border-color: #dcdfe6; }
+.ov-card-top { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.ov-pulse { width: 8px; height: 8px; border-radius: 50%; background: #e6a23c; flex-shrink: 0; animation: ovpulse 1.4s ease-in-out infinite; }
+@keyframes ovpulse { 0%,100% { box-shadow: 0 0 0 0 rgba(230,162,60,.5); } 50% { box-shadow: 0 0 0 5px rgba(230,162,60,0); } }
+.ov-name { font-weight: 600; font-size: 14px; color: #303133; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ov-state.running { font-size: 11px; color: #e6a23c; flex-shrink: 0; }
+.ov-meta { font-size: 12px; color: #606266; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ov-proj { color: #409eff; }
+.ov-sep { color: #c0c4cc; }
+.ov-task { color: #606266; }
+.ov-subtag { margin-right: 4px; }
+.ov-since { font-size: 11px; color: #c0c4cc; margin-top: 6px; font-variant-numeric: tabular-nums; }
+
+.ov-idle-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.ov-idle-chip { display: inline-flex; align-items: center; gap: 6px; background: #fff; border: 1px solid #ebeef5; border-radius: 16px; padding: 4px 12px; font-size: 13px; color: #606266; cursor: pointer; transition: border-color .15s; }
+.ov-idle-chip:hover { border-color: #c0c4cc; }
+.ov-lead { transform: scale(.9); }
+.ov-idle-proj { color: #909399; font-size: 12px; }
+.ov-idle-state { color: #c0c4cc; font-size: 11px; }
+
+.ov-div { margin: 8px 0 16px; }
 
 .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
 .sel { width: 240px; }
