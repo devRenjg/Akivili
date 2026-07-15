@@ -7,6 +7,7 @@
         <span class="ov-auto">每 {{ OV_REFRESH_SEC }}s 自动刷新</span>
         <div class="ov-filter">
           <el-select v-model="ovDaysPreset" size="small" class="ov-win" @change="onPreset">
+            <el-option :value="7" label="最近一周" />
             <el-option :value="30" label="最近一个月" />
             <el-option :value="180" label="最近半年" />
             <el-option :value="365" label="最近一年" />
@@ -180,7 +181,7 @@ const open = reactive({})
 const OV_REFRESH_SEC = 10
 const ov = ref(null)
 const ovLoading = ref(false)
-const ovDaysPreset = ref(30)     // 30=最近一月 / 180=最近半年 / 'custom'=自填
+const ovDaysPreset = ref(7)      // 默认最近一周；7/30/180/365/'custom'=自填
 const ovDaysCustom = ref(7)      // 自定义天数，1~100
 let ovTimer = null
 // 生效窗口天数：预设直接用其值，自定义用输入框（clamp 1~100）
