@@ -44,6 +44,7 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 | `run_scheduling_probe.py` | 10/10 | 并发度/重试上限从 Settings 读取、优先级领取（high>medium>none）、同级 FIFO、退避、异常型重试到上限、超时/error 失败分类 |
 | `run_scheduling_events_probe.py` | 6/6 | 调度流水埋点：enqueued/claimed/done 事件入 run_events、重试记 retry、失败记 failed+fail_reason=exception、流水独立于 activities（不污染成员动态） |
 | `run_task_gates_probe.py` | 10/10 | 单任务运行双闸熔断：总量闸/循环闸从 Settings 生效、mention 链达上限拒入队（防 @ 死循环）、assign/人工介入打断链清零、人工直接@（source 留空）不误伤、总量闸放大后长程任务可持续入队 |
+| `run_mention_chain_reset_probe.py` | 6/6 | 循环闸「产出即重置」口径（修 task149 误伤事故）：有产出的长链协作（每棒都落 jian comment/subtask）链长重置为 0 不被误掐、纯空转（无产出）mention 链仍累积到闸值如期熔断（保护不削弱）、混合链从最新往回数到最近一棒有产出即停、run 没起来（task_run_id 空）视为空转计入链长 |
 | `run_rate_limit_probe.py` | 8/8 | 限流/429 观测：错误文本识别（429/rate limit/overloaded/quota/retry-after，不误伤普通错误）、限流 error 无产出归因 fail_reason=rate_limited、普通错误仍归 error_no_output、/runs/rate-limit-metrics 聚合窗口内 total/failed/rate_limited + 命中率 + 失败归因分布 |
 | `run_mention_prompt_probe.py` | 11/11 | @ 触发把发言原话+任务上下文作为 prompt 传给成员（修 task140 事故：此前硬传空串→成员落「不要读任何文件」兜底模板收不到指令）、prompt 明示需要读文件/启动服务就正常做（去绝对禁令）、多人@各自拿到、_clip_history 历史回灌双限（条数+字符预算，至少留最新1条）从 Settings 生效 |
 | `run_concurrency_probe.py` | 7/7 | 并发池 MAX_CONCURRENCY 并行度、卡死 Agent 超时被 kill 不阻塞队列、慢 Agent 不饿死快 Agent |

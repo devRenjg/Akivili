@@ -263,26 +263,55 @@ async def _run_count(task_id: int) -> int:
 
 
 async def _mention_chain_len(task_id: int) -> int:
-    """该任务末尾「连续 mention 链式自动 run」的长度（循环闸口径）。
+    """该任务末尾「连续**空转** mention 链式自动 run」的长度（循环闸口径）。
 
-    从最新 run 往回数，只统计 `trigger='mention' 且 source_run_id 非空`（即由另一个 run 的
-    发言 @ 触发的自动 run）；一旦遇到非此类 run（assign/collaborate/人工重派，或人工直接 @
-    的 source 留空 mention）即停止计数。含义：Agent 互相 @ 的死循环会让链持续增长，而任何
-    人工介入或负责人统筹都会打断链、清零重来——故正常长程项目不受限，只掐断纯自动 @ 循环。"""
+    从最新 run 往回数，只统计 `trigger='mention' 且 source_run_id 非空`（由另一个 run 的发言 @
+    触发的自动 run）。以下两种情况都**停止计数**（重置链）：
+      1. 遇到非链式 run（assign/collaborate/人工重派，或人工直接 @ 的 source 留空 mention）——
+         人工介入/负责人统筹打断链；
+      2. 遇到一个**产出了真实交付**的链式 run（该 run 有 jian comment/subtask 发言，或改过任务
+         状态）——说明这一棒是实质协作、不是空转。
+
+    含义（防误伤）：只有「连续多棒 @ 却谁都没产出」的**真死循环空转**才会累积撞闸；只要链中
+    有 Agent 真交付了成果（多轮复验/返工这种长链协作即属此类），链就被重置，不会被误掐。
+    真正的 Agent 互相 @ 空转（无新产出）仍会持续累积、如期熔断。（task149 误伤事故根因修复）"""
     db = await get_connection()
     try:
         rows = await (await db.execute(
-            "SELECT trigger, source_run_id FROM run_queue WHERE task_id=? ORDER BY id DESC",
-            (task_id,))).fetchall()
+            "SELECT trigger, source_run_id, task_run_id, agent_slug FROM run_queue "
+            "WHERE task_id=? ORDER BY id DESC", (task_id,))).fetchall()
     finally:
         await db.close()
     n = 0
     for r in rows:
-        if r["trigger"] == "mention" and r["source_run_id"] is not None:
-            n += 1
-        else:
+        # 非链式入队 → 断点，停
+        if not (r["trigger"] == "mention" and r["source_run_id"] is not None):
             break
+        # 链式但有真实产出 → 这一棒是实质协作，重置链，停
+        if await _run_queue_item_produced(task_id, r["task_run_id"], r["agent_slug"]):
+            break
+        n += 1
     return n
+
+
+async def _run_queue_item_produced(task_id: int, task_run_id, agent_slug: str) -> bool:
+    """某个 run_queue 项对应的 run 是否产出了真实交付。循环闸「产出即重置」判定用。
+
+    口径：该 run 是否落过一条带 `run_id` 的 assistant 消息——jian comment/subtask 发言时
+    (`routes/agent_cli.py`) 会把当前 run_id 回填到 `messages.run_id`，这是把「产出」精确绑定到
+    **具体这一棒 run** 的唯一可靠信号。不用「该 slug 在本任务有没有发过言」这种宽口径，否则
+    一个 Agent 早先发过一次言，它之后所有空转 run 都会被误判成有产出、循环闸永远不触发。
+    task_run_id 为空（run 没起来）视为无产出。"""
+    if not task_run_id:
+        return False
+    db = await get_connection()
+    try:
+        msg = await (await db.execute(
+            "SELECT 1 FROM messages WHERE run_id=? AND role='assistant' LIMIT 1",
+            (task_run_id,))).fetchone()
+        return bool(msg)
+    finally:
+        await db.close()
 
 
 async def log_run_event(event: str, *, run_queue_id: int | None = None,

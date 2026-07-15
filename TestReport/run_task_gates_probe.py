@@ -97,6 +97,8 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
         max_retry = 2
         max_runs_per_task = 50
         max_mention_chain = 4
+        orphan_sweep_interval_sec = 120
+        orphan_sweep_idle_sec = 1800
 
     config_mod.load_settings = lambda: _FakeSettings()
     try:
