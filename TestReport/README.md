@@ -77,11 +77,6 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 | `run_skill_downloadable_probe.py` | 7/7 | 「仅集成不下载」契约：downloadable=false 硬拦截 403、目录型 Skill 扫描 |
 | `run_codex_cli_smoke.py` `*` | 冒烟 | Codex CLI 后端连通性烟测（单点，非断言式） |
 
-### 通知 / 集成
-| 脚本 | 实测 | 覆盖 |
-|---|---|---|
-| `run_wecom_push_probe.py` | 12/12 | 任务卡片一键推送企微群机器人：`build_task_markdown` 结构（#标题+副标题+正文+「详情请点击」链接）、UTF-8 字节安全截断（≤4096 不切坏汉字）、空链接/副标题降级、`send_markdown` 结果归一化（errcode=0→ok / 非0→带 errmsg 失败 / 网络异常→ok=False 不抛，monkeypatch httpx 不发真实请求） |
-
 ### 工具（非测试）
 | 脚本 | 说明 |
 |---|---|

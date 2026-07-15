@@ -69,12 +69,6 @@ class Settings(BaseSettings):
     # 巡检间隔（秒，默认 120）；静默阈值（秒，默认 1800=30分，须 ≥ 最长 idle 超时以免误伤慢但在跑的 run）。
     orphan_sweep_interval_sec: int = int(os.environ.get("AKIVILI_ORPHAN_SWEEP_INTERVAL", "120"))
     orphan_sweep_idle_sec: int = int(os.environ.get("AKIVILI_ORPHAN_SWEEP_IDLE", "1800"))
-    # 企微群机器人 webhook URL（任务卡片一键推送用）。敏感凭证，配在 config.json（gitignore 已排除），
-    # 空则「发送到企微」功能不可用（接口返回明确提示）。可用环境变量 AKIVILI_WECOM_WEBHOOK 覆盖。
-    wecom_webhook_url: str = os.environ.get("AKIVILI_WECOM_WEBHOOK", "")
-    # 平台对外基址（拼「详情请点击」的任务卡片链接用）。内网访问地址，如 http://10.23.28.27:8100。
-    # 空则推送里不带链接。可用环境变量 AKIVILI_FRONTEND_BASE_URL 覆盖。
-    frontend_base_url: str = os.environ.get("AKIVILI_FRONTEND_BASE_URL", "")
 
 
 def load_settings() -> Settings:

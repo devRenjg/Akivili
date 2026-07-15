@@ -220,61 +220,6 @@ async def kill(req: KillRequest):
     return {"ok": ok}
 
 
-class PushWecomRequest(BaseModel):
-    # 正文：不传则取该任务会话最新一条 assistant 交付；传了则用它（前端可让用户编辑后再发）。
-    body: str = ""
-    # 副标题：夹在标题和正文之间的一段说明（如「建议对接的内容与文本」）。可空。
-    subtitle: str = ""
-
-
-@router.post("/tasks/{task_id}/push-wecom", dependencies=[Depends(require_admin)])
-async def push_wecom(task_id: int, req: PushWecomRequest):
-    """把任务卡片一键推送到企微群机器人：标题 + 正文摘要 + 详情链接。
-
-    正文默认取该任务会话最新一条 assistant 交付（前端可预填让用户编辑）。webhook 未配置时
-    返回明确提示（400），不静默失败。发送结果（含企微 errcode）如实回传，不吞错。
-    """
-    import wecom  # noqa: PLC0415
-    from config import load_settings  # noqa: PLC0415
-
-    s = load_settings()
-    webhook = (s.wecom_webhook_url or "").strip()
-    if not webhook:
-        raise HTTPException(400, "未配置企微群机器人 webhook（config.json 的 wecom_webhook_url），"
-                                 "请先在企微群添加群机器人并把 URL 配上")
-
-    db = await get_connection()
-    try:
-        task = await (await db.execute(
-            "SELECT id, title, project_id, conversation_id FROM tasks WHERE id=?",
-            (task_id,))).fetchone()
-        if not task:
-            raise HTTPException(404, "任务不存在")
-        body = (req.body or "").strip()
-        if not body:
-            # 默认取最新一条 assistant 交付（jian comment/API 产出都落 role=assistant）
-            row = await (await db.execute(
-                "SELECT content FROM messages WHERE conversation_id=? AND role='assistant' "
-                "ORDER BY id DESC LIMIT 1", (task["conversation_id"],))).fetchone()
-            body = (row["content"].strip() if row and row["content"] else "")
-    finally:
-        await db.close()
-
-    # 拼「详情请点击」链接：前端任务详情路由 /projects/:pid/tasks/:tid
-    base = (s.frontend_base_url or "").strip().rstrip("/")
-    link = f"{base}/projects/{task['project_id']}/tasks/{task_id}" if base else ""
-
-    content = wecom.build_task_markdown(
-        title=task["title"] or f"任务 #{task_id}",
-        body=body or "（该任务暂无交付正文，可在下方手动填写后再发送）",
-        link=link, subtitle=req.subtitle)
-    result = await wecom.send_markdown(webhook, content)
-    if not result["ok"]:
-        # 脱敏后回传错误（绝不把 webhook URL 明文带进响应/日志）
-        raise HTTPException(502, f"企微推送失败：{result['error']}")
-    return {"ok": True}
-
-
 @router.get("/tasks/{task_id}/messages")
 async def get_messages(task_id: int):
     db = await get_connection()

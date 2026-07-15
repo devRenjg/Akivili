@@ -11,9 +11,6 @@
         </template>
         <span class="crumb-title">{{ task?.title || '任务' }}</span>
       </div>
-      <div class="td-actions">
-        <el-button v-if="isAdmin && task" text size="small" @click="openWecomDialog">📮 发送到企微</el-button>
-      </div>
     </div>
 
     <div v-if="task" class="td-body">
@@ -232,28 +229,6 @@
       </template>
     </el-dialog>
 
-    <!-- 发送到企微：编辑副标题/正文后一键推送群机器人 -->
-    <el-dialog v-model="wecomVisible" title="📮 发送到企微群" width="640px" class="task-dialog" append-to-body>
-      <el-form label-position="top">
-        <el-form-item label="标题（推送首行，自动用任务标题）">
-          <el-input :model-value="task?.title || ''" disabled />
-        </el-form-item>
-        <el-form-item label="补充说明（可选，夹在标题与正文之间）">
-          <el-input v-model="wecomForm.subtitle" type="textarea" :rows="2"
-                    placeholder="如：本周直播研发重点关注如下，请相关同学对接" />
-        </el-form-item>
-        <el-form-item label="正文（默认取本任务最新交付，可编辑）">
-          <el-input v-model="wecomForm.body" type="textarea" :rows="10"
-                    placeholder="推送到群里的正文内容" />
-        </el-form-item>
-        <div class="wecom-hint">推送尾部会自动附「详情请点击：任务卡片链接」。企微单条上限 4096 字节，超长自动截断。</div>
-      </el-form>
-      <template #footer>
-        <el-button @click="wecomVisible = false">取消</el-button>
-        <el-button class="akivili-primary-btn" :loading="wecomSending" @click="doPushWecom">发送到企微</el-button>
-      </template>
-    </el-dialog>
-
     <!-- 日志详情：所有命令与运行时详细信息 -->
     <RunTranscriptDialog v-model="transcriptVisible" :run-id="transcriptRunId"
                          :agent-name="transcriptAgentName" />
@@ -310,10 +285,6 @@ const toolEvents = ref([])
 const currentRunId = ref(null)
 const addSubVisible = ref(false)
 const subForm = ref({ title: '', assignee_slug: '', description: '', priority: 'none' })
-// 发送到企微弹框
-const wecomVisible = ref(false)
-const wecomSending = ref(false)
-const wecomForm = ref({ subtitle: '', body: '' })
 // 日志详情弹框
 const transcriptVisible = ref(false)
 const transcriptRunId = ref(null)
@@ -651,34 +622,6 @@ async function doAddSub() {
     ElMessage.error(e?.response?.data?.detail || e.message)
   }
 }
-function openWecomDialog() {
-  // 预填正文：取时间线里最新一条 assistant 交付（找不到则留空，用户手动填）
-  let latest = ''
-  for (let i = timeline.value.length - 1; i >= 0; i--) {
-    const it = timeline.value[i]
-    if (it.kind === 'message' && it.role === 'assistant' && (it.content || '').trim()) {
-      latest = it.content.trim()
-      break
-    }
-  }
-  wecomForm.value = { subtitle: '', body: latest }
-  wecomVisible.value = true
-}
-async function doPushWecom() {
-  wecomSending.value = true
-  try {
-    await tasksApi.pushWecom(taskId, {
-      subtitle: wecomForm.value.subtitle || '',
-      body: wecomForm.value.body || '',
-    })
-    wecomVisible.value = false
-    ElMessage.success('已发送到企微群')
-  } catch (e) {
-    ElMessage.error(e?.response?.data?.detail || e.message)
-  } finally {
-    wecomSending.value = false
-  }
-}
 function openTranscript(r) {
   transcriptRunId.value = r.id
   transcriptAgentName.value = agentDisplayBySlug(r.agent_slug)
@@ -760,8 +703,6 @@ onUnmounted(stopPolling)
 .task-detail { max-width: 1440px; margin: 0 auto; }
 .td-topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
 .td-crumb { display: flex; align-items: center; gap: 8px; }
-.td-actions { display: flex; align-items: center; gap: 8px; }
-.wecom-hint { font-size: 12px; color: #909399; line-height: 1.5; margin-top: 4px; }
 .crumb-sep { color: #c0c4cc; }
 .crumb-title { font-weight: 600; color: #303133; }
 .crumb-link { color: #409eff; cursor: pointer; }
