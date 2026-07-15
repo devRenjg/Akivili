@@ -55,3 +55,6 @@ _tmp_*
 .DS_Store
 .idea/
 .vscode/
+
+# 个人产物（简历等，与项目无关，不入仓）
+Resume/
