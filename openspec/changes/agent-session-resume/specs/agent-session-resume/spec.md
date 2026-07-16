@@ -4,7 +4,7 @@
 
 ### Requirement: per-(task, agent) CLI 会话复用与串行
 
-系统 SHALL 为每个 `(conversation_id, agent_slug)` 维护一条 CLI session,持久化于 `agent_sessions` 表（唯一键 `(conversation_id, agent_slug)`）。同一 Agent 在同一 task 里再次被触发执行时,系统 SHALL 复用该 session（CLI resume）,而非每次新建会话。session 记录 SHALL 含 `session_id`、`committed_msg_id`（上次成功执行确认的增量水位）、`provider_id`、`backend`、`workdir`;本次执行的快照终点 `planned_through_msg_id` SHALL 落在 `task_runs` 行。粒度 SHALL 为 (conversation, agent)——同一 task 内每个成员各持独立 session,互不干扰。系统 SHALL 保证同一 `(conversation, agent)` 至多一个 queued/running run（串行）,重复触发 SHALL **折叠**进下一轮（合并触发意图，不丢弃），而非并行起第二条;`run_queue` 无 conversation_id 列，折叠 SHALL 用「queued 合并水位 / running 记 pending intent、收尾建至多一个 successor」实现，SHALL NOT 依赖 `(conversation_id, agent_slug)` partial unique index。全局并发上限约束的是不同 (task, agent) 的并行度,与此串行正交。
+系统 SHALL 为每个 `(conversation_id, agent_slug)` 维护一条 CLI session,持久化于 `agent_sessions` 表（唯一键 `(conversation_id, agent_slug)`）。同一 Agent 在同一 task 里再次被触发执行时,系统 SHALL 复用该 session（CLI resume）,而非每次新建会话。session 记录 SHALL 含 `session_id`、`committed_msg_id`（上次成功执行确认的增量水位）、`provider_id`、`backend`、`workdir`;本次执行的快照终点 `planned_through_msg_id` SHALL 落在 `task_runs` 行。粒度 SHALL 为 (conversation, agent)——同一 task 内每个成员各持独立 session,互不干扰。系统 SHALL 保证同一 `(task, agent)` 至多一个 active run（active = queued/claimed/running）,重复触发 SHALL **折叠**进下一轮（合并触发意图，不丢弃），而非并行起第二条。DB 级唯一性 SHALL 用 `partial unique index ON run_queue(task_id, agent_slug) WHERE status IN ('queued','claimed','running')` 保证（应用层查重有 TOCTOU 竞态，不足以防两个并发 POST 各插一条）;折叠 SHALL 用「queued 原子合并水位 / claimed·running 记 pending intent、收尾据 pending 建至多一个 successor」实现。全局并发上限约束的是不同 (task, agent) 的并行度,与此串行正交。
 
 #### Scenario: 首次执行建立 session
 - **WHEN** 某 Agent 在某 task 首次被触发执行（`agent_sessions` 无该 (conversation, agent) 行）
@@ -15,8 +15,8 @@
 - **THEN** 系统以 resume 启动 CLI,复用上次会话上下文,不新建会话
 
 #### Scenario: 同 (task, agent) 串行
-- **WHEN** 某 (conversation, agent) 已有 queued/running run,此时该成员在同一 task 被再次触发
-- **THEN** 系统不并行起第二条 run,把新触发折叠进下一轮,保证增量边界有确定推进点
+- **WHEN** 某 (task, agent) 已有 active run（queued/claimed/running），此时该成员在同一 task 被再次触发
+- **THEN** partial unique index 挡下并发插入的第二条 run，触发被折叠进下一轮（queued 合并水位 / claimed·running 记 pending intent，收尾据 pending 建至多一个 successor），保证增量边界有确定推进点
 
 #### Scenario: 会话粒度隔离
 - **WHEN** 同一 task 内两个不同成员各自被触发执行
@@ -24,7 +24,7 @@
 
 ### Requirement: session_id 抓取与生命周期
 
-系统 SHALL 从 CLI 输出中提取会话标识并按下述策略维护其生命周期。claude backend SHALL 从 `-p --output-format stream-json` 的 `system`(init)/`result` 行提取 `session_id`;codex backend SHALL 从 app-server 的 `threadId` 提取。生命周期 SHALL 满足：① **流中途首次见到 id 即抢先落库（pin）**,防执行中途崩溃丢指针;② **收尾以本次最新 id 覆盖存**（resume 后 id 可能变,非只存首次）;③ 更新用 **COALESCE 空值保护**（本次没抓到 id 时不清空旧指针）。
+系统 SHALL 从 CLI 输出中提取会话标识并按下述策略维护其生命周期。claude backend SHALL 从 `-p --output-format stream-json` 的 `system`(init)/`result` 行提取 `session_id`;codex backend SHALL 从 app-server 的 `threadId` 提取。生命周期 SHALL 满足：① **流中途首次见到 id 即抢先落库（pin）**,防执行中途崩溃丢指针;② **收尾以本次最新 id 覆盖存**（resume 后 id 可能变,非只存首次）;③ 更新用 **COALESCE 空值保护**（本次没抓到 id 时不清空旧指针）;④ **pin 与覆盖 SHALL 带 `task_run_id`/`worker_generation`/session version 条件（CAS）**：仅当写入者仍是当前活跃 run/世代时才更新，防上一轮迟到的流事件覆盖下一轮已建立的新 session pointer。
 
 #### Scenario: 流中途 pin 落库
 - **WHEN** CLI 流中第一次出现 session_id,该 run 尚未收尾
@@ -37,6 +37,10 @@
 #### Scenario: 空值不清指针
 - **WHEN** 某次执行未能从输出中抓到 session_id
 - **THEN** 系统用 `COALESCE(?, session_id)` 更新,保留上一次的有效指针,不清空
+
+#### Scenario: 迟到流事件不覆盖新 session
+- **WHEN** 上一轮 run 的流事件迟到到达，此时该 (task,agent) 已由新一轮 run（新 task_run_id/generation）建立了新的 session pointer
+- **THEN** CAS 条件（task_run_id/generation 不匹配）拒绝迟到写入，新 session pointer 不被旧事件覆盖
 
 ### Requirement: resume 落地判定与失效降级（不劣于现状）
 
@@ -68,7 +72,7 @@
 
 ### Requirement: 增量上下文回灌（快照水位 + 排除自产）
 
-系统 SHALL 在复用 session 执行时只回灌「增量上下文」,而非全量历史。增量水位 SHALL 用 **2 字段两阶段**：`agent_sessions.committed_msg_id`（上次**成功**执行确认的水位，**只有 run 成功收尾才推进**）+ `task_runs.planned_through_msg_id`（本次构建 prompt 那刻的快照终点 = 当时 `MAX(messages.id)`）。系统 **SHALL NOT** 用「执行完成时的 MAX(id)」做单一水位（并发下会把执行期间别人新写的消息算进而漏话）。增量 = `messages WHERE conversation_id=? AND id > committed_msg_id AND id <= planned_through_msg_id AND 作者非本 agent`（参数化）：别人/人工在上次成功水位之后、本次快照之前说的话喂给本 Agent,本 Agent 自己的历史发言由 CLI session 记忆承载、不重喂。**不变量 = at-least-once**：崩溃/中断时 committed 未推进 → 续跑从同一起点重取 → 重复但不漏;prompt 构建后、CLI 接收前崩溃时 committed **SHALL NOT** 提前推进。增量仍 SHALL 过历史裁剪防单次海量。首次执行（无 session）SHALL 回灌全量历史（现状行为）。
+系统 SHALL 在复用 session 执行时只回灌「增量上下文」,而非全量历史。增量水位 SHALL 用 **2 字段两阶段**：`agent_sessions.committed_msg_id`（上次**成功**执行确认的水位，**只有 run 成功收尾才推进**）+ `task_runs.planned_through_msg_id`（本次构建 prompt 那刻的快照终点 = 当时 `MAX(messages.id)`）。系统 **SHALL NOT** 用「执行完成时的 MAX(id)」做单一水位（并发下会把执行期间别人新写的消息算进而漏话）。增量 = `messages WHERE conversation_id=? AND id > committed_msg_id AND id <= planned_through_msg_id AND 作者非本 agent`（参数化）：别人/人工在上次成功水位之后、本次快照之前说的话喂给本 Agent,本 Agent 自己的历史发言由 CLI session 记忆承载、不重喂。**不变量 = at-least-once**：崩溃/中断时 committed 未推进 → 续跑从同一起点重取 → 重复但不漏;prompt 构建后、CLI 接收前崩溃时 committed **SHALL NOT** 提前推进。**单次海量增量 SHALL 用连续前缀分批，SHALL NOT 用「保新丢旧」裁剪**：现状历史裁剪按保留最新、丢弃较早裁剪，若套在增量上会丢中段较早消息而 committed 仍推进到 planned_through → 中段永久漏喂，违反 at-least-once。增量 SHALL 从 committed 之后最旧一条起、按连续前缀截取本轮可喂量，`committed_msg_id` 收尾时 **SHALL 只推进到本轮实际连续喂达的最后一条 id（committed_batch_end），SHALL NOT 直接推进到 planned_through**;剩余尾部留到下一轮从新 committed 起点续喂。超上限 SHALL 在连续前缀处截断、分多轮喂，**SHALL NOT 跳段**。首次执行（无 session）SHALL 回灌全量历史（现状行为，同样连续前缀分批、超上限分轮不丢段）。
 
 #### Scenario: 复用执行只喂增量
 - **WHEN** 某 (conversation, agent) 带 session resume 执行,其间别人新增了若干条 messages
@@ -86,13 +90,17 @@
 - **WHEN** 自上次快照后无他人新 messages（增量为空）
 - **THEN** prompt 仅含本轮指令,不含历史片段
 
+#### Scenario: 海量增量连续前缀分批不跳段
+- **WHEN** 增量消息条数/字符超单轮上限
+- **THEN** 系统从 committed 之后最旧一条起按连续前缀截取本轮可喂量、在上限处截断（committed_batch_end），committed_msg_id 只推进到 committed_batch_end 而非 planned_through，剩余尾部下一轮从新起点续喂，中间不跳过任何应喂消息
+
 #### Scenario: 首次执行全量回灌
 - **WHEN** 某 (conversation, agent) 首次执行（无 session）
 - **THEN** 系统回灌全量历史（与改造前一致），不因缺 session 而丢上下文
 
 ### Requirement: backend 分流（claude 与 codex 均必选）
 
-系统 SHALL 支持 claude 与 codex 两个 backend 的 session 复用,均为必选（用户重度使用 codex）。claude backend SHALL 用 `-p --resume <session_id>` flag。codex backend SHALL **每次执行 attempt 启动一个** `codex app-server --listen stdio://` 进程（run 结束即关，**非** Worker 全局共享一个 app-server）+ JSON-RPC `thread/resume`（不可恢复时回退 `thread/start`,传输/进程错误 fail-fast）+ `turn/start`,以 `threadId` 作为其 session 标识。runner SHALL 依 `agent_sessions.backend` 分流到对应实现;两 backend 共用同一 `agent_sessions` 表、降级链与 poisoned 分类。
+系统 SHALL 支持 claude 与 codex 两个 backend 的 session 复用,均为必选（用户重度使用 codex）。claude backend SHALL 用 `-p --resume <session_id>` flag。codex backend SHALL **每次执行 attempt 启动一个** `codex app-server --listen stdio://` 进程（run 结束即关，**非** Worker 全局共享一个 app-server）+ JSON-RPC `thread/resume`（不可恢复时回退 `thread/start`,传输/进程错误 fail-fast）+ `turn/start`,以 `threadId` 作为其 session 标识。codex `thread/resume` 前系统 SHALL 检查 `CODEX_HOME` 下对应 rollout/thread 记录存在性与 workdir 一致性——记录不存在或 workdir 不一致时 SHALL 降级 `thread/start` 全量、不 resume 到不存在/错配的线程。runner SHALL 依 `agent_sessions.backend` 分流到对应实现;两 backend 共用同一 `agent_sessions` 表、降级链与 poisoned 分类。
 
 #### Scenario: claude 走 flag resume
 - **WHEN** 执行 backend 为 claude 且命中可用 session
@@ -100,7 +108,11 @@
 
 #### Scenario: codex 走 app-server thread resume
 - **WHEN** 执行 backend 为 codex 且命中可用 session（threadId）
-- **THEN** 系统经 app-server `thread/resume` 恢复线程续接;线程不可恢复（unknown thread/schema 漂移）时回退 `thread/start` 开新线程并如实标记为新会话
+- **THEN** 系统先校验 `CODEX_HOME` rollout 存在且 workdir 一致，再经 app-server `thread/resume` 恢复线程续接;线程不可恢复（unknown thread/schema 漂移）时回退 `thread/start` 开新线程并如实标记为新会话
+
+#### Scenario: codex rollout 不存在则降级
+- **WHEN** codex 命中 session（threadId）但 `CODEX_HOME` 下对应 rollout 记录不存在或 workdir 不一致
+- **THEN** 系统不 resume 到该线程，降级 `thread/start` 全量新建，如实标记为新会话
 
 #### Scenario: codex 传输错误 fail-fast
 - **WHEN** codex app-server 出现传输/进程级错误（非协议可恢复错误）

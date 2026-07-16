@@ -26,15 +26,18 @@
 
 - 粒度取 **(conversation_id, agent_slug)**——同一 task 里每个成员各持独立 session，互不干扰。
 - 新表 `agent_sessions(id, conversation_id, agent_slug, session_id, committed_msg_id, provider_id, backend, workdir, updated_at)`，唯一键 `(conversation_id, agent_slug)`。`committed_msg_id` = 上次**成功**执行确认喂到的水位（见决策 3）。本次执行的快照终点 `planned_through_msg_id` 落在 `task_runs` 行（每 run 一行、天然是历史）。
-- **同 (task, agent) 串行 + 折叠（Review P0-3 修正：不是 index、不是丢弃）**：目标 = 同一成员在同一 task 上**至多一个 queued/running run**，重复触发**折叠**进下一轮（合并触发意图，不丢），而非并行起第二条、也不是当前代码的直接 `return None` 丢弃。**注意**：`run_queue` **无 conversation_id 列**，无法直接建 `(conversation_id, agent_slug)` partial unique index（原 spec 写法建不出来）;改用「折叠模型」实现（见决策 1b）。这样既防重复并行做工，又让「增量边界」有确定的推进时机。
+- **同 (task, agent) 单 active + 折叠（Review P0-3/P0-B 修正）**：目标 = 同一成员在同一 task 上**至多一个 active run**（active = queued/claimed/running），重复触发**折叠**进下一轮（合并触发意图，不丢），而非并行起第二条、也不是当前 `return None` 丢弃。**DB 级唯一性**：`run_queue` 虽无 conversation_id 列，但有 `task_id`——建 partial unique index `ON run_queue(task_id, agent_slug) WHERE status IN ('queued','claimed','running')` 从 DB 层杜绝两个并发 POST 各插一条 active（应用层查重有 TOCTOU 竞态，Review P0-B）。折叠规则见决策 1b。
 
 ### 决策 1b：重复触发折叠模型（Review P0-3，取代「查重丢弃」与「伪 index」）
 
-现状 `collab.py:392` 对同 task/agent 已有 queued/running 时直接 `return None`——触发被静默丢。改为持久化折叠：
+现状 `collab.py:392` 对同 task/agent 已有 queued/running 时直接 `return None`——触发被静默丢。改为 **DB 级唯一性 + 持久化折叠**：
 
-- **目标 run 为 queued（未 claim）**：把新触发的消息水位/触发来源**合并**进该 queued 行（更新其 planned 上界），不新建行。
-- **目标 run 为 running**：在其 `run_queue` 行持久化 `rerun_requested=1` + `pending_through_message_id`（合并到最大）+ 触发来源集合。
-- **该 running run 收尾事务内**：检查 pending intent，若有则**至多创建一个** successor run（带合并后的水位），然后清 pending。
+- **DB 唯一性兜底**：`partial unique index ON run_queue(task_id, agent_slug) WHERE status IN ('queued','claimed','running')`——两个并发触发只有一个能插入 active 行，另一个 insert 冲突后转入折叠路径（而非各插一条 → 双执行）。
+- **目标 run 为 queued（未 claim）**：把新触发的消息水位/触发来源**用原子 `MAX`/`COALESCE` 更新**合并进该 queued 行（**不先读后写**，避免竞态），不新建行。
+- **目标 run 为 claimed/preparing**：同 running 处理——记 pending intent（不能漏在 queued/running 两分法之外，Review P0-B）。
+- **目标 run 为 running**：在其 `run_queue` 行持久化 `rerun_requested=1` + `pending_through_message_id`（原子合并到最大）+ 触发来源集合。
+- **该 run 收尾事务内**：检查 pending intent，若有则**至多创建一个** successor run（带合并后的水位），然后清 pending。各终态的 pending 处理：**failed** → 仍据 pending 生成 successor（不丢用户新指令）;**killed** → 用户主动停，**同时取消** pending intent（不生成 successor）;**superseded** → pending intent 由 recovery child 继承（不再单独生成 successor，避免与 recovery child 重复）。
+- **历史数据**：加 partial unique index 前须先清理/归并存量重复 active 行（见 [platform-graceful-restart] 迁移节），否则建索引失败。
 - **区分 enqueue plan 与 delivery receipt**：记录「计划喂到哪」与「实际随 claim 投递了哪些」，避免新旧 Worker 协议不一致时误判消息已送达（简化实现 = 存消息高水位 + 必要触发 ID，不必像多节点那样存完整投递集）。
 - **不降低全局并发**：全局并发上限（当前 8）约束的是「不同 (task, agent) 同时跑几个」，同 (task, agent) 串行与之正交——不同成员、不同任务照旧并行。
 
@@ -64,7 +67,10 @@
   - A **崩溃/被中断**（committed 未推进）→ 续跑仍从**同一 committed 起点**取增量 → **重复喂但不漏**（满足不变量）。
   - A 执行期间 B 写的消息 id > A 的 planned_through → 不在 A 本次增量内，但下次触发 A 时（committed 仍在 B 之前）被正确纳入，**不漏**。
 - **崩溃不漏的关键**：**只有成功才提交 committed**;prompt 构建后、CLI 接收前崩溃时 committed 不得提前推进（否则漏）。
-- 增量仍过 `_clip_history` 防单次海量。首次执行（无 session）回灌全量（现状行为）。
+- **🔴 单次海量增量——必须连续前缀分批，禁止直接过 `_clip_history`**：现状 `_clip_history` 按「保新丢旧」裁剪（`_HISTORY_MAX_MSGS`/`_HISTORY_MAX_CHARS`），若把它套在增量上，会**丢掉中段较早的消息但 committed 仍推进到 planned_through** → 被丢的中段永久漏喂，直接违反 at-least-once。因此增量 SHALL **从 committed 之后的最旧一条开始、按连续前缀（contiguous prefix）截取本轮可喂的量**，`committed_msg_id` 收尾时**只推进到本轮实际连续喂达的最后一条 id**（`committed_batch_end`），而非 planned_through。剩余未喂部分（> committed_batch_end 且 <= planned_through）留到下一轮从新 committed 起点继续，天然不重不漏。
+  - 判据：`committed_batch_end` SHALL 满足「[committed_msg_id+1, committed_batch_end] 内所有应喂消息都已纳入本轮 prompt」，中间不得有跳过。达上限即在此截断，宁可分多轮，绝不跳段。
+  - `planned_through_msg_id` 仍记录快照终点（用于判断「是否还有未喂尾部」与并发边界），但 committed 推进以 `committed_batch_end` 为准，二者可不相等（有未喂尾部时 committed_batch_end < planned_through）。
+- 首次执行（无 session）回灌全量（现状行为，同样连续前缀分批：超上限则分轮喂，不丢段）。
 - **等效方案对比**：另一种防漏思路是维护「投递集」（记录已喂给该 agent 哪些 message）+ 排队期消息「折叠」进本轮；我们用「快照水位 + 排除自产」达到等效防漏，省一张投递集表。
 - **一处有意取舍**：也可让 Agent 用 CLI 命令**自己回读**业务历史、平台几乎不喂。我们**保留平台侧增量喂**（不建 Agent 自读命令），因为：① 我们的 `jian` CLI 未暴露全量 message 列表读取；② 增量在快照机制下很小；③ 改动面小于「造一套 Agent 自读历史的命令 + 改 prompt 教 Agent 用」。留待讨论期复核。
 
