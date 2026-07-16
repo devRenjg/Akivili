@@ -1,62 +1,80 @@
 # Tasks — platform-graceful-restart
 
-> 规划态,分期落实,每期独立走探针验证、独立提交。M2.5 依赖 [agent-session-resume] 先出 resume 能力。
+> 规划态,分阶段落实,**每阶段验证门通过才进下一步**;每阶段含「代码 + 新探针 + 全量回归」,一步一提交、可独立回退。经技术负责人 Review 修订（2026-07-16）：先补执行协议状态机，Worker 剥离优先、resume 后置。
 
-## 跨-change 执行顺序（已确认，风险低→高、价值早兑现）
+## 跨-change 执行顺序（Review 修订版：阶段 0-6，Worker 先、resume 后）
 
-两个 change 合并成 8 个可独立验证的落实步,**每步验证门通过才进下一步**;每步含「代码 + 新探针 + 全量回归」,一步一提交、可独立回退:
+| 阶段 | 归属 | 内容 | 依赖 | 验证门 |
+|---|---|------|------|------|
+| **0** | 本 change | 补 durable execution 状态机 + 7 不变量 + 修正 3 处事实错误 | — | `--strict` + Review 认可 |
+| **1** | 本 change | DB 协议地基：WAL/备份/索引、统一入队、两段式 dispatch、原子 claim(CAS)、触发合并、task_run↔queue 关联 | 0 | `atomic_claim_probe`/`sse_tail_probe`/`dispatch_idempotency_probe`/`trigger_coalesce_probe` |
+| **2** | 本 change | Worker 剥离 + supervisor/heartbeat + generation + 进程 containment + kill request/ack | 1 | `worker_split_probe`/`worker_containment_probe`/`kill_ack_probe` |
+| **3** | [agent-session-resume] | Claude resume（建表/pin/水位/降级/poisoned） | 1 | ASR S1-S3 探针 |
+| **4** | [agent-session-resume] | Codex app-server（每 run 一进程/thread resume） | 1 | ASR S4 探针 |
+| **5** | 本 change | 交棒 + 有界恢复：generation/claim barrier/defer 5min/CAS supersede+child 同事务/bounded recovery/fencing | 3·4·2 | `worker_handover_probe`/`recovery_budget_probe`/`fencing_probe` |
+| **6** | 本 change | Nginx 蓝绿 + SSE 主动轮换 + expand/contract | 2 | 手动压测 + `blue_green_probe` |
 
-| 步 | 内容 | 依赖 | 验证门 |
-|---|------|------|------|
-| **1** | **PGR-M1**（起点） WAL + SSE 尾随续传 | — | `sse_tail_probe` + 全量回归,流式不退化 |
-| 2 | ASR-S1 建表 + 同(task,agent)串行 + claude session_id 抓取 | — | `agent_session_build_probe`,串行不双跑 + 回归 |
-| 3 | ASR-S2 claude resume + 快照水位增量 | 步2 | `agent_session_resume_probe`,**并发不漏话** + token 降 + 回归 |
-| 4 | ASR-S3 降级链 + poisoned 丢 session | 步3 | `agent_session_fallback_probe`,4类降级不劣于现状 |
-| 5 | ASR-S4 codex app-server + thread/resume | 步2 | `codex_session_resume_probe` + 回归 |
-| 6 | PGR-M2 worker 剥离 + 状态外置 + kill 标记 | — | `worker_split_probe`,停 API 不断 Agent + 双进程回归 |
-| 7 | **PGR-M2.5**（汇合点） defer 5min + 交棒 + 续跑 | 步4/5 + 步6 | `worker_handover_probe`(7子项) + 回归 |
-| 8 | PGR-M3 Nginx 蓝绿 | 步6 | 手动压测切换,SSE/请求不断 |
+**执行纪律**：① 验证门不过不推进;② 每阶段可独立回退;③ 需重启验证先问用户、按单实例流程;④ DB 建表/加列前用**安全在线备份**（WAL 下不可直接 cp，见 1.1b）。**本 change 覆盖阶段 0/1/2/5/6;阶段 3/4 归 [agent-session-resume]。**
 
-**执行纪律**：① 验证门不过不推进;② 每步可独立回退（不影响已达成能力）;③ 需重启验证先问用户、按单实例流程;④ DB 建表/加列前先备份 `jianagency.db`。**本 change 的 M1/M2/M2.5/M3 = 上表步 1/6/7/8;ASR 的 S1-S4 = 步 2/3/4/5。**
+## 阶段 0 — 补执行协议规格（当前，纯文档）
+- [ ] 0.1 design 决策 0：状态机 `accepted→queued→claimed→running→{succeeded/failed/killed/superseded}` + 7 不变量（已写入）
+- [ ] 0.2 spec 新增 Requirement：状态机与不变量、原子 claim、两段式 dispatch、进程 containment、generation/ack/fencing（已写入）
+- [ ] 0.3 修正 3 处事实错误：claim 非原子、`run_queue` 无 conversation_id 列、resume mismatch 判定（本 change + ASR 已改）
+- [ ] 0.4 `--strict` 校验通过 + Review 复核认可
 
-## M1 — 流式与并发地基（WAL + SSE 尾随续传，不做文件唯一源/同步器）
-- [ ] 1.1 SQLite 连接建立时开 `PRAGMA journal_mode=WAL` + `PRAGMA busy_timeout`（与 concurrency 0.1 同一件事,择一先做）
-- [ ] 1.2 SSE 端点改为**尾随 `run_logs`**：查 `run_logs WHERE run_id=? AND id > <前端已收最大 id> ORDER BY id`,轮询(~200ms)推新增行;CLI 写 run_logs 的路径(Worker 线程→`_log()`)**不动**
-- [ ] 1.3 SSE 断点续传：前端重连带「已收最大 log id」,从该点续推,不重不丢;run 未起发「排队中」占位、已终态一次性回放全量 + 收尾态
-- [ ] 1.4 新增探针 `sse_tail_probe`：CLI 写 run_logs → SSE 尾随可见;断连带 last-id 重连从断点续、不重不丢;run 终态回放全量
-- [ ] 1.5 回归全量探针,确认流式体验不退化(stdout_display 等)、读 run_logs 逻辑不回归
+## 阶段 1 — DB 协议地基（消灭双领与触发丢失；流式可重连）
+- [ ] 1.1 SQLite 连接开 `PRAGMA journal_mode=WAL`（初始化一次）+ `PRAGMA busy_timeout`（**每条新连接**都设）
+- [ ] 1.1b 安全在线备份：改用 SQLite online backup API 或 `VACUUM INTO`（**不可直接 cp 主库**——WAL 下会漏未 checkpoint 的 `-wal` 数据）；建表/加列前先备份
+- [ ] 1.1c 加索引：`run_logs(run_id,id)`、`run_queue(status,next_retry_at,id)`、active `(task_id,agent_slug,status)`
+- [ ] 1.2 **原子 claim(CAS)**：`_claim_one` 改单语句条件更新（`UPDATE...WHERE id=(子查询) AND status='queued' RETURNING *`），杜绝双领
+- [ ] 1.3 **统一入队 + 两段式 dispatch**：所有触发（人工@/auto/mention/leader）经队列;`POST /tasks/{id}/dispatch` 接 idempotency key、幂等持久化用户消息、入队、返回 `execution_id`,**不在请求内跑 CLI**;`GET /executions/{execution_id}/events` 独立 SSE 订阅
+- [ ] 1.4 **触发合并（不丢，非丢弃）**：同 (task,agent) 已有 queued→合并消息水位到该行;running→持久化 `rerun_requested`+`pending_through_message_id`+触发来源;收尾事务内据 pending 至多建一个 successor
+- [ ] 1.5 **task_run↔queue 不可变关联**：claim 同事务建 `task_runs` 行 + 写 `task_runs.run_queue_id`(UNIQUE NOT NULL)
+- [ ] 1.6 **SSE 尾随 run_logs + 续传契约**：`id:<run_logs.id>`+`Last-Event-ID`;事件 `queued/run_started/log/superseded/terminal/heartbeat`;断连带 last-id 续、run 未起发占位、终态回放全量
+- [ ] 1.7 探针：`atomic_claim_probe`(N并发只1中)、`dispatch_idempotency_probe`(同key只1execution)、`trigger_coalesce_probe`(100次触发不丢)、`sse_tail_probe`(断连续传不重不漏)
+- [ ] 1.8 回归全量探针,确认流式不退化、读 run_logs 逻辑不回归
 
-## M2 — 执行层剥离（核心：重启 API 不断 Agent）
-- [ ] 2.1 `_running` 内存计数 → 改查 DB（`SELECT COUNT(*) ... status='running'`）,并发上限判断走 DB
+## 阶段 2 — Worker 剥离（重启 API 不断 Agent；崩溃可清可拉起）
+- [ ] 2.1 `_running` 内存计数 → 查 DB（claimed+running 计数）;单 Worker 用进程内 semaphore 控本地上限
 - [ ] 2.2 新增 `worker.py` 入口：`reclaim_orphan_runs` + `_loop` 并发池 + 孤儿巡检,不起 HTTP
-- [ ] 2.3 API `startup` 不再 `start_loop()`,只保留建库/seed/静态托管;塞队列的路径不变
-- [ ] 2.4 pid 落 `task_runs.pid`（已存在字段）,Worker 起 CLI 后写入,供跨进程可见与重启兜底
-- [ ] 2.5 kill 改「标记法」：API 写 `kill_requested`（run_queue/task_runs 加列或轻表）→ Worker 轮询到 → 用进程内 pid 指纹 `taskkill /F /T` 杀树 + 落终态;沿用创建时间指纹防复用误杀;kill **不触发续跑**（用户主动停）
-- [ ] 2.6 新增探针 `worker_split_probe`：① 两进程从共享队列原子领取不重复 ② API 写 kill 标记 Worker 杀成功 ③ 停 API 保 Worker 后进行中的 run 仍推进到终态（模拟 API 重启不断 Agent）
-- [ ] 2.7 更新启动脚本/文档：分别拉起 API 与 Worker;`reclaim_orphan_runs` 归 Worker 启动时做
-- [ ] 2.8 回归全量探针（concurrency/orphan/timeout/scheduling/mention 等）在「API+Worker 双进程」下通过
+- [ ] 2.3 API `startup` 不再 `start_loop()`,只保留建库/seed/静态托管
+- [ ] 2.4 **进程 containment**：Windows Job Object + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`;POSIX `start_new_session` 进程组;持久化 `pid + pid_create_time + worker_generation`
+- [ ] 2.5 **Worker supervisor/heartbeat/readiness**：Windows Service/WinSW/NSSM 或 systemd/Docker restart 拉起;Worker 写 heartbeat/version/generation/draining/active count;`/api/health` readiness 检查 DB 可写+迁移完成+Worker 可用+协议兼容;Runtime 页显示 Worker offline/draining
+- [ ] 2.6 **kill request/ack**：API 写 `kill_requested`→Worker 轮询→按 pid+create_time 指纹 `taskkill /F /T` 杀树+落终态+**ack**;kill **不触发续跑**
+- [ ] 2.7 探针：`worker_split_probe`(两进程不重复领取、停 API 保 Worker 后 run 仍推进)、`worker_containment_probe`(Worker 崩溃后无孤儿 CLI)、`kill_ack_probe`
+- [ ] 2.8 更新启动脚本/文档：分别拉起 API 与 Worker + supervisor
+- [ ] 2.9 回归全量探针在「API+Worker 双进程」下通过
 
-## M2.5 — 温和重启 + resume 续跑（核心：改执行层重启不丢上下文；依赖 agent-session-resume）
-- [ ] 2.5.1 **前置确认**：[agent-session-resume] 的 S1/S2/S3/S4 已落地——在跑 run 有可用 `session_id`（claude 与 codex 均已接入 resume，且流中途 pin 落库）
-- [ ] 2.5.2 **温和重启 defer 窗口**：重启意图到达 → 停领新活 → 轮询 `activeTasks`,全部在跑 run 自然收尾即零中断重启;等待上限 **5 分钟**（参数化可调）内未清零才转交棒硬路径
-- [ ] 2.5.3 交棒标记（Worker 级,与 kill 标记同 DB 轮询机制,语义相反：交棒续、kill 不续）：`task_runs`/轻表加列
-- [ ] 2.5.4 旧 Worker 收到交棒标记 → 停领新活 → 对每个在跑 run：`taskkill /F /T` 杀 CLI 进程树(pid 指纹防误杀) + 旧 run 落 `superseded`（**不触发自动流转**：不误判子任务 done/父任务 reviewing）+ 依 `agent_sessions` 有无可用 session_id 入队「续跑 run」(带 `superseded_from` + resume 意图 + **系统恢复标记**) 或普通重跑(无 session) → 退出
-- [ ] 2.5.5 新 Worker 领取「续跑 run」→ **重发原始任务 prompt**（重新 `build_cli_prompt`）+ 走 [agent-session-resume] 的 resume 路径起 CLI;resume 未落地时 prompt 前置「新会话」披露（不喂空/不造「继续」指令）
-- [ ] 2.5.6 **续跑豁免防死循环配额（失败原因白名单区分）**：续跑 run 标记为系统恢复类 → 豁免 `MAX_MENTION_CHAIN` 空转链计数、不占 `MAX_RUNS_PER_TASK`;与 Agent 自发 @ 严格区分
-- [ ] 2.5.7 **副作用重复防护（不做服务端 exactly-once）**：续跑靠 session 记忆 + prompt 约束（「你之前可能已提交过，先检查再动手」「只做一次，即便非零退出也不重试」）防重复建卡/comment/改状态;关键写操作可加轻量自然去重，不追求精确幂等
-- [ ] 2.5.8 `reclaim_orphan_runs` 增强：落终态某 running run 时若有 `session_id` → 追加入队续跑 run（带 `superseded_from` 幂等标 + 系统恢复标记）,覆盖非交棒的硬崩溃;poisoned 已丢 session 的 run 不续跑
-- [ ] 2.5.9 防双续幂等：以「旧 run 是否已有 `superseded_from=该run` 的子 run」为幂等键,交棒杀 + reclaim 兜底对同一 run 至多入队一条续跑
-- [ ] 2.5.10 无 session 兜底：首次执行无 session_id / poisoned 已丢 session 的 run → 落 failed 重排队(现状,等于从头重跑该次分派)
-- [ ] 2.5.11 更新 Worker 重启脚本：发重启意图 → defer 等空闲窗口 →（超时才）发交棒标记 → 等旧 Worker 退（杀 CLI + 入队续跑完成）→ 起新 Worker(新代码)
-- [ ] 2.5.12 新增探针 `worker_handover_probe`：① 有在跑 run 先 defer、收尾后零中断重启 ② defer 超时转交棒、旧 run 落 superseded 且不触发自动流转、续跑带 resume 意图+系统恢复标记 ③ 新 Worker 重发原 prompt 以 resume 续、上下文延续 ④ 防双续:交棒+reclaim 对同一 run 只生成一条续跑 ⑤ 无 session 走从头重跑兜底 ⑥ kill 标记不触发续跑 ⑦ 续跑不吃 mention-chain/runs-per-task 配额
-- [ ] 2.5.13 回归全量探针在「交棒重启 Worker」场景下通过
+## 阶段 3/4 — resume（归 [agent-session-resume]，本 change 只依赖其产出）
+- [ ] 3.x Claude resume（ASR S1-S3）：`agent_sessions` 表 + 流中 pin + committed/planned 水位 + `--resume` + mismatch/失败降级 + poisoned 分类
+- [ ] 4.x Codex app-server（ASR S4）：每 run 一个 `codex app-server --listen stdio://` + `thread/resume`→`thread/start` + threadId pin + rollout/workdir 检查 + transport fail-fast
+- [ ] 依赖对接：阶段 5 前确认 ASR 已产出可用 `session_id`（含流中途 pin，供中断续跑）
 
-## M3 — 连接平滑（Nginx 蓝绿）
-- [ ] 3.1 新增 `deploy/nginx.conf`：`upstream` 指向 API 实例,反代 `:8100`,SSE 需 `proxy_buffering off` + 合理超时
-- [ ] 3.2 蓝绿脚本：起新 API 实例(新端口)→ `/api/health` 通过 → 切 upstream → `nginx -s reload` → 旧 API 排空退出
-- [ ] 3.3 手动验证：压测/SSE 进行中执行蓝绿切换,连接不断、请求不报错、Agent 不受影响
-- [ ] 3.4 文档：更新 README 部署段(Nginx + API + Worker 三者拉起顺序);记忆 `backend-restart-single-instance` 的手动流程由 Nginx reload 取代
+## 阶段 5 — 交棒 + 有界恢复（改执行层：能等则零中断，超时 resume 续跑）
+- [ ] 5.1 **温和重启 defer 窗口**：重启意图→停领新活→轮询 `activeTasks`,全部收尾即零中断;等待上限 **5 分钟**（参数化）内未清零才转交棒
+- [ ] 5.2 **generation + claim barrier**：`worker_state` 单行表(current_generation/state/heartbeat)+`task_runs.worker_generation`;3 态交棒 `running→draining→done`;draining 后不再 claim（与 claim 同一受保护决策点）
+- [ ] 5.3 **交棒硬路径**：旧 Worker 对每个在跑 run `taskkill /F /T` 杀树 + 旧 run **CAS supersede**（`WHERE status='running' AND worker_generation=?`，**不触发自动流转**）+ 依 session 入队续跑 run（`superseded_from`+resume 意图+系统恢复标记）**同一事务**;置 generation done → 新 Worker 确认 done 后 `g+1` 接管（ack）
+- [ ] 5.4 新 Worker 领续跑 run → **重发原始任务 prompt** + resume 路径起 CLI;resume 未落地时 prompt 前置「新会话」披露
+- [ ] 5.5 **续跑豁免防死循环配额**：续跑标系统恢复类 → 豁免 `MAX_MENTION_CHAIN`、不占 `MAX_RUNS_PER_TASK`;与 Agent 自发 @ 严格区分
+- [ ] 5.6 **副作用 at-least-once**：靠 session 记忆 + prompt 约束（「先检查再动手」「只做一次，即便非零退出也不重试」）;平台自有写操作可加 `recovery_chain_id + logical_op_key` 幂等键;外部副作用保留执行链+告警+人工确认入口;**明确写规格:恢复语义 = at-least-once，非 exactly-once**
+- [ ] 5.7 **bounded recovery**：独立维护 `recovery_attempt` + 指数退避 + 每 chain 最大恢复次数 + dead-letter/人工介入;普通 mention-chain 配额与系统恢复配额**分开统计**
+- [ ] 5.8 `reclaim_orphan_runs` 增强：落终态某 running run 时若有 session→追加入队续跑（`superseded_from` 幂等标）;poisoned 已丢 session 的不续;**无法证明旧进程已停则不建 child**（fencing 兜底）
+- [ ] 5.9 防双续幂等：`superseded_from` 唯一约束——一个父 run 至多一个 recovery child;交棒杀+reclaim 兜底对同一 run 至多入队一条
+- [ ] 5.10 **generation fencing**：`jian` 写接口带 run 的 generation，DB 校验 == 当前活跃 generation，拒 superseded/过期 generation 旧进程写平台
+- [ ] 5.11 更新 Worker 重启脚本：发重启意图 → defer 等 →（超时才）交棒 → 等旧 Worker done → 起新 Worker
+- [ ] 5.12 探针：`worker_handover_probe`(defer零中断/超时交棒/supersede+child同事务/重发原prompt续/防双续/无session兜底/kill不续/续跑不吃配额)、`recovery_budget_probe`(crash-loop 达上限进 dead-letter/退避生效)、`fencing_probe`(旧 generation 被拒写)
+- [ ] 5.13 回归全量探针在「交棒重启 Worker」场景下通过
 
-## 收尾（每期完成后）
-- [ ] 固化：本 change 完成并验证后,把 `platform-graceful-restart` 能力规格从 change delta 固化进 `specs/platform-graceful-restart/spec.md`,change 移入 `changes/archive/`
-- [ ] 联动更新 [platform-concurrency-scaling]：其 2.1（状态外置）标注「由 graceful-restart M2 提供」、2.2（多 worker 无状态消费）标注「M2 已出可多进程消费地基,concurrency 在其上做并发规模与公平」,避免重复实现
+## 阶段 6 — 连接平滑（Nginx 蓝绿）
+- [ ] 6.1 新增 `deploy/nginx.conf`：`upstream` 指向 API 实例,反代 `:8100`,SSE 需 `proxy_buffering off` + 合理超时
+- [ ] 6.2 **SSE 主动轮换**：每 15~30s 主动断,客户端按 `Last-Event-ID` 自动重连——给旧 API 确定排空上限（不靠「同一连接不断」）
+- [ ] 6.3 蓝绿脚本：起新 API 实例 → readiness(DB可写+迁移完成+Worker可用) 通过 → 切 upstream → `nginx -s reload` → 旧 API drain timeout 后退
+- [ ] 6.4 **expand/contract 部署**：① expand-only migration ② Worker 先兼容新旧 payload/schema ③ 切 API 写新格式 ④ 稳定后 contract 清旧;queue payload 加 `payload_version`,readiness 检查 API/Worker 协议兼容
+- [ ] 6.5 **`superseded` 状态影响面完整矩阵**：`run_queue`/`task_runs` schema+status 注释、`_process_one` 终态 UPDATE、`runner._finish_run`、progress/auto-flow、Runtime 总览+失败率+运行时间统计、`RunRow.vue`/`RunTranscriptDialog.vue`/`Runtime.vue` 状态颜色文案、lineage/重跑/孤儿巡检/失败归因——**出完整状态矩阵+允许转换表**，杜绝未知状态落入成功图标
+- [ ] 6.6 手动验证 + `blue_green_probe`：压测/SSE 进行中蓝绿切换,自动重连、状态与日志不重不漏、Agent 不受影响
+- [ ] 6.7 文档：更新 README 部署段(Nginx + API + Worker + supervisor 拉起顺序);记忆 `backend-restart-single-instance` 手动流程由 Nginx reload 取代
+
+## 收尾（每阶段完成后）
+- [ ] 固化：本 change 完成并验证后,把能力规格从 change delta 固化进 `specs/platform-graceful-restart/spec.md`,change 移入 `changes/archive/`
+- [ ] 联动更新 [platform-concurrency-scaling]：其 2.1（状态外置）标注「由本 change 阶段 1/2 提供」、2.2（多 worker 无状态消费）标注「本 change 出可多进程消费地基（含原子 claim CAS），concurrency 在其上做并发规模与公平」
+

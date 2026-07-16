@@ -2,6 +2,70 @@
 
 ## ADDED Requirements
 
+### Requirement: durable execution 状态机与并发不变量
+
+系统 SHALL 以持久化执行状态机承载每次执行：一条 `run_queue` 行 = 一个 execution，状态 `accepted → queued → claimed → running → {succeeded | failed | killed | superseded}`，claimed 时 SHALL 同事务创建其唯一关联的 `task_runs` 行。系统 SHALL 满足以下不变量：① 一个 queue item 同一时刻只被一个 Worker generation 持有;② 同一 `(task, agent)` 最多一个 running 且最多一个持久化 pending intent;③ `running→succeeded` 与 `running→superseded` 通过 CAS 竞争只能一个成功;④ `superseded + recovery child 入队` 同一事务提交;⑤ 旧 generation 不能 finalize、不能写平台（fencing）;⑥ recovery chain 有次数上限 + 退避 + dead-letter;⑦ task_run/run_queue/session 水位/消息投递之间有明确事务边界。所有终态转换 SHALL 用 `WHERE status='running' AND worker_generation=?` 的 CAS 落定。
+
+#### Scenario: 自然完成与交棒互斥
+- **WHEN** 一个 running run 同时被「自然完成」与「交棒 supersede」触发
+- **THEN** 两者通过 CAS 竞争，只有一个成功落终态；结果只能是「succeeded 且无 recovery child」或「superseded 且恰好一个 recovery child」，不出现互相覆盖或半提交
+
+#### Scenario: supersede 与 recovery child 同事务
+- **WHEN** 一个 running run 被交棒中断需要续跑
+- **THEN** 「旧 run 落 superseded」与「recovery child 入队」在同一事务提交，不出现「已 superseded 但无 child」的半提交状态
+
+#### Scenario: 旧 generation 被 fencing
+- **WHEN** 一个属于旧 Worker generation 的进程（含崩溃后残留的孤儿 CLI）尝试 finalize run 或调用 `jian` 写平台
+- **THEN** 系统按 generation 校验拒绝该写入（当前活跃 generation 不匹配），防止旧执行与恢复执行双写
+
+### Requirement: 原子 claim（CAS 单语句领取）
+
+系统 SHALL 用单语句条件更新原子领取 queued run：`UPDATE run_queue SET status='claimed', claim_owner=?, claim_generation=?, claimed_at=... WHERE id=(子查询选一条 queued) AND status='queued' RETURNING *`。`AND status='queued'` 的 CAS 条件 SHALL 保证多个 Worker 竞争同一行时至多一个成功。SHALL NOT 使用「先 SELECT 再无条件 UPDATE」的两步领取。并发上限判断在多 Worker 下 SHALL 使用原子容量机制而非「先 COUNT 再 claim」（单 Worker 阶段可用进程内 semaphore）。
+
+#### Scenario: 并发竞争同一行只有一个成功
+- **WHEN** 多个 Worker 同时尝试领取同一个 queued run
+- **THEN** CAS 条件使至多一个 UPDATE 命中，该 run 只被一个 Worker 领取，其余落空去领下一条，不重复不遗漏
+
+#### Scenario: claim 即建 task_run 关联
+- **WHEN** 一个 run 被原子领取（进入 claimed）
+- **THEN** 同一事务内创建其 `task_runs` 行并写 `task_runs.run_queue_id`（UNIQUE NOT NULL），建立不可变关联，不再等执行结束才回填
+
+### Requirement: 两段式 dispatch（提交与订阅分离）
+
+系统 SHALL 把所有触发（人工 @、auto-dispatch、mention、leader 协同）统一经持久化队列，采用两段式协议：① `POST /tasks/{id}/dispatch` 接收客户端 idempotency key，幂等持久化用户消息、创建 durable execution 入队、立即返回稳定 `execution_id`，SHALL NOT 在请求内直接执行 CLI;② `GET /executions/{execution_id}/events` 独立 SSE 订阅，按 execution_id 尾随日志，API 重启后可重新订阅。相同 idempotency key 重试 POST SHALL 只产生一条用户消息与一个 execution。
+
+#### Scenario: 提交不在请求内执行
+- **WHEN** 用户人工 @ 一位成员触发执行
+- **THEN** API 幂等入队并立即返回 execution_id，不在 POST 请求内同步跑 CLI；执行由 Worker 领取，API 重启不影响该执行
+
+#### Scenario: POST 幂等
+- **WHEN** 相同 idempotency key 的 dispatch 请求被重试（网络抖动/前端重发）
+- **THEN** 系统只产生一条用户消息与一个 execution，不重复入队
+
+### Requirement: 子进程 containment（Worker 死则 CLI 死）
+
+系统 SHALL 保证 CLI 子进程不因 Worker 崩溃而成为继续运行的孤儿：Windows SHALL 用 Job Object + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，POSIX SHALL 用 `start_new_session` 独立进程组 + 父死清理。系统 SHALL 持久化 `pid + pid_create_time + worker_generation`（不只存 pid、不只在内存），使重启后可比对进程身份。恢复中断的 run 前系统 SHALL 先确认旧进程树已清理；无法证明旧执行已停止时 SHALL NOT 创建 recovery child（宁可不续，不可双执行），并以 generation fencing 作为兜底。
+
+#### Scenario: Worker 崩溃后无孤儿 CLI
+- **WHEN** Worker 进程崩溃退出
+- **THEN** 其启动的 CLI 子进程树被 OS（Job Object / 进程组机制）连带清理，不留下继续运行的孤儿进程
+
+#### Scenario: 无法证明旧进程已停则不续跑
+- **WHEN** 恢复某中断 run 前，无法确认其旧 CLI 进程树已被清理
+- **THEN** 系统不创建 recovery child，避免旧 CLI 与恢复 CLI 双执行；generation fencing 兜底拒绝旧进程写平台
+
+### Requirement: Worker generation 与交棒 ack
+
+系统 SHALL 用单调递增的 Worker generation 标识执行世代，持久化于 `worker_state` 单行表（current_generation/state/heartbeat_at）与每个 `task_runs.worker_generation`。交棒 SHALL 走 3 态：`running(g) → draining(g)`（旧 Worker 停领、杀在跑 CLI、supersede + 入队 recovery child、置 done）`→` 新 Worker 确认旧 generation 为 done 后 `g+1` 接管（ack）。claim 与 draining 检查 SHALL 在同一受保护决策点完成（draining 后不再 claim），关闭「停领与新任务刚进」的竞态。
+
+#### Scenario: 新 Worker 确认旧世代 done 才接管
+- **WHEN** 旧 Worker 进入 draining 并完成 kill/supersede/入队 recovery child、置 generation 为 done
+- **THEN** 新 Worker 读到 done 后才升 generation 接管领取，不与旧 Worker 并发持有同一 run
+
+#### Scenario: draining 后不再领新活
+- **WHEN** Worker 已进入 draining 状态
+- **THEN** 该 Worker 不再 claim 新 run，避免「正在停机却又领了新任务」的竞态
+
 ### Requirement: API 层与执行层解耦
 
 系统 SHALL 将 Agent 执行(队列消费、CLI 子进程、并发池)从 API 进程剥离到独立的 Worker 进程。API 进程 SHALL NOT 直接执行 Agent,只负责 HTTP/API、往队列塞任务、尾随日志转发流式、写 kill/交棒标记。Worker 进程 SHALL 负责领取队列、起 CLI、跑 Agent、落终态、孤儿回收。API 进程 SHALL 无执行态(状态全在 DB 与 Worker),从而可独立重启。
@@ -16,7 +80,7 @@
 
 ### Requirement: 调度状态外置以支持多进程
 
-系统的并发调度状态 SHALL 外置到数据库,不依赖单进程内存。并发计数 SHALL 由 DB 查询得出(`run_queue`/`task_runs` 的 running 计数),run 领取 SHALL 保持原子(SELECT queued + UPDATE running + commit),使多个 Worker 进程可安全竞争同一队列而不重复领取、不丢任务。执行 run 的 pid SHALL 落库(`task_runs.pid`),跨进程可见。
+系统的并发调度状态 SHALL 外置到数据库,不依赖单进程内存。并发计数 SHALL 由 DB 查询得出(`run_queue`/`task_runs` 的 claimed+running 计数)。run 领取 SHALL 用「原子 claim（CAS 单语句领取）」Requirement 定义的方式（**非**现状「SELECT + 无条件 UPDATE」两步），使多个 Worker 进程可安全竞争同一队列而不重复领取、不丢任务。执行 run 的 `pid + pid_create_time + worker_generation` SHALL 落库,跨进程可见且可校验进程身份。
 
 #### Scenario: 多进程不重复领取
 - **WHEN** 多个 Worker 进程同时从共享队列领取待执行 run

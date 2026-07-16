@@ -4,11 +4,11 @@
 
 ### Requirement: per-(task, agent) CLI 会话复用与串行
 
-系统 SHALL 为每个 `(conversation_id, agent_slug)` 维护一条 CLI session,持久化于 `agent_sessions` 表（唯一键 `(conversation_id, agent_slug)`）。同一 Agent 在同一 task 里再次被触发执行时,系统 SHALL 复用该 session（CLI resume）,而非每次新建会话。session 记录 SHALL 含 `session_id`、`snapshot_msg_id`（增量快照水位）、`provider_id`、`backend`、`workdir`。粒度 SHALL 为 (conversation, agent)——同一 task 内每个成员各持独立 session,互不干扰。系统 SHALL 保证同一 `(conversation, agent)` 至多一个 queued/running run（串行）,重复触发折叠进下一轮,而非并行起第二条;全局并发上限约束的是不同 (task, agent) 的并行度,与此串行正交。
+系统 SHALL 为每个 `(conversation_id, agent_slug)` 维护一条 CLI session,持久化于 `agent_sessions` 表（唯一键 `(conversation_id, agent_slug)`）。同一 Agent 在同一 task 里再次被触发执行时,系统 SHALL 复用该 session（CLI resume）,而非每次新建会话。session 记录 SHALL 含 `session_id`、`committed_msg_id`（上次成功执行确认的增量水位）、`provider_id`、`backend`、`workdir`;本次执行的快照终点 `planned_through_msg_id` SHALL 落在 `task_runs` 行。粒度 SHALL 为 (conversation, agent)——同一 task 内每个成员各持独立 session,互不干扰。系统 SHALL 保证同一 `(conversation, agent)` 至多一个 queued/running run（串行）,重复触发 SHALL **折叠**进下一轮（合并触发意图，不丢弃），而非并行起第二条;`run_queue` 无 conversation_id 列，折叠 SHALL 用「queued 合并水位 / running 记 pending intent、收尾建至多一个 successor」实现，SHALL NOT 依赖 `(conversation_id, agent_slug)` partial unique index。全局并发上限约束的是不同 (task, agent) 的并行度,与此串行正交。
 
 #### Scenario: 首次执行建立 session
 - **WHEN** 某 Agent 在某 task 首次被触发执行（`agent_sessions` 无该 (conversation, agent) 行）
-- **THEN** 系统开新 CLI 会话（不带 resume）、执行成功后把 CLI 返回的 `session_id`、`provider_id`、`backend`、`workdir`、构建 prompt 时的 `MAX(messages.id)` 作为 `snapshot_msg_id` 落库
+- **THEN** 系统开新 CLI 会话（不带 resume）、执行成功后把 CLI 返回的 `session_id`、`provider_id`、`backend`、`workdir` 落 `agent_sessions`，并把本次成功喂到的水位作为 `committed_msg_id` 落库
 
 #### Scenario: 再次执行复用 session
 - **WHEN** 同一 (conversation, agent) 再次被触发,且已有 session 且 backend/provider/workdir 未变
@@ -40,11 +40,15 @@
 
 ### Requirement: resume 落地判定与失效降级（不劣于现状）
 
-系统 SHALL 判定 resume 是否真正落地,并在 session 不可用的任何情形下回退到「全量回灌 + 新建会话」,保证行为不劣于改造前。判定 SHALL 覆盖：请求了 resume 但 CLI 报会话不存在（如 "no conversation found"）、或输出的 session_id 与请求的不一致 → 判 resume 未落地。降级情形 SHALL 覆盖：resume 未落地、provider/backend 变更、workdir 变更、（未来多机）runtime 不匹配。降级 SHALL 对用户无感（自动重开会话、执行正常完成）。
+系统 SHALL 判定 resume 是否真正落地,并在 session 不可用的任何情形下回退到「全量回灌 + 新建会话」,保证行为不劣于改造前。落地判定 SHALL 仅在**执行失败**时把 mismatch 判为未落地：`失败 && (CLI 报会话不存在如 "no conversation found" 或 输出 session_id 与请求不一致)` → 判 resume 未落地。**执行成功但输出 session_id 与请求不一致 SHALL 视为正常**（resume 后 CLI 可能 fork 新 session id），系统 SHALL 接受并覆盖保存新 id，SHALL NOT 判为失败。降级情形 SHALL 覆盖：resume 未落地、provider/backend 变更、workdir 变更、（未来多机）runtime 不匹配。降级 SHALL 对用户无感（自动重开会话、执行正常完成）。
 
-#### Scenario: resume 未落地自动回退
-- **WHEN** 以 resume 启动 CLI,CLI 报会话不存在,或输出 session_id 与请求的不一致
+#### Scenario: 失败且 mismatch 才判未落地并回退
+- **WHEN** 以 resume 启动 CLI，执行**失败**且 CLI 报会话不存在（或输出 session_id 与请求不一致）
 - **THEN** 系统判定 resume 未落地、清除失效 session_id、本次降级为全量回灌 + 新建会话,执行正常完成,新 session_id 落库供后续复用
+
+#### Scenario: 成功返回新 session_id 则接受覆盖存
+- **WHEN** 以 resume 启动 CLI，执行**成功**但输出的 session_id 与请求的不一致（CLI fork 了新会话）
+- **THEN** 系统视为正常，接受并以新 session_id 覆盖保存，SHALL NOT 判为失败或降级
 
 #### Scenario: provider/workdir 变更弃旧会话
 - **WHEN** 某 (conversation, agent) 已有 session,但当前执行的 `provider_id`/`backend`/`workdir` 与存储值不一致
@@ -64,15 +68,19 @@
 
 ### Requirement: 增量上下文回灌（快照水位 + 排除自产）
 
-系统 SHALL 在复用 session 执行时只回灌「增量上下文」,而非全量历史。增量水位 SHALL 用 **prompt-build 快照水位** `snapshot_msg_id`（= 构建本次 prompt 那刻该 conversation 的 `MAX(messages.id)`）,而 **SHALL NOT** 用「执行完成时的 MAX(id)」——后者在并发下会把执行期间别人新写的消息算进水位而导致漏话。增量 = `messages WHERE conversation_id=? AND id > snapshot_msg_id AND 作者非本 agent`（参数化 `id > ?`）：别人/人工在上一快照后说的话喂给本 Agent,本 Agent 自己的历史发言由 CLI session 记忆承载、不重喂。增量仍 SHALL 过历史裁剪防单次海量。首次执行（无 session）SHALL 回灌全量历史（现状行为）。
+系统 SHALL 在复用 session 执行时只回灌「增量上下文」,而非全量历史。增量水位 SHALL 用 **2 字段两阶段**：`agent_sessions.committed_msg_id`（上次**成功**执行确认的水位，**只有 run 成功收尾才推进**）+ `task_runs.planned_through_msg_id`（本次构建 prompt 那刻的快照终点 = 当时 `MAX(messages.id)`）。系统 **SHALL NOT** 用「执行完成时的 MAX(id)」做单一水位（并发下会把执行期间别人新写的消息算进而漏话）。增量 = `messages WHERE conversation_id=? AND id > committed_msg_id AND id <= planned_through_msg_id AND 作者非本 agent`（参数化）：别人/人工在上次成功水位之后、本次快照之前说的话喂给本 Agent,本 Agent 自己的历史发言由 CLI session 记忆承载、不重喂。**不变量 = at-least-once**：崩溃/中断时 committed 未推进 → 续跑从同一起点重取 → 重复但不漏;prompt 构建后、CLI 接收前崩溃时 committed **SHALL NOT** 提前推进。增量仍 SHALL 过历史裁剪防单次海量。首次执行（无 session）SHALL 回灌全量历史（现状行为）。
 
 #### Scenario: 复用执行只喂增量
 - **WHEN** 某 (conversation, agent) 带 session resume 执行,其间别人新增了若干条 messages
-- **THEN** 系统只把 `id > snapshot_msg_id` 且非本 agent 自产的新增 messages 拼进 prompt,不重复喂更早历史,也不重喂本 Agent 自己的旧发言
+- **THEN** 系统只把 `id > committed_msg_id AND id <= planned_through_msg_id` 且非本 agent 自产的新增 messages 拼进 prompt,不重复喂更早历史,也不重喂本 Agent 自己的旧发言
 
 #### Scenario: 并发不漏话
-- **WHEN** Agent A 执行期间,Agent B 在同一 conversation 写了发言（其 id 大于 A 本次的 snapshot_msg_id）
-- **THEN** A 本次水位只推进到 A 自己的快照,B 的发言在下次触发 A 时被正确纳入增量,不漏
+- **WHEN** Agent A 执行期间,Agent B 在同一 conversation 写了发言（其 id 大于 A 本次的 planned_through_msg_id）
+- **THEN** B 的发言不在 A 本次增量内，但因 A 的 committed 只推进到本次成功水位（仍在 B 之前）,B 的发言在下次触发 A 时被正确纳入增量,不漏
+
+#### Scenario: 崩溃不漏（at-least-once）
+- **WHEN** A 的 prompt 构建后、run 未成功收尾即崩溃/被中断（committed_msg_id 未推进）
+- **THEN** 续跑从同一 committed_msg_id 起点重取增量，已喂的消息重复喂但不漏，满足 at-least-once
 
 #### Scenario: 增量为空
 - **WHEN** 自上次快照后无他人新 messages（增量为空）
@@ -84,7 +92,7 @@
 
 ### Requirement: backend 分流（claude 与 codex 均必选）
 
-系统 SHALL 支持 claude 与 codex 两个 backend 的 session 复用,均为必选（用户重度使用 codex）。claude backend SHALL 用 `-p --resume <session_id>` flag。codex backend SHALL 改用 `codex app-server --listen stdio://` 长驻进程 + JSON-RPC `thread/resume`（不可恢复时回退 `thread/start`,传输/进程错误 fail-fast）+ `turn/start`,以 `threadId` 作为其 session 标识。runner SHALL 依 `agent_sessions.backend` 分流到对应实现;两 backend 共用同一 `agent_sessions` 表、降级链与 poisoned 分类。
+系统 SHALL 支持 claude 与 codex 两个 backend 的 session 复用,均为必选（用户重度使用 codex）。claude backend SHALL 用 `-p --resume <session_id>` flag。codex backend SHALL **每次执行 attempt 启动一个** `codex app-server --listen stdio://` 进程（run 结束即关，**非** Worker 全局共享一个 app-server）+ JSON-RPC `thread/resume`（不可恢复时回退 `thread/start`,传输/进程错误 fail-fast）+ `turn/start`,以 `threadId` 作为其 session 标识。runner SHALL 依 `agent_sessions.backend` 分流到对应实现;两 backend 共用同一 `agent_sessions` 表、降级链与 poisoned 分类。
 
 #### Scenario: claude 走 flag resume
 - **WHEN** 执行 backend 为 claude 且命中可用 session

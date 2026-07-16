@@ -1,6 +1,8 @@
 # Design — 平滑重启 / 热更新
 
-> 目标：改代码可随时重启 API,**用户访问不断、正在跑的 Agent 不中断**。分期 M1→M2→M3,每期独立可验证。本文记录架构、关键取舍与落地细节,**不含代码改动**。
+> 目标：改代码可随时重启,**用户访问不断、正在跑的 Agent 不中断**（改 API 零中断;改执行层温和重启:能等则零中断,超时中断后 resume 续跑不丢上下文）。**分期改为阶段 0-6（先补执行协议状态机再实现，Worker 剥离优先、resume 后置）**——见文末「实施阶段」。本文记录架构、执行状态机与不变量、关键取舍与落地细节,**不含代码改动**。
+>
+> **本文经技术负责人 Review 修订（2026-07-16）**：核心升级 = 从「resume 功能列表」升级为「持久化执行协议」——先定义 durable execution 状态机 + 并发不变量（见「决策 0」），再谈 resume。修正了原方案 3 处事实错误（claim 非原子、`run_queue` 无 conversation_id 列、resume mismatch 判定过严）。
 
 ## 现状（实地核查确认）
 
@@ -9,12 +11,15 @@
 | Agent 执行是 API 进程内 asyncio 协程 | `collab._loop` / `_process_one` | 进程停 → 协程消失 → run 被判死 |
 | CLI 是本进程 `subprocess.Popen` 子进程 | `executor/claude_code.py`,`codex.py` | 进程停 → 子进程成孤儿/被清 |
 | SSE 直接持有 CLI stdout 边读边推 | `routes/runs.py` `event_stream` | 进程停 → 流式断 |
-| 任务领取**已原子** | `collab._claim_one`（SELECT queued + UPDATE running + commit） | ✅ 多进程消费地基已具备 |
-| 并发计数在内存 | `collab._running` 集合 | ✋ 需外置到 DB 才能多进程 |
-| pid 注册表在内存,带创建时间指纹 | `executor/runner._RUN_PIDS` | ✋ 跨进程 kill 需重建;指纹可跨进程重算 |
-| `task_runs.pid` 字段已存在 | DB schema | ✅ pid 可落库,跨进程可见 |
+| 任务领取**非原子**（Review 修正） | `collab._claim_one:826`（先 SELECT queued LIMIT 1，再 UPDATE running，UPDATE **无** `AND status='queued'` CAS 条件） | 🔴 单进程 asyncio 下不被打断故当前安全;**多 Worker 会双领双执行**。原方案「已原子/地基已具备」判断**错误** |
+| 人工 @ 主受理人**在 API 请求内同步执行**（Review 修正） | `routes/runs.py:53-105` `dispatch` → `runner.execute_dispatch()`，POST 响应即 SSE 流 | 🔴 不经队列/Worker;API 重启直接断;M2「API 不执行 Agent」未覆盖此主路径,必须改两段式 |
+| 重复触发是**丢弃**非折叠（Review 修正） | `collab.py:392`（同 task/agent 已有 queued/running 直接 `return None`） | 🔴 新触发被静默丢;且 `run_queue` **无 conversation_id 列**，原 spec 写的 `(conversation_id,agent_slug)` partial index **建不出来** |
+| 并发计数在内存 | `collab._running` 集合 | ✋ 需外置到 DB 才能多进程;「COUNT running 再 claim」仍有超卖竞态,需原子容量判断 |
+| pid 指纹在内存,子进程**无 containment**（Review 修正） | `executor/runner._RUN_PIDS:17`;`claude_code.py:80`/`codex.py:62` 的 Popen **无** Job Object/`start_new_session` | 🔴 Worker 崩溃后旧 CLI 可能存活成孤儿→与 resume 后的新 CLI **双执行**;内存指纹崩溃即丢 |
+| `task_runs` 只存 pid | DB schema `database.py:155` | ✋ 未存 `pid_create_time`/`worker_generation`,重启后无法证明旧进程身份;`task_run↔run_queue` 关联到结束才回填,交棒中途对不上 |
 
 **核心矛盾**：Agent 执行寿命 = API 进程寿命。**解法：把执行层剥离成独立 Worker 进程。**
+**但先决条件（Review 核心结论）**：剥离前必须先有**持久化执行状态机 + 并发不变量**（原子 claim、generation/fencing、task_run↔queue 事务化关联），否则多 Worker/交棒下会出现**双执行**与**触发丢失**两类正确性事故。见决策 0。
 
 ## 目标架构
 
@@ -41,6 +46,35 @@
 
 ## 关键设计决策
 
+### 决策 0：durable execution 状态机 + 并发不变量（Review 核心，最优先）
+
+一切平滑重启/resume 都建立在一个**持久化执行状态机**上。先定义状态、转换与不变量，再谈剥离与续跑。
+
+**状态机**（每个 execution = 一条 `run_queue` 行 + 其唯一关联的 `task_runs` 行）：
+
+```
+accepted → queued → claimed → running ─┬─→ succeeded
+                                       ├─→ failed
+                                       ├─→ killed        (用户主动 kill，不续跑)
+                                       └─→ superseded    (交棒/reclaim 中断) + 恰好一个 recovery child 入队
+```
+
+- **accepted**：POST 已幂等持久化用户消息 + 建 durable execution，返回稳定 `execution_id`（= run_queue_id）。此刻还没进调度。
+- **queued**：进入可领取队列。
+- **claimed**：被某 Worker generation 原子领取（CAS），**同时**建 `task_runs` 行并建立不可变关联；尚未起 CLI。
+- **running**：CLI 已起、`pid + pid_create_time + worker_generation` 落库。
+- **终态**：succeeded/failed/killed/superseded，均以 `WHERE status='running' AND worker_generation=?` 的 CAS 落定。
+
+**7 条不变量**（实现必须逐条满足）：
+
+1. 一个 queue item 同一时刻只能被**一个 Worker generation** 持有（claim 原子 + generation）。
+2. 同一 `(task, agent)` 最多**一个 running**，且最多**一个持久化 pending intent**（重复触发合并进 intent，不丢不并发）。
+3. `running→succeeded` 与 `running→superseded` 通过 **CAS 竞争，只能一个成功**（自然完成与交棒不互相覆盖）。
+4. `superseded + recovery child 入队` 在**同一事务**提交（不出现「旧 run 已 superseded 但无 child」的半提交）。
+5. **旧 generation 不能 finalize、不能再调用 `jian` 写平台**（fencing：写接口带 run 的 generation，DB 校验 == 当前活跃 generation，不符拒写——防孤儿 CLI 双写）。
+6. recovery chain 有**明确次数上限 + 退避 + dead-letter**（防 crash-loop 无限 resume 烧 token）。
+7. `task_run`、`run_queue`、session watermark、消息投递之间有**明确事务边界**（见决策 6 与 [agent-session-resume] 水位）。
+
 ### 决策 1：流式改为「SSE 尾随 run_logs + 断点续传」（不做「文件唯一真相源+同步器」）
 
 **背景修正**：早期为「托孤」设想过「CLI 输出直写文件、同步器回填 run_logs」——目的是让 CLI 输出脱离 Worker 进程存活,供托孤后新 Worker 续跟。**改走静默+resume 路线后,重启会中断 CLI,CLI 无需脱离进程独立存活,这套重活整段砍掉。**
@@ -56,12 +90,22 @@
 - API 重启导致 SSE 断 → 前端带「已收最大 log id」重连续传,不重不丢。
 - **Worker 温和重启超时后 run 被中断→resume 续跑** → 续跑是**新的一次执行**(新 run),前端 SSE 会看到该 task 的执行链路衔接到新 run(与现有「一个 task 多条 run」的展示一致);被中断的旧 run 落终态(`superseded`)。
 
-### 决策 2：调度状态外置——`_running` 计数改查 DB
+### 决策 2：原子 claim + 调度状态外置（Review 修正：claim 必须改成 CAS）
 
-- 现状 `_running` 是内存 set,存「本进程正在跑的 run_queue id」,用于并发上限判断。
-- 外置：并发计数改为 `SELECT COUNT(*) FROM run_queue WHERE status='running'`(或 task_runs 同义)。
-- `_claim_one` 已原子(UPDATE status='running'),多 worker 竞争领取天然安全,不重复领取。
-- **与 concurrency 的 2.1 同一件事**：此项一次做,两个 change 都满足。
+- **原子 claim（P0-2）**：现 `_claim_one` 是「SELECT queued LIMIT 1 → UPDATE running」两步，UPDATE 无 CAS 条件，多 Worker 会双领。改为**单语句条件更新**：
+  ```sql
+  UPDATE run_queue
+     SET status='claimed', claim_owner=?, claim_generation=?, claimed_at=datetime('now'), lease_until=?
+   WHERE id=( SELECT q.id FROM run_queue q LEFT JOIN tasks t ON t.id=q.task_id
+              WHERE q.status='queued' AND (q.next_retry_at IS NULL OR q.next_retry_at<=datetime('now'))
+              ORDER BY CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, q.id LIMIT 1 )
+     AND status='queued'
+  RETURNING *;
+  ```
+  `AND status='queued'` 是 CAS 关键：两 Worker 竞争同一行，只有一个 UPDATE 命中。（未来 Postgres 用 `FOR UPDATE SKIP LOCKED + RETURNING`。）
+- **并发计数外置**：`_running` 内存 set → `SELECT COUNT(*) ... status IN ('claimed','running')`。**注意**：「先 COUNT 再 claim」在多 Worker 下仍有超卖竞态——单 Worker 用进程内 semaphore 控本地上限即可（本 change 只跑单 Worker）；多 Worker 的原子容量判断归 [platform-concurrency-scaling]。
+- **claim 即建 task_run 关联（P0-6）**：claim 成功的同一事务内创建 `task_runs` 行并写 `task_runs.run_queue_id`（UNIQUE NOT NULL），建立不可变关联——不再等执行结束才回填，交棒中途也能对上。
+- **与 concurrency 的 2.1 协调**：状态外置由本 change 做，concurrency 复用；但「原子 claim CAS」是本 change 必须先补的正确性前提，非「已具备」。
 
 ### 决策 3：跨进程 kill——API 写标记,Worker 自杀其子进程
 
@@ -102,6 +146,47 @@
 
 **防重复续跑**：续跑 run 入队时打标（如 `superseded_from=<旧 run_id>`),避免交棒杀 + reclaim 兜底对同一 run 各入队一次导致双续。以「旧 run 是否已生成续跑 run」为幂等键。
 
+### 决策 6：所有触发统一入队 + 两段式 dispatch（Review P0-1）
+
+现状人工 @ 主受理人走 `dispatch` → API 请求内 `runner.execute_dispatch()` 同步跑 CLI、POST 响应即 SSE。剥离后这条路径要么随 API 重启断、要么违反「API 不执行 Agent」。**改为两段式协议，人工/auto/mention/leader 所有触发统一经持久化队列**：
+
+1. **`POST /tasks/{id}/dispatch`**（提交）：接收客户端 **idempotency key** → 幂等持久化用户消息 → 建 durable execution(入队) → **立即返回稳定 `execution_id`(=run_queue_id)**。不在请求内跑 CLI。
+2. **`GET /executions/{execution_id}/events`**（订阅）：独立 SSE，按 execution_id 尾随 `run_logs`；API 重启后可重新订阅。
+
+幂等：同一 idempotency key 重试 POST 只产生一条 user message + 一个 execution。
+
+### 决策 7：进程 containment——子进程随 Worker 死，杀得净（Review P0-5）
+
+现状 claude/codex 的 `Popen` 无 Job Object/`start_new_session`，Worker 崩溃后 CLI 可能成孤儿继续跑，与 resume 后的新 CLI **双执行**。必须：
+
+- **Windows**：把 CLI 挂进 **Job Object** 并设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`——Worker 进程（持 Job 句柄）死亡时 OS 自动杀整个 Job 内进程树。
+- **POSIX**：`start_new_session=True` 独立进程组 + supervisor/PDEATHSIG 保证父死清理。
+- **持久化 `pid + pid_create_time + worker_generation`**（不再只存 pid、不再只在内存）——重启后可比对 create-time 证明进程身份。
+- **恢复前先安全清理旧进程树并确认成功**；无法证明旧执行已停 → **不创建 recovery child**（宁可不续，不可双执行）。
+- **fencing 兜底**（不变量 5）：即便清理有遗漏，`jian` 写接口按 generation 拒绝旧进程写平台。
+
+### 决策 8：交棒有 generation + ack + fencing（Review P0-4；单机简化版）
+
+交棒不是「写标记就杀」，要有世代与确认。**单机单 Worker 采用简化模型**（不建多节点的 `worker_instances`/`restart_requests` 表）：
+
+- **`worker_state` 单行轻表**：`current_generation, state(running/draining/done), heartbeat_at`。
+- **`task_runs.worker_generation`**：每个 run 归属的 Worker 世代。
+- **3 态交棒**：`running(g) → draining(g)`（旧 Worker 停领、杀在跑 CLI、superseded+入队 recovery child、置 done） → 新 Worker 读到旧 generation `done` 才 **`g+1` 接管**（ack）。
+- **claim 与 draining 同一受保护决策点**：draining 后不再 claim（关闭「停领与新任务刚进」的竞态）；单机用进程内标志 + DB `worker_state` 即可，不需 OS 分布式锁。
+- **fencing**：`g` 世代的进程/run 不能 finalize 也不能写平台（不变量 5）。
+- 多个重启请求：单机场景后到的重启覆盖前一个 draining 意图即可，不需 restart_requests 表管合并。
+
+### 决策 9：SSE 续传完整契约（Review P0-7）
+
+SSE 不止「带最大 log id 重连」，需完整契约：
+
+- 标准 `id: <run_logs.id>` + `Last-Event-ID` 头；事件类型：`queued / run_started{task_run_id} / log{log_id,channel,content,tool,tool_input,tool_output,meta} / superseded{successor_execution_id} / terminal{status} / heartbeat`。
+- **superseded 跳转**：run 被交棒中断 → 推 `superseded{successor_execution_id}` → 前端自动订阅 successor（恢复 run），用户视觉连续。
+- queue 尚未建 task_run 时订阅 → 先收 `queued` 占位。
+- **SSE 主动轮换**：每 15~30s 主动断，客户端按 `Last-Event-ID` 自动重连——给旧 API（蓝绿排空）**确定的排空上限**，不靠「同一连接不断」。
+- 日志清理后带过旧 Last-Event-ID → 明确降级（回放可得部分 + 提示）。
+- **验收口径**：写成「自动重连、状态与日志不重不漏」，**非绝对「同一连接不断」**。
+
 ## 落地技术细节
 
 **T0 — 温和重启 defer 窗口（M2.5 前置）**：重启意图到达后先停领新活、轮询 `activeTasks`；全部在跑 run 自然收尾即零中断重启。等待上限 **5 分钟**（参数化可调）内未清零才转入交棒硬路径。参数化配置,避免长任务把重启无限拖住。
@@ -121,16 +206,28 @@
 
 **T6 — 收尾幂等（复用现状，不需收尾重建）**：续跑是「新 run 走完整现有收尾链路」,旧 run 已由交棒/reclaim 落终态。收尾幂等靠现有 `_finalize_if_running`(`WHERE status='running'` 条件更新)——无需为托孤设计「任意 Worker 基于日志重建收尾」那套。
 
-| 里程碑 | 交付 | 达成的用户价值 | 验证 |
-|--------|------|----------------|------|
-| **M1** 流式与并发地基 | WAL+busy_timeout;SSE 尾随 run_logs + 断点续传 | API 重启后前端流式可续(不重不丢);WAL 让读写不互锁 | 新增「SSE 尾随续传」探针:断连带 last-id 重连从断点续、不重不丢、run 终态回放全量 |
-| **M2** 执行层剥离 | worker.py;API 不 start_loop;`_running`→DB;kill→DB 标记;pid 落库 | **重启 API 时 Agent 不中断** | 新增「多进程消费 + 跨进程 kill」探针:两进程不重复领取、API 写标记 Worker 杀成功、停 API 保 Worker 后 run 仍推进 |
-| **M2.5** 温和重启 + resume 续跑(核心) | defer 等空闲窗口;超时才交棒;旧 Worker 杀在跑 CLI + run 标 `superseded` + 入队续跑(重发原 prompt+豁免配额);reclaim 增强追加续跑;防双续幂等 | **重启 Worker(改执行层)时:能等则零中断;等不到则秒级中断后 resume 续跑,上下文不丢** | 新增「温和重启续跑」探针:①有在跑 run 时先 defer、run 收尾后零中断重启 ②defer 超时转交棒、旧 run 落 superseded、续跑带 resume 意图+系统恢复标记 ③新 Worker 重发原 prompt 以 resume 续 ④防双续幂等 ⑤无 session 走从头重跑兜底 ⑥续跑不吃 mention-chain/runs-per-task 配额 |
-| **M3** 连接平滑 | Nginx 反代 + 蓝绿脚本 | **改代码重启 API 用户连接不断** | 手动验证:压测期间蓝绿切换,进行中的 SSE 与请求不报错 |
+## 实施阶段（Review 修订：Worker 先、resume 后，先补状态机）
 
-- **顺序**：M1 → M2 → M2.5 → M3。M2 依赖 M1(WAL + SSE 续传);**M2.5 依赖 [agent-session-resume] 先出 resume 能力** + 本 change M2(独立 Worker + 交棒机制);M3 依赖 M2(API 无状态才可蓝绿),与 M2.5 相对独立可并行。
-- **达标线**：M1+M2 达成「改 API 平滑」;**M2.5 达成「改执行层重启也不丢上下文(resume 续跑)」**;M3 达成「用户连接不断」。
-- **回退**：每期独立,若 M2.5 遇阻(如 agent-session-resume 未就绪)可停在 M2(改 API 已平滑、改执行层暂退回「重启从头重跑」),不影响已达成的能力。
+| 阶段 | 交付 | 用户价值/目的 | 验证门 |
+|------|------|----------------|------|
+| **0 补规格** | 本文档决策 0 状态机 + 7 不变量 + 修正 3 处事实错误 | 把「resume 功能列表」升级为「持久化执行协议」 | OpenSpec `--strict` + Review 认可 |
+| **1 DB 协议地基** | WAL+每连接 busy_timeout+安全在线备份+索引;所有 dispatch 统一入队;POST 幂等+GET 订阅;**原子 claim(CAS)**;触发合并+delivery receipt;`task_run↔queue` 不可变关联 | 消灭双领与触发丢失;流式可重连 | `atomic_claim_probe`(N并发只1中)、`sse_tail_probe`、`dispatch_idempotency_probe`、`trigger_coalesce_probe` |
+| **2 Worker 剥离** | 独立 `worker.py`;API 不执行 Agent;supervisor/heartbeat/readiness;generation/lease/单实例;**Job Object/进程组 containment**;kill 带 request/ack | **重启 API 不断 Agent**;Worker 崩溃可被拉起、旧进程可清 | `worker_split_probe`、`worker_containment_probe`(崩溃后无孤儿 CLI)、`kill_ack_probe` |
+| **3 Claude resume** | `agent_sessions`;流中 pin;committed/planned 水位;`--resume`;mismatch/失败降级;poisoned 分类 | claude 省 token+上下文连贯（[agent-session-resume]） | ASR S1-S3 探针 |
+| **4 Codex app-server** | 每 run 一个 app-server;`thread/resume`→`thread/start`;threadId pin;rollout/workdir 检查;transport fail-fast | codex 同享 resume | ASR S4 探针 |
+| **5 交棒 + 有界恢复** | restart generation;claim barrier;defer 5min 等自然收尾;超时 kill+**CAS supersede+recovery child 同事务**;bounded recovery/退避/dead-letter;stale generation fencing | **改执行层:能等则零中断;超时 resume 续跑不丢上下文** | `worker_handover_probe`、`recovery_budget_probe`、`fencing_probe` |
+| **6 Nginx 蓝绿** | readiness 后切 upstream;SSE 主动轮换+Last-Event-ID;旧 API drain timeout;expand/contract 部署 | **改代码用户连接自动无损重连** | 手动压测切换 + `blue_green_probe` |
+
+- **顺序**：0 → 1 → 2 → 3 → 4 → 5 → 6。阶段 5（交棒续跑）依赖阶段 3/4（resume）+ 阶段 2（Worker+generation）；阶段 6 依赖阶段 2（API 无状态）。
+- **达标线**：阶段 1+2 = 「改 API 平滑、消灭双执行地基」;阶段 3+4+5 = 「改执行层温和重启、resume 续跑」;阶段 6 = 「连接无损重连」。
+- **本 change 覆盖阶段 0/1/2/5/6**;阶段 3/4（resume 本身）归 [agent-session-resume]。
+- **回退**：各阶段独立;阶段 5 遇阻可停在阶段 2（改 API 已平滑、改执行层暂退回「重启从头重跑」）。
+
+### 验收定义（Review）
+
+- **API 平滑重启**：Agent 继续跑;客户端有界时间内自动重连;状态与日志不重不漏;POST 重试不产生重复任务。
+- **Worker 温和重启**：drain 窗口内结束的 run 零中断;超时的 run 安全停 + 旧 run superseded + **恰好一个** recovery child;**无旧 CLI 与恢复 CLI 双执行**;恢复保上下文但**副作用语义明确为 at-least-once**。
+- **Worker 异常崩溃**：supervisor 拉起;旧进程树确认清理或 fencing;orphan 被恢复或进 dead-letter;恢复次数受限。
 
 ## 与 [platform-concurrency-scaling] 的协调（避免重复/冲突）
 
@@ -139,7 +236,7 @@
 | WAL + busy_timeout | M1 | 阶段 0.1 | **同一件事,谁先做另一个即满足** |
 | 调度状态外置(`_running`/pid→DB) | M2 | 阶段 2.1 | **由本 change M2 实现,concurrency 2.1 复用** |
 | 多 worker 无状态消费 | M2 达成「可多进程消费」地基(先跑单 worker) | 阶段 2.2 | 本 change 出地基,concurrency 2.2 在其上做「多 worker 并发规模与公平」 |
-| `_claim_one` 原子领取 | 复用(已具备) | 复用(已具备) | 无需改 |
+| `_claim_one` 原子领取 | **本 change 阶段1 补 CAS**（现状非原子，Review 修正） | 复用本 change 成果 | 原判断「已具备」错误，须先补 |
 | 同 slug 串行 / 公平调度 / Postgres | 不涉及 | concurrency 阶段 0/1 负责 | 本 change 不碰,避免动机混淆 |
 
 **分工原则**：本 change 只解决「解耦 + 平滑重启」(单 API + 单 Worker);「多 worker 并发规模、项目公平、Postgres」归 concurrency。两者共享「WAL + 状态外置」地基,一次实现、双方受益。

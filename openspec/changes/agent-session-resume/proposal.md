@@ -14,13 +14,13 @@
 
 > 规划态,claude 与 codex 均必选（claude 改动小、codex 需 app-server 集成，两线并行）。**本 change 暂不改代码。**
 
-- **per-(task, agent) session + 串行**：每个 `(conversation_id, agent_slug)` 维护一条 CLI session。新增轻表 `agent_sessions(conversation_id, agent_slug, session_id, snapshot_msg_id, provider_id, backend, workdir, updated_at)`,唯一键 `(conversation_id, agent_slug)`。同 (task, agent) **至多一个 queued/running run**（partial unique index），重复触发折叠进下一轮——既防重复并行做工，又给增量边界确定的推进点。
+- **per-(task, agent) session + 串行折叠**：每个 `(conversation_id, agent_slug)` 维护一条 CLI session。新增轻表 `agent_sessions(conversation_id, agent_slug, session_id, committed_msg_id, provider_id, backend, workdir, updated_at)`,唯一键 `(conversation_id, agent_slug)`。同 (task, agent) **至多一个 queued/running run**，重复触发**折叠**进下一轮（合并触发意图，**不丢**）——现状代码是 `return None` 丢弃（Review P0-3 修正）;`run_queue` **无 conversation_id 列**，不建伪 index，改用折叠模型（queued 合并水位 / running 记 pending intent、收尾建至多一个 successor）。
 - **session_id 抓取**：claude 从 `system`/`result` 行提取 `session_id`（现被忽略）;codex 从 app-server 的 `threadId` 提取。均写回 `agent_sessions`。
-- **增量回灌（快照水位 + 排除自产）**：执行前查该 (task, agent) 的 `session_id` + `snapshot_msg_id`;增量 = `messages WHERE conversation_id=? AND id > snapshot_msg_id AND 非本 agent 自产`（别人/人工在上一快照后说的话；本 Agent 自己的历史由 CLI session 记忆承载不重喂）。prompt 只喂增量,CLI 带 resume。`snapshot_msg_id` = 构建本次 prompt 那刻的 `MAX(messages.id)`。
-- **session_id 生命周期（三件套）**：每轮覆盖存最新（resume 后 id 可能变）+ COALESCE 空值保护（没抓到不清旧指针）+ 流中途 pin 抢先落库（防崩溃丢指针）+ resume 落地判定（"no conversation found"/emitted id≠请求 id → 判未落地重建）。
+- **增量回灌（2 字段水位，at-least-once 安全）**：`agent_sessions.committed_msg_id`（成功才推进）+ `task_runs.planned_through_msg_id`（本次 prompt 快照终点）。增量 = `messages WHERE id > committed_msg_id AND id <= planned_through_msg_id AND 非本 agent 自产`。崩溃时 committed 未推进→续跑从同一起点重取→**重复但不漏**（满足不变量）。本 Agent 自己历史由 session 记忆承载不重喂。
+- **session_id 生命周期（三件套）**：每轮覆盖存最新（resume 后 id 可能变）+ COALESCE 空值保护（没抓到不清旧指针）+ 流中途 pin 抢先落库（防崩溃丢指针）+ resume 落地判定（**失败** && "no conversation found"/emitted id≠请求 id → 判未落地重建;**成功**返回新 id → 接受覆盖存，Review P1-6 修正原过严判定）。
 - **降级链（健壮性）**：首次执行(无 session)→ 全量回灌(现状);resume 未落地/跨 provider/跨 workdir → 回退全量 + 新建;**poisoned 失败（迭代上限/api 400/codex 语义静默）→ 主动丢弃 prior session**（不 resume 坏状态）。**任何降级都不劣于现状。**
 - **增量水位修正并发漏话**：不用「完成时 MAX(id)」（并发下会把执行期间别人的发言算进水位而漏话），改用「prompt-build 快照水位 + 排除自产」——A 执行期间 B 写的消息下次触发 A 时被正确纳入。
-- **backend：claude 与 codex 均必选**（用户重度使用 codex）。claude 用 `-p --resume <sid>`（改动小）;codex 需从一次性 `codex exec` 改为 **`codex app-server --listen stdio://` + JSON-RPC `thread/resume`**（回退 `thread/start`）——集成模式变更，改动大但必做。
+- **backend：claude 与 codex 均必选**（用户重度使用 codex）。claude 用 `-p --resume <sid>`（改动小）;codex 需从一次性 `codex exec` 改为 **每次执行 attempt 起一个 `codex app-server --listen stdio://` 进程 + JSON-RPC `thread/resume`**（回退 `thread/start`,run 结束即关，**非** Worker 全局共享一个 app-server）——集成模式变更，改动大但必做。
 
 ## Capabilities
 
@@ -29,7 +29,7 @@
 
 ## Impact
 
-- **规划态,暂不改代码。** 落实时预计涉及：`executor/base.py`(`build_cli_prompt` 支持增量模式)、`executor/claude_code.py`(`--resume` 参数 + session_id 提取)、`executor/runner.py`(查/写 `agent_sessions`、增量取历史)、`database.py`(建 `agent_sessions` 表)。
-- **关联能力**：[agent-collaboration](多 Agent 协同/会话)、[agent-execution](执行)、[platform-graceful-restart](其 M2.5「静默+resume」依赖本 change 出的 resume 地基)。
+- **规划态,暂不改代码。** 落实时预计涉及：`executor/base.py`(`build_cli_prompt` 支持增量模式)、`executor/claude_code.py`(`--resume` 参数 + session_id 提取 + mismatch 判定)、`executor/codex.py`(app-server + thread/resume，每 run 一进程)、`executor/runner.py`(查/写 `agent_sessions`、committed/planned 两阶段水位、增量取历史、折叠模型)、`database.py`(建 `agent_sessions` 表 + `task_runs.planned_through_msg_id` 列 + 折叠所需 run_queue 字段)。
+- **关联能力**：[agent-collaboration](多 Agent 协同/会话)、[agent-execution](执行)、[platform-graceful-restart](其阶段 3/4 = 本 change;其阶段 5「温和重启+resume 续跑」依赖本 change 出的 resume 地基与流中途 pin)。
 - **不破坏多 Agent 协同**：每个 Agent 独立 session,互不干扰;别人的发言经「增量回灌」补给,语义正确。
 - **模型适配**：业界常见 session 模型是「1 issue × 1 agent = 1 session」,我们是「多 Agent 在一个 conversation 里 @ 来 @ 去」,故需 per-(task, agent) 粒度 + 增量回灌来适配,而非直接套用单会话。
