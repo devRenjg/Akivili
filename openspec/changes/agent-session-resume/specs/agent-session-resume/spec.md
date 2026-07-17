@@ -24,7 +24,7 @@
 
 ### Requirement: session_id 抓取与生命周期
 
-系统 SHALL 从 CLI 输出中提取会话标识并按下述策略维护其生命周期。claude backend SHALL 从 `-p --output-format stream-json` 的 `system`(init)/`result` 行提取 `session_id`;codex backend SHALL 从 app-server 的 `threadId` 提取。生命周期 SHALL 满足：① **流中途首次见到 id 即抢先落库（pin）**,防执行中途崩溃丢指针;② **收尾以本次最新 id 覆盖存**（resume 后 id 可能变,非只存首次）;③ 更新用 **COALESCE 空值保护**（本次没抓到 id 时不清空旧指针）;④ **pin 与覆盖 SHALL 带 `task_run_id`/`worker_generation`/session version 条件（CAS）**：仅当写入者仍是当前活跃 run/世代时才更新，防上一轮迟到的流事件覆盖下一轮已建立的新 session pointer。
+系统 SHALL 从 CLI 输出中提取会话标识并按下述策略维护其生命周期。claude backend SHALL 从 `-p --output-format stream-json` 的 `system`(init)/`result` 行提取 `session_id`;codex backend SHALL 从 app-server 的 `threadId` 提取。生命周期 SHALL 满足：① **流中途首次见到 id 即抢先落库（pin）**,防执行中途崩溃丢指针;② **收尾以本次最新 id 覆盖存**（resume 后 id 可能变,非只存首次）;③ 更新用 **COALESCE 空值保护**（本次没抓到 id 时不清空旧指针）;④ **pin 与覆盖 SHALL 带 CAS 条件（Review P1-3）**：`agent_sessions` SHALL 含 `session_version` 与 `current_task_run_id` 字段，pin/覆盖用 `WHERE current_task_run_id=? AND session_version=?`（写入者仍是当前活跃 attempt/版本才更新），成功后 `session_version` 自增、`current_task_run_id` 指向本 attempt;仅当写入者仍是当前活跃 attempt 时才更新，防上一轮迟到的流事件覆盖下一轮已建立的新 session pointer。
 
 #### Scenario: 流中途 pin 落库
 - **WHEN** CLI 流中第一次出现 session_id,该 run 尚未收尾
@@ -72,7 +72,7 @@
 
 ### Requirement: 增量上下文回灌（快照水位 + 排除自产）
 
-系统 SHALL 在复用 session 执行时只回灌「增量上下文」,而非全量历史。增量水位 SHALL 用 **2 字段两阶段**：`agent_sessions.committed_msg_id`（上次**成功**执行确认的水位，**只有 run 成功收尾才推进**）+ `task_runs.planned_through_msg_id`（本次构建 prompt 那刻的快照终点 = 当时 `MAX(messages.id)`）。系统 **SHALL NOT** 用「执行完成时的 MAX(id)」做单一水位（并发下会把执行期间别人新写的消息算进而漏话）。增量 = `messages WHERE conversation_id=? AND id > committed_msg_id AND id <= planned_through_msg_id AND 作者非本 agent`（参数化）：别人/人工在上次成功水位之后、本次快照之前说的话喂给本 Agent,本 Agent 自己的历史发言由 CLI session 记忆承载、不重喂。**不变量 = at-least-once**：崩溃/中断时 committed 未推进 → 续跑从同一起点重取 → 重复但不漏;prompt 构建后、CLI 接收前崩溃时 committed **SHALL NOT** 提前推进。**单次海量增量 SHALL 用连续前缀分批，SHALL NOT 用「保新丢旧」裁剪**：现状历史裁剪按保留最新、丢弃较早裁剪，若套在增量上会丢中段较早消息而 committed 仍推进到 planned_through → 中段永久漏喂，违反 at-least-once。增量 SHALL 从 committed 之后最旧一条起、按连续前缀截取本轮可喂量，`committed_msg_id` 收尾时 **SHALL 只推进到本轮实际连续喂达的最后一条 id（committed_batch_end），SHALL NOT 直接推进到 planned_through**;剩余尾部留到下一轮从新 committed 起点续喂。超上限 SHALL 在连续前缀处截断、分多轮喂，**SHALL NOT 跳段**。首次执行（无 session）SHALL 回灌全量历史（现状行为，同样连续前缀分批、超上限分轮不丢段）。
+系统 SHALL 在复用 session 执行时只回灌「增量上下文」,而非全量历史。增量水位 SHALL 用 **2 字段两阶段**：`agent_sessions.committed_msg_id`（上次**成功**执行确认的水位，**只有 run 成功收尾才推进**）+ `task_runs.planned_through_msg_id`（本次构建 prompt 那刻的快照终点 = 当时 `MAX(messages.id)`）。系统 **SHALL NOT** 用「执行完成时的 MAX(id)」做单一水位（并发下会把执行期间别人新写的消息算进而漏话）。增量 = `messages WHERE conversation_id=? AND id > committed_msg_id AND id <= planned_through_msg_id AND 作者非本 agent`（参数化）：别人/人工在上次成功水位之后、本次快照之前说的话喂给本 Agent,本 Agent 自己的历史发言由 CLI session 记忆承载、不重喂。**不变量 = at-least-once**：崩溃/中断时 committed 未推进 → 续跑从同一起点重取 → 重复但不漏;prompt 构建后、CLI 接收前崩溃时 committed **SHALL NOT** 提前推进。**单次海量增量 SHALL 用连续前缀分批，SHALL NOT 用「保新丢旧」裁剪**：现状历史裁剪按保留最新、丢弃较早裁剪，若套在增量上会丢中段较早消息而 committed 仍推进到 planned_through → 中段永久漏喂，违反 at-least-once。增量 SHALL 从 committed 之后最旧一条起、按连续前缀截取本轮可喂量，`committed_msg_id` 收尾时 **SHALL 只推进到本轮实际连续喂达的最后一条 id（committed_batch_end），SHALL NOT 直接推进到 planned_through**;剩余尾部留到下一轮从新 committed 起点续喂。超上限 SHALL 在连续前缀处截断、分多轮喂，**SHALL NOT 跳段**。「连续前缀」SHALL 指所有 eligible message（排除本 agent 自产后）的连续扫描区间，**不要求原始消息 ID 无空洞**（自产消息造成的 ID 空洞不算跳段）;单条消息本身超字符预算时 SHALL 至少完整投递该条，避免永远无法推进。**剩余尾部 SHALL 自动续批**：本轮 run 成功且 `committed_batch_end < planned_through_msg_id` 时，系统 SHALL 在**同一事务**内（连同 committed 推进、session pointer 更新）创建一个 `history_backlog` successor run 继续消费尾部（携带 `trigger=history_backlog`/`history_batch_no`/`history_batch_end`/`history_backlog_from_execution_id`），SHALL NOT 依赖新的用户 @ 才继续。backlog successor SHALL 不计 mention-chain、受独立最大批次数/token 预算限制、复用同一 CLI session;所有批次消费完才清除 backlog 标记;达批次上限仍未消费完 SHALL 进人工提示而非无限自动跑。首次执行（无 session）SHALL 回灌全量历史（现状行为，同样连续前缀分批 + 自动续批、超上限分轮不丢段不空转）。
 
 #### Scenario: 复用执行只喂增量
 - **WHEN** 某 (conversation, agent) 带 session resume 执行,其间别人新增了若干条 messages
@@ -93,6 +93,18 @@
 #### Scenario: 海量增量连续前缀分批不跳段
 - **WHEN** 增量消息条数/字符超单轮上限
 - **THEN** 系统从 committed 之后最旧一条起按连续前缀截取本轮可喂量、在上限处截断（committed_batch_end），committed_msg_id 只推进到 committed_batch_end 而非 planned_through，剩余尾部下一轮从新起点续喂，中间不跳过任何应喂消息
+
+#### Scenario: 无新触发也自动续批消费尾部
+- **WHEN** 海量增量需分 3 批消费，且期间没有新的用户 @ 触发
+- **THEN** 本轮成功后系统在同事务内自动创建 `history_backlog` successor 继续下一批，逐轮推进 committed，直至全部批次消费完才清 backlog；不依赖新触发、不空转在半消费状态
+
+#### Scenario: 单条超大消息不卡死
+- **WHEN** 某单条消息本身超过字符预算
+- **THEN** 系统至少完整投递该条（必要时该轮只喂这一条），committed 得以越过它继续推进，不永久卡住
+
+#### Scenario: 达批次上限转人工
+- **WHEN** backlog 自动续批达到独立设定的最大批次数/预算仍未消费完
+- **THEN** 系统停止自动续批、转人工提示，不无限自动跑下去
 
 #### Scenario: 首次执行全量回灌
 - **WHEN** 某 (conversation, agent) 首次执行（无 session）

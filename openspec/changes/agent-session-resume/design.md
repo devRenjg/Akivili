@@ -62,15 +62,23 @@
 - **增量 = `messages WHERE conversation_id=? AND id > committed_msg_id AND id <= planned_through_msg_id AND 非本 agent 自产`**（参数化）：
   - 别人（含人工）在上次成功水位之后、本次快照之前说的话 → 喂给本 Agent。
   - 本 Agent 自己的历史发言由 CLI session 记忆承载，**不重喂**。
-- **为何 at-least-once 安全**：
-  - A 成功 → `committed_msg_id` 推进到 A 的 `planned_through`;下次从此起点，不重不漏。
+- **为何 at-least-once 安全**（统一口径：`committed_msg_id` 只推进到 `committed_batch_end`，**不是** planned_through，见下方连续前缀分批）：
+  - A 成功 → `committed_msg_id` 推进到本轮实际连续喂达的 `committed_batch_end`;下次从此起点，不重不漏。
   - A **崩溃/被中断**（committed 未推进）→ 续跑仍从**同一 committed 起点**取增量 → **重复喂但不漏**（满足不变量）。
   - A 执行期间 B 写的消息 id > A 的 planned_through → 不在 A 本次增量内，但下次触发 A 时（committed 仍在 B 之前）被正确纳入，**不漏**。
 - **崩溃不漏的关键**：**只有成功才提交 committed**;prompt 构建后、CLI 接收前崩溃时 committed 不得提前推进（否则漏）。
 - **🔴 单次海量增量——必须连续前缀分批，禁止直接过 `_clip_history`**：现状 `_clip_history` 按「保新丢旧」裁剪（`_HISTORY_MAX_MSGS`/`_HISTORY_MAX_CHARS`），若把它套在增量上，会**丢掉中段较早的消息但 committed 仍推进到 planned_through** → 被丢的中段永久漏喂，直接违反 at-least-once。因此增量 SHALL **从 committed 之后的最旧一条开始、按连续前缀（contiguous prefix）截取本轮可喂的量**，`committed_msg_id` 收尾时**只推进到本轮实际连续喂达的最后一条 id**（`committed_batch_end`），而非 planned_through。剩余未喂部分（> committed_batch_end 且 <= planned_through）留到下一轮从新 committed 起点继续，天然不重不漏。
   - 判据：`committed_batch_end` SHALL 满足「[committed_msg_id+1, committed_batch_end] 内所有应喂消息都已纳入本轮 prompt」，中间不得有跳过。达上限即在此截断，宁可分多轮，绝不跳段。
   - `planned_through_msg_id` 仍记录快照终点（用于判断「是否还有未喂尾部」与并发边界），但 committed 推进以 `committed_batch_end` 为准，二者可不相等（有未喂尾部时 committed_batch_end < planned_through）。
-- 首次执行（无 session）回灌全量（现状行为，同样连续前缀分批：超上限则分轮喂，不丢段）。
+  - **「连续前缀」= 所有 eligible message（排除本 agent 自产后）的连续扫描区间**，不要求原始消息 ID 无空洞（自产消息造成的 ID 空洞不算跳段）。
+  - **单条消息本身超字符预算**：SHALL 至少完整投递这一条（不能因一条超大消息就永远卡住不推进），必要时该轮只喂这一条。
+- **🔴 自动续批——`history_backlog` successor（Review P0-4）**：连续前缀分批留下的尾部（`committed_batch_end < planned_through_msg_id`）不能等下一次用户 @ 才消费——**无新触发时会永远留在 backlog**。因此本轮 run 成功且 `committed_batch_end < planned_through_msg_id` 时，SHALL 在**同一事务**内自动创建一个 `history_backlog` successor run 继续消费剩余尾部：
+  - successor 携带 `trigger=history_backlog`、`history_batch_no`、`history_batch_end`、`history_backlog_from_execution_id`。
+  - **不计 mention-chain**（系统触发，豁免 `MAX_MENTION_CHAIN`）、受**独立的最大批次数 / token 预算**限制。
+  - **复用同一 CLI session**（resume，不新建会话）。
+  - `committed_msg_id` 推进、session pointer 更新、backlog successor 创建 SHALL **同事务**提交（避免推进了水位却没建后继、或建了后继但水位没动的半提交）。
+  - **所有批次消费完（committed 追平 planned_through 或新的快照终点）才清除 backlog 标记**;达批次上限仍未消费完 → 进**人工提示**（不无限自动跑）。
+- 首次执行（无 session）回灌全量（现状行为，同样连续前缀分批 + backlog 续批：超上限分轮喂、自动建 successor 续，不丢段、不空转）。
 - **等效方案对比**：另一种防漏思路是维护「投递集」（记录已喂给该 agent 哪些 message）+ 排队期消息「折叠」进本轮；我们用「快照水位 + 排除自产」达到等效防漏，省一张投递集表。
 - **一处有意取舍**：也可让 Agent 用 CLI 命令**自己回读**业务历史、平台几乎不喂。我们**保留平台侧增量喂**（不建 Agent 自读命令），因为：① 我们的 `jian` CLI 未暴露全量 message 列表读取；② 增量在快照机制下很小；③ 改动面小于「造一套 Agent 自读历史的命令 + 改 prompt 教 Agent 用」。留待讨论期复核。
 

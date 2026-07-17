@@ -21,7 +21,8 @@
 - [x] 0.2 spec 新增 Requirement：状态机与不变量、原子 claim、两段式 dispatch、进程 containment、generation/ack/fencing、SSE 统一事件序列、历史数据迁移（已写入）
 - [x] 0.3 修正 3 处事实错误：claim 非原子、`run_queue` 无 conversation_id 列（折叠改用 `(task_id,agent_slug)` partial index）、resume mismatch 判定（本 change + ASR 已改）
 - [x] 0.4 第二轮 Review 6 个 P0（A-F）+ 关键 P1 全部落文档：删 accepted、折叠 DB 唯一性、连续前缀分批、硬崩溃 generation 接管、SSE 统一游标、历史迁移闭环
-- [ ] 0.5 `--strict` 校验通过 + Review 复核认可（放行阶段 1）
+- [x] 0.5 第三轮 Review 4 个 P0 + 7 个 P1 全部落文档：① P0-1 execution:attempt 一对多（模型 A，`UNIQUE(run_queue_id, attempt_no)`）② P0-2 done 不改名 + expand/activate/contract 真可回滚 ③ P0-3 event 全局自增游标 + 双写同事务 ④ P0-4 backlog 自动续批 + committed_batch_end 统一;P1：claim 真原子/worker_instance_id/session CAS 字段/1.4 claimed 折叠/状态矩阵前移阶段1/lease 时间语义/recovery_blocked 产品闭环
+- [ ] 0.6 `--strict` 校验通过（已过）+ 第三轮 Review 复核认可（放行阶段 1）
 
 ## 阶段 1 — DB 协议地基（消灭双领与触发丢失；流式可重连）
 - [ ] 1.1 SQLite 连接开 `PRAGMA journal_mode=WAL`（初始化一次）+ `PRAGMA busy_timeout`（**每条新连接**都设）
@@ -29,18 +30,24 @@
 - [ ] 1.1c 加索引：`run_logs(run_id,id)`、`run_queue(status,next_retry_at,id)`、active `(task_id,agent_slug,status)`
 - [ ] 1.2 **原子 claim(CAS)**：`_claim_one` 改单语句条件更新（`UPDATE...WHERE id=(子查询) AND status='queued' RETURNING *`），杜绝双领
 - [ ] 1.3 **统一入队 + 两段式 dispatch**：所有触发（人工@/auto/mention/leader）经队列;`POST /tasks/{id}/dispatch` 接 idempotency key、幂等持久化用户消息、入队、返回 `execution_id`,**不在请求内跑 CLI**;`GET /executions/{execution_id}/events` 独立 SSE 订阅
-- [ ] 1.4 **触发合并（不丢，非丢弃）**：同 (task,agent) 已有 queued→合并消息水位到该行;running→持久化 `rerun_requested`+`pending_through_message_id`+触发来源;收尾事务内据 pending 至多建一个 successor
-- [ ] 1.5 **task_run↔queue 不可变关联**：claim 同事务建 `task_runs` 行 + 写 `task_runs.run_queue_id`;SQLite 不能给已有表直接加 `NOT NULL UNIQUE`，分步——`ALTER ADD COLUMN run_queue_id INTEGER`(可空) → 反向回填存量 → `CREATE UNIQUE INDEX ... WHERE run_queue_id IS NOT NULL`(partial 容忍存量空) → 新写入路径强制非空
-- [ ] 1.5b **历史数据迁移闭环（Review P0-F）**：① `run_queue.status` 值域扩展 `+claimed/succeeded/killed/superseded/recovery_blocked`，一次性 `UPDATE ... SET status='succeeded' WHERE status='done'`，**读取层保留 `done→succeeded` 兼容映射**（旧代码回滚期不炸）;② `agent_sessions` 折叠 partial unique index 建立前先归并/取消存量同 (task,agent) 多 active 行（否则建索引失败）;③ 新列（worker_generation/pid_create_time/owner_instance_id/planned_through_msg_id/committed_msg_id/meta_json 等）带安全默认（NULL/0），存量行走首次执行/全量分支不报错;④ 回滚兼容——旧代码读到未知状态/新列按保守兜底，不因 schema 前进崩;⑤ 迁移前先 `VACUUM INTO` 安全备份（承接 1.1b），失败可回滚
-- [ ] 1.6 **SSE 统一事件序列 + 续传契约（Review P0-E，游标用 seq 非 run_logs.id）**：建 `execution_events(execution_id, seq, event_type, payload_json, created_at)` `UNIQUE(execution_id,seq)`;`run_logs` 加 `meta_json` 列（channel/tool/tool_input/tool_output）;所有事件（log + 控制事件 `queued/run_started/superseded/terminal`）先落 execution_events 再推，`id:<seq>`+`Last-Event-ID` 为唯一游标（heartbeat 不占 seq）;断连 `WHERE execution_id=? AND seq>? ORDER BY seq` 回放，控制事件与 log 统一有序不重不漏（含断线期间的 superseded/terminal）、run 未起发 queued 占位、终态回放全量
-- [ ] 1.7 探针：`atomic_claim_probe`(N并发只1中)、`dispatch_idempotency_probe`(同key只1execution)、`trigger_coalesce_probe`(100次触发不丢)、`sse_tail_probe`(断连续传不重不漏，**含断线期间 superseded 控制事件重连必达、seq 有序**)
+- [ ] 1.4 **触发合并（不丢，非丢弃；含 claimed 与完整终态折叠，Review P1-4）**：同 (task,agent) 已有 queued→原子 `MAX/COALESCE` 合并消息水位到该行;**claimed/preparing→同样记 pending intent**（不能漏在 queued/running 两分法之外）;running→持久化 `rerun_requested`+`pending_through_message_id`+触发来源;收尾事务内据 pending 至多建一个 successor。各终态折叠规则：**failed**→仍据 pending 建 successor;**killed**→取消 pending 不建;**superseded**→pending 由 recovery child 继承不另建
+- [ ] 1.4a **状态消费者矩阵前移到阶段 1（Review P0-A/P1-5）**：本阶段引入 claimed/superseded/recovery_blocked 的同时，同步更新所有状态消费者（progress 聚合、Runtime 总览、任务自动流转、孤儿巡检、失败归因、前端 RunRow.vue/Runtime.vue 状态色）识别新状态 + 落地完整状态矩阵与允许转换表。**不留到阶段 6**（阶段 6 的同名任务删除，见 6.x）
+- [ ] 1.5 **execution:attempt 一对多关联（Review P0-1，模型 A）**：`run_queue`=稳定 execution，`task_runs`=attempt。claim 同事务建**新 attempt**（`task_runs` 行，`attempt_no = SELECT COALESCE(MAX(attempt_no),0)+1 WHERE run_queue_id=?`）+ 写 `run_queue_id + attempt_no`;约束 `UNIQUE(run_queue_id, attempt_no)`（**非** `run_queue_id` 单列唯一——否则 lease 回收/重试第二次 claim 撞键）。SQLite 分步——`ALTER ADD COLUMN run_queue_id INTEGER` + `ALTER ADD COLUMN attempt_no INTEGER`(均可空) → 反向回填存量(attempt_no=1) → `CREATE UNIQUE INDEX ... ON task_runs(run_queue_id, attempt_no) WHERE run_queue_id IS NOT NULL` → 新写入强制非空且递增。lease 回收/瞬时失败重试：execution 回 queued、旧 attempt 落 `abandoned`/`prestart_failed`，下次 claim 建 attempt_no+1;execution 终态由获胜 attempt 决定
+- [ ] 1.5a **改造现有 retry 与 attempt 模型对齐（Review P0-1）**：`collab.py:895` 现在把同一 run_queue 行改回 `queued` 重试——保留此 execution 级回队机制，但下次领取时**新建 attempt 行**而非复用/覆盖，使 `_process_one` 的异常重试与 claimed lease 回收统一走 attempt 模型;SSE 事件绑稳定 execution_id（run_queue.id），多 attempt 事件进同一流
+- [ ] 1.5b **历史数据迁移闭环 + 真可回滚 expand/activate/contract（Review P0-F/P0-2）**：① **`run_queue` 成功态保持 `done` 不改名**（task_runs 成功=`succeeded`，两层各留命名，**不改写历史 `done`**——旧二进制回滚后仍按 `status='done'` 精确判断，改写会漏判）;② 新状态 `claimed/superseded/recovery_blocked` 经 **feature flag** 灰度：expand(加 schema 不写新状态) → API+Worker 全部部署兼容读取版 → 开 flag 写新状态 → 观察 → contract;**不能只让 Worker 先兼容**（旧 API 在线会误判）;③ `agent_sessions` 折叠 partial unique index 建立前先归并/取消存量同 (task,agent) 多 active 行;④ 新列（worker_generation/worker_instance_id/pid_create_time/owner_instance_id/planned_through_msg_id/committed_msg_id/meta_json/attempt_no 等）带安全默认（NULL/0），存量行走首次执行/全量分支不报错;⑤ 迁移前先 `VACUUM INTO` 安全备份（承接 1.1b），失败可回滚
+- [ ] 1.6 **SSE 统一事件表 + 全局自增游标 + 双写同事务（Review P0-E/P0-3）**：建 `execution_events(id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id, event_type, payload_json, created_at)`;**游标用全局自增 `id`**（非自算 `MAX(seq)+1`——并发写会竞争/撞键;间隙无所谓）;`run_logs` 加 `meta_json` 列（channel/tool/tool_input/tool_output）;所有事件（log + 控制事件 `queued/run_started/superseded/terminal`）先落表再推，`id:<全局id>`+`Last-Event-ID` 为唯一游标（heartbeat 不落表）;断连 `WHERE execution_id=? AND id>? ORDER BY id` 回放
+- [ ] 1.6a **双写同事务（Review P0-3）**：状态/数据写入与其事件写入同一事务提交——POST 消息+queued execution+queued event;run_log+log event;claimed/running+run_started event;终态+terminal event;superseded+recovery child+superseded event。防「有日志无 event」「已终态无 terminal」「有 child 无 superseded 跳转」半提交;successor 切换时客户端游标重置到 successor 起点（新 execution 独立 id 序列）
+- [ ] 1.7 探针：`atomic_claim_probe`(N并发只1中)、`dispatch_idempotency_probe`(同key只1execution)、`trigger_coalesce_probe`(100次触发不丢)、`sse_tail_probe`(断连续传不重不漏，含断线期间 superseded 控制事件重连必达、全局 id 有序)
+- [ ] 1.7a **attempt 模型探针（Review 故障注入 1/2）**：`attempt_lease_probe`(claim 建 task_run 后、running 前强杀 Worker，lease 回收后建新 attempt，不违反 `UNIQUE(run_queue_id,attempt_no)`)、`attempt_retry_probe`(同 execution 连续两次瞬时失败，attempt 1/2/3 均保留、终态由获胜 attempt 决定)
+- [ ] 1.7b **event 事务探针（Review 故障注入 3/4/5/6）**：`event_seq_concurrency_probe`(API/Worker/日志/终态线程并发写全局 id 不冲突不乱序)、`event_txn_probe`(run_log 写成功、event 写前崩溃→同事务回滚;终态与 terminal event 间崩溃→无「无终态事件」;superseded+child+event 任一点故障→三者原子)
+- [ ] 1.7c **迁移回滚探针（Review 故障注入 9/10）**：`mixed_version_probe`(新 Worker 写 claimed/superseded 时旧 API 在线不误判)、`rollback_probe`(真回滚旧代码，历史 done/新状态不致任务提前完成或永久卡住)
 - [ ] 1.8 回归全量探针,确认流式不退化、读 run_logs 逻辑不回归
 
 ## 阶段 2 — Worker 剥离（重启 API 不断 Agent；崩溃可清可拉起）
 - [ ] 2.1 `_running` 内存计数 → 查 DB（claimed+running 计数）;单 Worker 用进程内 semaphore 控本地上限
 - [ ] 2.2 新增 `worker.py` 入口：`reclaim_orphan_runs` + `_loop` 并发池 + 孤儿巡检,不起 HTTP
 - [ ] 2.3 API `startup` 不再 `start_loop()`,只保留建库/seed/静态托管
-- [ ] 2.4 **进程 containment（Review P0-5/P0-D）**：Windows Job Object + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，按 `CREATE_SUSPENDED → AssignProcessToJobObject → ResumeThread` 顺序创建防「已跑起未进 Job」逃逸窗口;POSIX `start_new_session` 进程组;持久化 `pid + pid_create_time + worker_generation`（可比对进程身份）
+- [ ] 2.4 **进程 containment（Review P0-5/P0-D）**：Windows Job Object + `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，按 `CREATE_SUSPENDED → AssignProcessToJobObject → ResumeThread` 顺序创建防「已跑起未进 Job」逃逸窗口;POSIX `start_new_session` 进程组;持久化 `pid + pid_create_time + worker_generation + worker_instance_id`（Review P1-2：attempt 行同时存 generation 与 instance id，注入 `jian` 环境供 fencing 比对，可比对进程身份）
 - [ ] 2.5 **Worker supervisor/heartbeat/readiness**：Windows Service/WinSW/NSSM 或 systemd/Docker restart 拉起;Worker 写 heartbeat/version/generation/draining/active count;`/api/health` readiness 检查 DB 可写+迁移完成+Worker 可用+协议兼容;Runtime 页显示 Worker offline/draining
 - [ ] 2.5b **API/Worker 协议回滚兼容（Review P1-6）**：明确旧 Worker 遇到新状态/新 payload 版本时的行为——`protocol_version` 不匹配时**fail-closed**（不领取、不接管高版本 run，避免误处理未知状态），而非静默忽略;配合 expand/contract 部署，保证滚动升级/回滚期新旧进程并存不产生错误处理
 - [ ] 2.6 **kill request/ack 带生命周期（Review P1-2）**：kill 请求持久化 `request_id / target_task_run_id / target_generation / state(requested→acked→done) / acked_at / outcome`;API 写 `kill_requested`→Worker 轮询→**校验 target_generation == 当前活跃 generation**（防旧 kill 标记误伤后续恢复 run）→按 pid+create_time 指纹 `taskkill /F /T` 杀树+落终态(`killed`)+**ack**;kill **不触发续跑**（用户主动停）;过期/世代不符的 kill 请求作废不执行
@@ -55,7 +62,9 @@
 
 ## 阶段 5 — 交棒 + 有界恢复（改执行层：能等则零中断，超时 resume 续跑）
 - [ ] 5.1 **温和重启 defer 窗口**：重启意图→停领新活→轮询 `activeTasks`,全部收尾即零中断;等待上限 **5 分钟**（参数化）内未清零才转交棒
-- [ ] 5.2 **generation + claim barrier（Review P0-D）**：`worker_state` 单行表(current_generation/**owner_instance_id**/state/heartbeat_at/**lease_expires_at**/**protocol_version**)+`task_runs.worker_generation`;心跳周期推进 lease_expires_at;两类接管——① 优雅交棒 3 态 `running→draining→done`（有 ack）② **硬崩溃 lease 过期 CAS 抢占**（`WHERE current_generation=g AND lease_expires_at<now SET generation=g+1,owner_instance_id=new`，并发唯一接管，不干等 done）;protocol_version 与 DB schema 不匹配 fail-closed 不接管;draining 后不再 claim（与 claim 同一受保护决策点）
+- [ ] 5.2 **generation + claim barrier（Review P0-D/P1-1/P1-6）**：`worker_state` 单行表(current_generation/**owner_instance_id**/state/heartbeat_at/**lease_expires_at**/**protocol_version**)+`task_runs.worker_generation`+`task_runs.worker_instance_id`;两类接管——① 优雅交棒 3 态 `running→draining→done`（有 ack）② **硬崩溃 lease 过期 CAS 抢占**（`WHERE current_generation=g AND lease_expires_at<now SET generation=g+1,owner_instance_id=new`，并发唯一接管，不干等 done）;protocol_version 与 DB schema 不匹配 fail-closed 不接管
+- [ ] 5.2a **claim 真原子互斥（Review P1-1）**：claim SQL 的 WHERE 同时校验 `worker_state.state='running'`（非 draining/done）+ `claim_generation==当前活跃 generation` + owner_instance 匹配 + lease 未过期，**不只靠本地进程标志**;draining 后该 CAS 天然不命中，关闭「停领与新任务刚进」竞态
+- [ ] 5.2b **lease 时间语义（Review P1-6）**：以**数据库时间**为准（防 Worker 与 DB 时钟漂移）;定义 `heartbeat_interval`、`lease_duration`(=N×heartbeat_interval)、允许的短暂暂停窗口（DB 卡顿/GC），使短停顿不误触发接管;心跳周期推进 lease_expires_at
 - [ ] 5.3 **交棒硬路径**：旧 Worker 对每个在跑 run `taskkill /F /T` 杀树 + 旧 run **CAS supersede**（`WHERE status='running' AND worker_generation=?`，**不触发自动流转**）+ 依 session 入队续跑 run（`superseded_from`+resume 意图+系统恢复标记）**同一事务**;置 generation done → 新 Worker 确认 done 后 `g+1` 接管（ack）
 - [ ] 5.4 新 Worker 领续跑 run → **重发原始任务 prompt** + resume 路径起 CLI;resume 未落地时 prompt 前置「新会话」披露
 - [ ] 5.5 **续跑豁免防死循环配额**：续跑标系统恢复类 → 豁免 `MAX_MENTION_CHAIN`、不占 `MAX_RUNS_PER_TASK`;与 Agent 自发 @ 严格区分
@@ -72,8 +81,8 @@
 - [ ] 6.1 新增 `deploy/nginx.conf`：`upstream` 指向 API 实例,反代 `:8100`,SSE 需 `proxy_buffering off` + 合理超时
 - [ ] 6.2 **SSE 主动轮换**：每 15~30s 主动断,客户端按 `Last-Event-ID` 自动重连——给旧 API 确定排空上限（不靠「同一连接不断」）
 - [ ] 6.3 蓝绿脚本：起新 API 实例 → readiness(DB可写+迁移完成+Worker可用) 通过 → 切 upstream → `nginx -s reload` → 旧 API drain timeout 后退
-- [ ] 6.4 **expand/contract 部署**：① expand-only migration ② Worker 先兼容新旧 payload/schema ③ 切 API 写新格式 ④ 稳定后 contract 清旧;queue payload 加 `payload_version`,readiness 检查 API/Worker 协议兼容
-- [ ] 6.5 **`superseded` 状态影响面完整矩阵**：`run_queue`/`task_runs` schema+status 注释、`_process_one` 终态 UPDATE、`runner._finish_run`、progress/auto-flow、Runtime 总览+失败率+运行时间统计、`RunRow.vue`/`RunTranscriptDialog.vue`/`Runtime.vue` 状态颜色文案、lineage/重跑/孤儿巡检/失败归因——**出完整状态矩阵+允许转换表**，杜绝未知状态落入成功图标
+- [ ] 6.4 **expand/activate/contract 部署（Review P0-2 真可回滚）**：① expand-only migration（加 schema/列，不写新状态）② **API + Worker 全部部署兼容读取版**（都能识别新状态、不误判——不能只让 Worker 先兼容）③ feature flag 开启新状态/新 payload 写入 ④ 观察稳定 ⑤ contract 清旧;`run_queue` 成功态保持 `done` 不改名（不改写历史）;queue payload 加 `payload_version`,readiness 检查 API/Worker 协议兼容;旧 Worker 遇高版本 payload fail-closed
+- [ ] 6.5 **（已前移到阶段 1 的 1.4a）** 状态影响面完整矩阵不再留在阶段 6——见 1.4a。阶段 6 仅保留蓝绿部署相关，状态矩阵随阶段 1 引入新状态时同步落地
 - [ ] 6.6 手动验证 + `blue_green_probe`：压测/SSE 进行中蓝绿切换,自动重连、状态与日志不重不漏、Agent 不受影响
 - [ ] 6.7 文档：更新 README 部署段(Nginx + API + Worker + supervisor 拉起顺序);记忆 `backend-restart-single-instance` 手动流程由 Nginx reload 取代
 

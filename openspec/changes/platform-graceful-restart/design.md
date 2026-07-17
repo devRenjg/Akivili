@@ -50,21 +50,23 @@
 
 一切平滑重启/resume 都建立在一个**持久化执行状态机**上。先定义状态、转换与不变量，再谈剥离与续跑。
 
-**状态机**（每个 execution = 一条 `run_queue` 行 + 其唯一关联的 `task_runs` 行）：
+**🔴 execution : attempt = 一对多（Review P0-1，用户拍板模型 A）**：一个 `run_queue` 行 = **稳定 execution**（ID 不变，前端订阅/展示的锚点）；每次 claim（含 lease 回收、瞬时失败重试）在其下创建一个新的 **attempt** = 一条 `task_runs` 行，`UNIQUE(run_queue_id, attempt_no)`（**不是** `run_queue_id` 唯一）。这样「claim 建 task_run」与「lease 过期/瞬时失败把同一 run_queue 回 queued 再领」不再撞唯一键——每次领取递增 `attempt_no`，旧 attempt 落 `abandoned`（claimed 未起 CLI 就丢）/`prestart_failed`（起 CLI 前失败）等非获胜终态。`run_queue` 的终态由**最终获胜 attempt** 决定。SSE 绑**稳定 execution_id**，同一 execution 的多个 attempt 事件进同一条事件流（见决策 9）。平滑重启产生的 recovery child 仍是**新的 execution**（新 run_queue 行），用 `superseded_from` 关联父 execution——与「同一 execution 内多 attempt」是两个层级：attempt = 同一 execution 的重试尝试，recovery child = 交棒/中断后另起的续跑 execution。
+
+**状态机**（execution = `run_queue` 行；下挂多个 attempt = `task_runs` 行）：
 
 ```
 queued → claimed → running ─┬─→ succeeded
    ↑         │              ├─→ failed
    └─────────┘              ├─→ killed             (用户主动 kill，不续跑)
-  (lease 过期回收)           ├─→ superseded         (交棒/reclaim 中断) + 恰好一个 recovery child 入队
-                            └─→ recovery_blocked   (无法安全恢复，进 dead-letter 待人工)
+ (lease过期/重试            ├─→ superseded         (交棒/reclaim 中断) + 恰好一个 recovery child 入队
+  回 queued，新 attempt)     └─→ recovery_blocked   (无法安全恢复，进 dead-letter 待人工)
 ```
 
 - **无 accepted 独立态（Review P0-A，用户拍板删）**：`POST /tasks/{id}/dispatch` 在**同一事务**内写用户消息 + 建 `queued` execution，**事务提交后才返回** `execution_id`（= run_queue_id）。不设「已 accepted 但未 queued」的悬空态，省一个 outbox/promoter + orphan sweeper。
-- **queued**：进入可领取队列。
-- **claimed**：被某 Worker generation 原子领取（CAS），**同时**建 `task_runs` 行并建立不可变关联 + 写 `lease_until`；尚未起 CLI。**崩溃恢复**：`claimed` 超 `lease_until` 未转 running → 由接管者 CAS 回收 `claimed→queued`（prepare-lease 过期），可重领。
-- **running**：CLI 已起、`pid + pid_create_time + worker_generation` 落库。`claimed→running` 亦用 CAS（校验 `claim_owner`/`claim_generation` 未变才转）。
-- **终态**：succeeded/failed/killed/superseded/recovery_blocked，均以 `WHERE status='running' AND worker_generation=?`（或 reclaim 场景的 generation CAS）落定。`recovery_blocked` 为 dead-letter 终态，需人工介入，不自动再生成 recovery child。
+- **queued**：进入可领取队列（execution 级，attempt 尚未创建）。
+- **claimed**：被某 Worker generation 原子领取（CAS），**同时**创建一个新 attempt（`task_runs` 行，`attempt_no = 上一个 + 1`）+ 写 `lease_until`；尚未起 CLI。**崩溃恢复**：`claimed` 超 `lease_until` 未转 running → 接管者 CAS 回收 execution `claimed→queued`（prepare-lease 过期）、把该 attempt 落 `abandoned`，下次 claim 建 `attempt_no+1` 新 attempt 重领。
+- **running**：CLI 已起、`pid + pid_create_time + worker_generation + worker_instance_id` 落该 attempt 行。`claimed→running` 亦用 CAS（校验 `claim_owner`/`claim_generation` 未变才转）。
+- **终态**：execution 终态 succeeded/failed/killed/superseded/recovery_blocked，由获胜 attempt 决定，均以 CAS 落定（`WHERE status='running' AND worker_generation=?` 或 reclaim 场景的 generation CAS）；未获胜 attempt 落 `abandoned/prestart_failed`。`recovery_blocked` 为 dead-letter 终态，需人工介入，不自动再生成 recovery child。
 
 **状态消费者矩阵（Review P0-A：从阶段 6 前移到阶段 0/1）**：引入 `claimed`/`superseded` 后，所有只认 `queued`/`running` 的消费者（progress 聚合、Runtime 总览、任务自动流转、孤儿巡检、失败归因、前端 `RunRow.vue`/`Runtime.vue` 状态色）**必须同步识别新状态**，否则会把 `claimed` 误判为空闲、把 `superseded` 落入成功图标。完整状态矩阵 + 允许转换表在阶段 1 引入状态时同步落地，不留到阶段 6。
 
@@ -84,13 +86,13 @@ queued → claimed → running ─┬─→ succeeded
 
 **保留现状 + 补统一事件序列续传（游标见决策 9，用 `execution_events.seq` 而非 `run_logs.id`）**：
 - CLI stdout 维持经 Worker daemon 线程 → `runner._log()` 写 `run_logs`（现状不动,`_has_jian_deliverable`/`_has_trailing_stdout`/孤儿巡检 last_ts/转写详情全部零改动）;`run_logs` 仅新增 `meta_json` 列承载结构化附加信息。
-- 唯一改造:**API 的 SSE 端点改为尾随 `execution_events`**——log 与所有控制事件先落 `execution_events(execution_id, seq, ...)` 再推,记已推最大 `seq`,轮询/推送新增到前端,直到 run 终态。这样 **API 重启导致 SSE 断连后,前端带 `Last-Event-ID:<seq>` 重连即从断点续推,控制事件与日志统一不重不漏**（含断线期间的 superseded/terminal，见决策 9）,满足「改 API 用户流式自动无损重连」。
+- 唯一改造:**API 的 SSE 端点改为尾随 `execution_events`**——log 与所有控制事件先落 `execution_events(id AUTOINCREMENT, execution_id, ...)` 再推,记已推最大全局 `id`,轮询/推送新增到前端,直到 run 终态。这样 **API 重启导致 SSE 断连后,前端带 `Last-Event-ID:<id>` 重连即从断点续推,控制事件与日志统一不重不漏**（含断线期间的 superseded/terminal，见决策 9）,满足「改 API 用户流式自动无损重连」。
 - WAL(决策见下)让「Worker 写 + API 读」不互锁。
 
 **SSE 尾随的边界**：
 - run 排队未起 → SSE 发「排队中」占位（execution_events 的一条 queued 事件）,Worker 领取起 CLI 后开始有日志。
 - run 已终态(用户中途进入) → 一次性回放全量 + 收尾态,不需实时。
-- API 重启导致 SSE 断 → 前端带 `Last-Event-ID:<seq>` 重连续传,不重不丢。
+- API 重启导致 SSE 断 → 前端带 `Last-Event-ID:<id>` 重连续传,不重不丢。
 - **Worker 温和重启超时后 run 被中断→resume 续跑** → 续跑是**新的一次执行**(新 run),前端 SSE 会看到该 task 的执行链路衔接到新 run(与现有「一个 task 多条 run」的展示一致);被中断的旧 run 落终态(`superseded`)。
 
 ### 决策 2：原子 claim + 调度状态外置（Review 修正：claim 必须改成 CAS）
@@ -107,7 +109,7 @@ queued → claimed → running ─┬─→ succeeded
   ```
   `AND status='queued'` 是 CAS 关键：两 Worker 竞争同一行，只有一个 UPDATE 命中。（未来 Postgres 用 `FOR UPDATE SKIP LOCKED + RETURNING`。）
 - **并发计数外置**：`_running` 内存 set → `SELECT COUNT(*) ... status IN ('claimed','running')`。**注意**：「先 COUNT 再 claim」在多 Worker 下仍有超卖竞态——单 Worker 用进程内 semaphore 控本地上限即可（本 change 只跑单 Worker）；多 Worker 的原子容量判断归 [platform-concurrency-scaling]。
-- **claim 即建 task_run 关联（P0-6）**：claim 成功的同一事务内创建 `task_runs` 行并写 `task_runs.run_queue_id`（UNIQUE NOT NULL），建立不可变关联——不再等执行结束才回填，交棒中途也能对上。
+- **claim 即建 attempt 关联（P0-6，模型 A）**：claim 成功的同一事务内创建**一个新 attempt**（`task_runs` 行）并写 `task_runs.run_queue_id + attempt_no`，约束 `UNIQUE(run_queue_id, attempt_no)`（**非** `run_queue_id` 单列唯一——那会让 lease 回收/重试的第二次 claim 撞键，见决策 0 P0-1）。建立 execution↔attempt 关联不再等执行结束才回填，交棒中途也能对上。`attempt_no` 从该 execution 现有最大 attempt +1 原子取得（同事务 `SELECT COALESCE(MAX(attempt_no),0)+1 ... WHERE run_queue_id=?`）。
 - **与 concurrency 的 2.1 协调**：状态外置由本 change 做，concurrency 复用；但「原子 claim CAS」是本 change 必须先补的正确性前提，非「已具备」。
 
 ### 决策 3：跨进程 kill——API 写标记,Worker 自杀其子进程
@@ -190,12 +192,18 @@ queued → claimed → running ─┬─→ succeeded
 
 SSE 不止「带最大 log id 重连」，需完整契约。**核心修正：Last-Event-ID SHALL NOT 用 `run_logs.id`**——控制事件（`queued/run_started/superseded/terminal`）不写在 `run_logs` 里，用 log id 当游标会导致这些控制事件在重连后**漏投或错序**（例如断线期间刚好发生 superseded，重连按 log id 续传收不到跳转事件，前端卡在死 run）。
 
-- **新增 `execution_events` 统一事件表**：`(execution_id, seq, event_type, payload_json, created_at)`，`seq` 在 `execution_id` 内单调递增（`UNIQUE(execution_id, seq)`）。**所有** SSE 事件（含 log 与所有控制事件）都先落这张表再推，`id: <seq>` 用它做唯一游标。log 事件的 `payload_json` 携带对应 `run_logs.id`（或直接内联日志内容），控制事件携带各自结构化载荷。
+- **新增 `execution_events` 统一事件表 + 全局 AUTOINCREMENT 游标（Review P0-3）**：`(id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id, event_type, payload_json, created_at)`。**游标用全局自增 `id`**，不自己算 per-execution seq——`SELECT MAX(seq)+1` 在 API/Worker/日志线程/终态线程并发写时会竞争或撞唯一键。SSE 查询 `WHERE execution_id=? AND id > ? ORDER BY id`，`id: <全局id>` 做 Last-Event-ID。全局自增在 execution 内**有间隙没关系**（只要单调），实现最简、天然原子（SQLite AUTOINCREMENT 由引擎保证）。（备选：run_queue 加 `next_event_seq` 用 `UPDATE ... SET next_event_seq=next_event_seq+1 RETURNING` 原子分配 per-execution seq；本方案取更简的全局自增。）**所有** SSE 事件（含 log 与所有控制事件）都先落这张表再推。
+- **🔴 双写同事务（Review P0-3，避免半提交）**：状态/数据写入与其对应事件写入 SHALL 在**同一事务**提交，否则会出现「有日志无 log event」「已终态但 SSE 永远收不到 terminal」「recovery child 已建但父 execution 无 superseded 跳转」。必须同事务的组合：
+  - POST 用户消息 + queued execution + `queued` event
+  - run_log 行 + `log` event
+  - `claimed`/`running` 状态转换 + `run_started` event
+  - 终态转换 + `terminal` event
+  - `superseded` + recovery child 入队 + `superseded` event
 - **`run_logs` 加 `meta_json` 列**：承载 log 事件需要的结构化附加信息（channel/tool/tool_input/tool_output 等），使 log 事件可从 run_logs + meta 完整重建，`execution_events` 的 log 行只需引用 run_log id。
-- 事件类型：`queued / run_started{task_run_id} / log{run_log_id,channel,content,tool,tool_input,tool_output,meta} / superseded{successor_execution_id} / terminal{status} / heartbeat`（heartbeat 不占 seq、不落表）。
-- **重连**：客户端带 `Last-Event-ID: <seq>` → 服务端 `SELECT ... FROM execution_events WHERE execution_id=? AND seq > ? ORDER BY seq` 回放，控制事件与 log 事件**统一有序、不重不漏**。
-- **superseded 跳转**：run 被交棒中断 → 写并推 `superseded{successor_execution_id}` → 前端自动订阅 successor（恢复 run），用户视觉连续。断线期间发生的 superseded 因落在 execution_events，重连必能收到。
-- queue 尚未建 task_run 时订阅 → 先收 `queued` 占位（同样是 execution_events 的一条）。
+- 事件类型：`queued / run_started{task_run_id, attempt_no} / log{run_log_id,channel,content,tool,tool_input,tool_output,meta} / superseded{successor_execution_id} / terminal{status} / heartbeat`（heartbeat 不落表、不占游标）。
+- **重连**：客户端带 `Last-Event-ID: <id>` → 服务端 `SELECT ... FROM execution_events WHERE execution_id=? AND id > ? ORDER BY id` 回放，控制事件与 log 事件**统一有序、不重不漏**。
+- **superseded 跳转 + 游标重置**：run 被交棒中断 → 同事务写 `superseded{successor_execution_id}` → 前端自动订阅 successor（恢复 run），**并把 SSE 游标重置为 successor 自己的起点**（successor 是新 execution、有独立 id 序列，不能沿用父 execution 的游标）。断线期间发生的 superseded 因落在 execution_events，重连必能收到。
+- queue 尚未建 attempt 时订阅 → 先收 `queued` 占位（同样是 execution_events 的一条）。
 - **SSE 主动轮换**：每 15~30s 主动断，客户端按 `Last-Event-ID` 自动重连——给旧 API（蓝绿排空）**确定的排空上限**，不靠「同一连接不断」。
 - 事件清理后带过旧 Last-Event-ID → 明确降级（回放可得部分 + 提示当前最新状态）。
 - **验收口径**：写成「自动无损重连、控制事件与日志统一有序不重不漏」，**非绝对「同一连接不断」**。
@@ -204,7 +212,7 @@ SSE 不止「带最大 log id 重连」，需完整契约。**核心修正：Las
 
 **T0 — 温和重启 defer 窗口（M2.5 前置）**：重启意图到达后先停领新活、轮询 `activeTasks`；全部在跑 run 自然收尾即零中断重启。等待上限 **5 分钟**（参数化可调）内未清零才转入交棒硬路径。参数化配置,避免长任务把重启无限拖住。
 
-**T1 — SSE 统一事件序列 + 断点续传（M1 唯一改造）**：SSE 端点从「直连 CLI stdout 边读边推」改为「尾随 `execution_events`」——所有 log 与控制事件先落 `execution_events(execution_id, seq, ...)` 再推;查 `execution_events WHERE execution_id=? AND seq > <前端已收最大 seq> ORDER BY seq`,轮询(~200ms)推新增。前端重连带 `Last-Event-ID:<seq>` 即从断点续,控制事件与 log 统一不重不漏（含断线期间的 superseded/terminal，见决策 9）。CLI 写 run_logs 的路径(Worker 线程 → `_log()`)**不动**，log 事件引用 run_logs.id + `run_logs.meta_json`。（单机单 API 不需要跨节点消息中继。）
+**T1 — SSE 统一事件序列 + 断点续传（M1 唯一改造）**：SSE 端点从「直连 CLI stdout 边读边推」改为「尾随 `execution_events`」——所有 log 与控制事件先落 `execution_events(id AUTOINCREMENT, execution_id, ...)` 再推;查 `execution_events WHERE execution_id=? AND id > <前端已收最大 id> ORDER BY id`,轮询(~200ms)推新增。前端重连带 `Last-Event-ID:<id>` 即从断点续,控制事件与 log 统一不重不漏（含断线期间的 superseded/terminal，见决策 9）。CLI 写 run_logs 的路径(Worker 线程 → `_log()`)**不动**，log 事件引用 run_logs.id + `run_logs.meta_json`。（单机单 API 不需要跨节点消息中继。）
 
 **T2 — 交棒时的中断与重入队（M2.5 核心）**：交棒标记轮询到后,旧 Worker 对每个在跑 run:① `taskkill /F /T` 杀 CLI 进程树(pid 指纹防误杀);② 旧 run 落终态(`superseded`,**不触发自动流转**——不误判子任务 done/父任务 reviewing);③ 依 `agent_sessions` 有无可用 session_id 决定——有则入队「续跑 run」(标 `superseded_from=旧run_id` + resume 意图 + 系统恢复标记豁免配额)、无则入队普通重跑(从头)。新 Worker 领取续跑 run,重发原 prompt + 交给 [agent-session-resume] 的 resume 路径起 CLI。
 
@@ -219,9 +227,10 @@ SSE 不止「带最大 log id 重连」，需完整契约。**核心修正：Las
 
 **T6 — 收尾幂等（复用现状，不需收尾重建）**：续跑是「新 run 走完整现有收尾链路」,旧 run 已由交棒/reclaim 落终态。收尾幂等靠现有 `_finalize_if_running`(`WHERE status='running'` 条件更新)——无需为托孤设计「任意 Worker 基于日志重建收尾」那套。
 
-**T7 — 历史数据迁移闭环（Review P0-F）**：新状态机/新列必须与存量数据兼容，SQLite ALTER 能力有限（不支持改列约束、加 `UNIQUE`/`NOT NULL` 到已有列），迁移须一次性想清：
-- **`run_queue.status` 值域迁移**：现状 `queued|running|done|failed` → 新增 `claimed|succeeded|killed|superseded|recovery_blocked`。存量 `done` 一次性 `UPDATE run_queue SET status='succeeded' WHERE status='done'`;残留 `running`（历史脏数据）按 reclaim 规则收敛。**代码读取层保留 `done` 兼容映射**（旧 API 回滚期读到 succeeded 不炸），直到全量升级稳定后再删。
-- **`task_runs.run_queue_id`（UNIQUE NOT NULL）建列**：SQLite 不能直接给已有表加 `NOT NULL UNIQUE` 列。分步：① `ALTER ADD COLUMN run_queue_id INTEGER`（可空）;② 用现有 `run_queue.task_run_id` 反向回填存量关联;③ 建 `CREATE UNIQUE INDEX ... ON task_runs(run_queue_id) WHERE run_queue_id IS NOT NULL`（partial unique 容忍存量空值）;④ 新代码写入路径强制非空，旧行保持可空——不追溯改历史行的 NOT NULL。
+**T7 — 历史数据迁移闭环（Review P0-F/P0-2）**：新状态机/新列必须与存量数据兼容，SQLite ALTER 能力有限（不支持改列约束、加 `UNIQUE`/`NOT NULL` 到已有列），且迁移须走**真正可回滚的 expand → activate → contract 三段式**（Review P0-2 纠正上一版「一次性改写 done」的不可回滚做法）：
+- **🔴 `run_queue` 成功态保持 `done` 不改名（Review P0-2 更简做法）**：`run_queue` 成功继续叫 `done`、`task_runs` 成功叫 `succeeded`，两层各留命名，**不为字符串统一而把历史 `done` 改写成 `succeeded`**。原因：旧二进制回滚后仍按 `status='done'` / `IN('queued','running')` 精确判断，改写会让回滚出来的旧代码漏判既有记录。上一版「一次性 `UPDATE ... SET status='succeeded' WHERE status='done'` + 读取层兼容映射」被否——读取映射只帮新代码，救不了被回滚的旧二进制。
+- **新状态经 feature flag 灰度**：新增 `claimed|superseded|recovery_blocked`（`succeeded` 仅用于 task_runs）。部署顺序 = **expand（加 schema/列，暂不写新状态）→ API + Worker 全部部署「兼容读取版」（都能识别新状态不误判）→ feature flag 开启新状态/新 payload 写入 → 观察稳定 → contract 清理**。**不能只让 Worker 先兼容**：新 Worker 一旦写 `claimed/superseded`，仍在线的旧 API/progress 也会误判任务状态。
+- **`task_runs.run_queue_id + attempt_no`（模型 A，非单列唯一）建列**：SQLite 不能直接给已有表加 `NOT NULL UNIQUE` 列。分步：① `ALTER ADD COLUMN run_queue_id INTEGER` + `ALTER ADD COLUMN attempt_no INTEGER`（均可空）;② 用现有 `run_queue.task_run_id` 反向回填存量关联、存量行 `attempt_no=1`;③ 建 `CREATE UNIQUE INDEX ... ON task_runs(run_queue_id, attempt_no) WHERE run_queue_id IS NOT NULL`（partial unique 容忍存量空值，**复合键**而非 `run_queue_id` 单列——见决策 0 P0-1）;④ 新代码写入路径强制非空、每次 claim 递增 attempt_no，旧行保持可空——不追溯改历史行。
 - **`agent_sessions` 折叠 partial unique index 前先清存量重复 active 行**（见 ASR 决策 1b）：建 `partial unique index ON run_queue(task_id, agent_slug) WHERE status IN ('queued','claimed','running')` 前，先 `归并/取消`存量同 (task,agent) 多 active 行，否则建索引失败。
 - **新列默认值保证旧行可用**：`worker_generation`/`pid_create_time`/`owner_instance_id`/`planned_through_msg_id`/`committed_msg_id`/`meta_json` 等新列 SHALL 带安全默认（NULL 或 0），存量行走「首次执行/全量回灌」自然分支，不因缺值报错。
 - **回滚兼容**：阶段回退到旧代码时，旧代码 SHALL 能忽略新列/新状态（读到未知状态按保守兜底），不因 schema 前进而崩。
