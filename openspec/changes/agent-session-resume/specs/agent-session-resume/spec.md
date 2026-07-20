@@ -17,7 +17,15 @@ UNIQUE(task_id, agent_slug)
 ```sql
 CREATE UNIQUE INDEX ... ON tasks(conversation_id) WHERE conversation_id IS NOT NULL;
 ```
-迁移前 SHALL 清理历史重复。固化后 conversation 粒度与 task 粒度实际一一对应，现有单 pending intent 才安全。**若未来产品确需多 task 共享 conversation**，SHALL 改模型（二选一）：① active 串行只限制 `claimed/running`、允许多个 queued execution 排队;② 新增 FIFO `pending_intents` 表至少存 `task_id/prompt/source/idempotency_key/created_at`，SHALL NOT 只留一个布尔/水位槽。当前拍板走 1:1 DB 约束，不改模型。
+固化后 conversation 粒度与 task 粒度实际一一对应，现有单 pending intent 才安全。**若未来产品确需多 task 共享 conversation**，SHALL 改模型（二选一）：① active 串行只限制 `claimed/running`、允许多个 queued execution 排队;② 新增 FIFO `pending_intents` 表至少存 `task_id/prompt/source/idempotency_key/created_at`，SHALL NOT 只留一个布尔/水位槽。当前拍板走 1:1 DB 约束，不改模型。
+
+**历史重复迁移 SHALL 是可执行、可回滚的完整流程（Review 第八轮 P1-D，「迁移前清理历史重复」不足以直接实施）**：
+1. **dry-run 查询**：先输出所有重复 `conversation_id` 及其关联的 task、messages、run_queue、task_runs、agent_sessions（人工可审），SHALL NOT 静默改数据。
+2. **保留规则确定性**：明确重复中哪个 task 保留原 conversation（如最早创建/有 active run 的 task），规则 SHALL 确定、可复现。
+3. **其他 task 处置**：其余 task SHALL 二选一——隔离阻断（标记需人工处理、不进 1:1 约束）或新建 conversation 并迁移其消息/执行历史;当前默认隔离阻断，需迁移历史时人工确认。
+4. **不串档**：迁移 SHALL 保证 `agent_sessions`、pending intent、`run_queue`、`task_runs` 归属正确 task/conversation，SHALL NOT 把 A 的 session/run 串到 B。
+5. **原子回滚**：`UNIQUE INDEX` 创建 SHALL 在清理事务成功后进行;创建失败 SHALL 整体回滚，不留部分重写。
+6. **备份 + 完整性校验**：迁移前 SHALL `VACUUM INTO`/online backup 安全备份，迁移后运行完整性探针核对无孤儿/串档。
 
 **pending intent SHALL NOT 因 poisoned/failed 而丢失（Review 第七轮 P0-3）**：区分「自动恢复 successor」与「执行期间新到达的外部用户 intent」——
 - 自动恢复 successor：poisoned failure 时不建（禁自动重试）。
@@ -45,6 +53,14 @@ CREATE UNIQUE INDEX ... ON tasks(conversation_id) WHERE conversation_id IS NOT N
 #### Scenario: task:conversation 一对一 DB 约束拒绝共享
 - **WHEN** 迁移建立 `UNIQUE INDEX ON tasks(conversation_id) WHERE conversation_id IS NOT NULL` 后，尝试让两个 task 复用同一 conversation_id
 - **THEN** DB 唯一约束拒绝第二次写入;迁移前历史重复已清理，使 conversation 粒度与 task 粒度一一对应，单 pending intent 安全
+
+#### Scenario: 历史重复迁移可 dry-run 且不串档
+- **WHEN** 构造历史上共享同一 conversation_id 的多个 task，运行迁移
+- **THEN** dry-run 先输出所有重复 conversation 及关联 task/messages/run_queue/task_runs/agent_sessions 可审;按确定性规则保留一个 task、其余隔离或新建 conversation 迁移历史;迁移不把某 task 的 session/pending/run 串到另一 task
+
+#### Scenario: UNIQUE index 创建失败整体回滚
+- **WHEN** 迁移清理 + 建 `UNIQUE INDEX` 过程中任一步失败（如仍有未清理重复）
+- **THEN** 整个迁移事务回滚，不留部分重写;迁移前已 `VACUUM INTO`/online backup 备份，迁移后完整性探针核对无孤儿/串档
 
 #### Scenario: 跨 task 共享 conversation 的触发不丢不错投
 - **WHEN**（1:1 约束下）task A 已 active，其 conversation 不可能再挂 task B——若历史脏数据出现共享，B 的触发

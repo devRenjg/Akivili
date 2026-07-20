@@ -145,7 +145,7 @@ claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功
 - **第 0 步 · 温和重启：先 defer 等空闲窗口**：收到重启意图后,若当前 `activeTasks > 0`（有在跑 run）,**优先不中断,等一个空闲窗口**（轮询 `activeTasks`、总计等待上限 **5 分钟**，参数化可调）——能等到所有在跑 run 自然收尾就零中断重启。仅当超过等待上限仍有在跑 run,才进入下面的「中断 + resume」硬路径。经验上多数重启可落在空闲窗口,根本不触发中断。等待期间**停止领新活**,避免边等边来新活永远等不完。
 - **交棒流程（DB 标记,Windows 无优雅 SIGTERM,与 kill 标记同机制）**——仅在 defer 超时仍有在跑 run 时触发：
   1. 写「交棒」标记 → 旧 Worker 轮询到 → **停止领新活**。
-  2. 旧 Worker 对每个在跑 run:**杀其 CLI 子进程树**（`taskkill /F /T` + pid 指纹防误杀）、把 run 标为 **「待续」(supersede) 并落终态**（旧 run → `superseded`）、按其 `(conversation, agent)` **重新入队一条续跑 run**（携带「resume 该 session」意图 + `superseded_from`）→ 旧 Worker 退出。
+  2. 旧 Worker 对每个在跑 run:**杀其 CLI 子进程树**（`taskkill /F /T` + pid 指纹防误杀）、把 run 标为 **「待续」(supersede) 并落终态**（旧 run → `superseded`）、按其 `(conversation, agent)` **重新入队一条续跑 run**（携带 `recovery_mode`：有 session=`session_resume`/无=`full_replay` + `superseded_from`）→ 旧 Worker 退出。**child 启动前置 = 「fencing 生效 AND 完整进程树确认退出」双 AND 条件（第八轮 P0-B）**——generation fencing 只挡 `jian` 平台写、挡不住残留 CLI 改文件/shell/外部 API/占资源，故 kill/containment 失败或超时（未确认全树退出）时 SHALL NOT supersede+建 child，落 `recovery_blocked`+`blocked_reason=process_not_confirmed_dead`、保留 pid/generation/instance/containment 信息待人工确认清理后再建 child。
   3. 起新 Worker（新代码）→ 从队列领取续跑 run → 依 `agent_sessions.session_id` resume 启动 CLI → Agent 从上次上下文续跑。
 - **续跑喂什么 prompt**：续跑 run **重发原始任务 prompt**（重新 `build_cli_prompt`）+ resume 指针,**不喂空、不造「继续」指令**。靠 resume 恢复记忆 + prompt 约束（「聚焦本轮、只做一次」）防重复。resume 确认未落地时,prompt 前置「上轮会话未能恢复,这是新会话,请如实告知用户」披露。此语义与 agent-session-resume 的常规 resume 统一（见其 design「续跑时的 prompt 语义」）。
 - **副作用重复防护（不做服务端 exactly-once）**：被中断的 run 可能已产生副作用（建卡/comment/改状态,已落库）。续跑靠 **session 记忆 + prompt 约束**（「你之前可能已提交过,先检查再动手」「只做一次,即便非零退出也不重试」）防重复,**不引入服务端精确幂等键**。关键写操作（如建卡）可加轻量自然去重,但不追求 exactly-once。
@@ -158,8 +158,8 @@ claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功
 - **统一规则 = 先接管（bump generation 定 fencing）→ 再判死 → 才续跑**：
   1. 新 Worker 启动先**接管**：对 `worker_state` 做 CAS `generation=g AND lease_expires_at < now → generation=g+1`（见决策 8），使旧世代 `g` 被 fencing——即便孤儿 CLI 还活着，`jian` 写接口按 generation 拒其写平台（不变量 5），杜绝**双写**这一真正危害。
   2. 对每个残留 `running` run，用持久化的 `pid + pid_create_time` **探活**：进程不存在、或存在但 create-time 不匹配（pid 已被复用）→ 判定旧执行已停。
-  3. **仅在「旧执行已确认停 或 已被 fencing 且 containment 已清理其进程树」时**，才据 `session_id` 入队一条续跑 run（`superseded_from` 幂等标 + resume 意图 + 系统恢复豁免配额）。
-  4. **既不能证明已停、又不能保证 fencing 生效** → **不创建 recovery child**，该 run 置 `recovery_blocked`（进 dead-letter，见决策 0/有界恢复），等人工介入，宁可不续不可双执行。
+  3. **仅在「旧执行已确认停 AND 完整进程树确认退出/containment 已清理」时**（第八轮 P0-B：AND 双条件，fencing 生效不足以放行——挡不住残留 CLI 改文件/shell/外部 API），才据 recovery mode 入队一条续跑 run（`superseded_from` 幂等标 + 系统恢复豁免配额）。
+  4. **既不能证明已停、又不能保证进程树清理生效** → **不创建 recovery child**，旧 attempt 落 `orphaned`（第八轮 P1-B：running 未确认死亡的孤儿，非 `abandoned`）、该 run 置 `recovery_blocked`+`blocked_reason=process_not_confirmed_dead`（`final_attempt_id` 指向该 orphaned attempt），保留 pid/create_time/generation/instance/containment 信息，等人工确认清理后再建 child，宁可不续不可双执行。
 - **无/失效 `session_id` 的 run（第七轮 P0-2：异常 reclaim 与温和交棒统一，不再落 failed/不续）**：确认旧进程已停或已 fencing+进程树清理后 → **父 execution 落 `superseded` + 子 execution 入队 `recovery_mode=full_replay`**（清 session 后从平台消息重建上下文），SHALL NOT 落 `failed` 或「现状兜底不续」。「session 不可用」只决定 recovery mode（`session_resume` vs `full_replay`），**不把基础设施中断记成业务 `failed`、也不丢弃执行意图**。须区分两类：① **attempt 自身业务/模型 poisoned failure**（如 iteration_limit/api 400/语义静默）→ 按 failure/recovery policy 处理（可禁自动重试）;② **Worker 崩溃时发现存量 session 不可用** → 清 session、走 `full_replay` child。
 - 好处:复用现有「队列领取 + 起 CLI + 收尾」全链路,收尾幂等由现有 `_finalize_if_running` + generation CAS 保证;fencing + 判死双保险取代「盲目假设已死」;有 session 与无 session 恢复共用同一 `superseded_from`/recovery budget/事件顺序/`recovery_mode` 契约，不出现两套恢复模型。
 
