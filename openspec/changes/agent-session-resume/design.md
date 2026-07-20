@@ -46,6 +46,11 @@
 - **每轮覆盖存最新**：resume 后 CLI 可能返回新的 session_id（这正是需要落地判定兜底的原因）。每次执行收尾都以本次输出的最新 session_id 覆盖存，**不是只存首次**。
 - **空值保护（COALESCE）**：更新用 `SET session_id = COALESCE(?, session_id)`——本次没抓到 id 时不清空旧指针。
 - **流中途抢先落库（pin）**：流里第一次看到 session_id 就落库一次，防执行中途崩溃丢指针（这条对 [platform-graceful-restart] 的 resume 续跑至关重要）。
+- **🔴 session owner 四阶段 CAS 协议（Review 第四轮 P0-4）**：上面的 pin/覆盖需要「写入者仍是当前活跃 attempt」的 CAS 保护，但**只写校验条件不够**——新 attempt 启动时 `current_task_run_id` 仍指向上一 attempt（或为空），第一次 pin 永远不满足 `WHERE current_task_run_id=:this_attempt`;若无条件改 owner 又重新引入迟到覆盖竞态。故 `agent_sessions` 加 `session_version`（= **owner epoch**，只在 owner 切换/退休递增，非每次 pin 递增）+ `current_task_run_id`，走四阶段：
+  - **(1) acquire**：attempt 启动时按观察到的旧 version CAS——`UPDATE ... SET current_task_run_id=:new_attempt, session_version=session_version+1 WHERE (conversation,agent) AND session_version=:observed RETURNING session_version`;首次无行用 `INSERT ... ON CONFLICT(conversation_id,agent_slug) DO NOTHING` 归属本 attempt（并发下只一个成功，其余观察最新 version 重试）。
+  - **(2) pin**：流中途 `UPDATE ... SET session_id=COALESCE(:sid,session_id) WHERE current_task_run_id=:new_attempt AND session_version=:owner_version`;**pin 不递增 version**，调用方整段持稳定 owner token。
+  - **(3) final**：成功收尾同事务更新最终 pointer + committed 水位 + backlog/pending successor（任一失败整体回滚）。
+  - **(4) retire**：attempt 终态后清 `current_task_run_id`/推进 epoch，使迟到 pin/final CAS 失败;**终态无 successor 也 retire**;poisoned/降级清 session 与 retire 同事务。
 - **resume 落地判定（Review P1-6 修正：mismatch 只在失败时判）**：
   - `失败 && emitted_id != requested_id`（或 stderr "no conversation found"）→ 判 resume **未落地**，返回空触发 fresh 重建。
   - `成功 && emitted_id != requested_id` → **正常**（resume 后 CLI 可能 fork 新 session id）→ **接受并覆盖保存** emitted_id，不判失败。
@@ -62,22 +67,25 @@
 - **增量 = `messages WHERE conversation_id=? AND id > committed_msg_id AND id <= planned_through_msg_id AND 非本 agent 自产`**（参数化）：
   - 别人（含人工）在上次成功水位之后、本次快照之前说的话 → 喂给本 Agent。
   - 本 Agent 自己的历史发言由 CLI session 记忆承载，**不重喂**。
-- **为何 at-least-once 安全**（统一口径：`committed_msg_id` 只推进到 `committed_batch_end`，**不是** planned_through，见下方连续前缀分批）：
-  - A 成功 → `committed_msg_id` 推进到本轮实际连续喂达的 `committed_batch_end`;下次从此起点，不重不漏。
+- **为何 at-least-once 安全**（统一口径：`committed_msg_id` 推进到 `batch_scan_end`＝本批已完整扫描取舍的最高原始 id，可等于也可小于 planned_through，见下方连续前缀分批）：
+  - A 成功 → `committed_msg_id` 推进到本批已扫描取舍的 `batch_scan_end`（尾部全自产时即 planned_through）;下次从此起点，不重不漏、不空转。
   - A **崩溃/被中断**（committed 未推进）→ 续跑仍从**同一 committed 起点**取增量 → **重复喂但不漏**（满足不变量）。
   - A 执行期间 B 写的消息 id > A 的 planned_through → 不在 A 本次增量内，但下次触发 A 时（committed 仍在 B 之前）被正确纳入，**不漏**。
 - **崩溃不漏的关键**：**只有成功才提交 committed**;prompt 构建后、CLI 接收前崩溃时 committed 不得提前推进（否则漏）。
-- **🔴 单次海量增量——必须连续前缀分批，禁止直接过 `_clip_history`**：现状 `_clip_history` 按「保新丢旧」裁剪（`_HISTORY_MAX_MSGS`/`_HISTORY_MAX_CHARS`），若把它套在增量上，会**丢掉中段较早的消息但 committed 仍推进到 planned_through** → 被丢的中段永久漏喂，直接违反 at-least-once。因此增量 SHALL **从 committed 之后的最旧一条开始、按连续前缀（contiguous prefix）截取本轮可喂的量**，`committed_msg_id` 收尾时**只推进到本轮实际连续喂达的最后一条 id**（`committed_batch_end`），而非 planned_through。剩余未喂部分（> committed_batch_end 且 <= planned_through）留到下一轮从新 committed 起点继续，天然不重不漏。
-  - 判据：`committed_batch_end` SHALL 满足「[committed_msg_id+1, committed_batch_end] 内所有应喂消息都已纳入本轮 prompt」，中间不得有跳过。达上限即在此截断，宁可分多轮，绝不跳段。
-  - `planned_through_msg_id` 仍记录快照终点（用于判断「是否还有未喂尾部」与并发边界），但 committed 推进以 `committed_batch_end` 为准，二者可不相等（有未喂尾部时 committed_batch_end < planned_through）。
+- **🔴 单次海量增量——必须连续前缀分批，禁止直接过 `_clip_history`**：现状 `_clip_history` 按「保新丢旧」裁剪（`_HISTORY_MAX_MSGS`/`_HISTORY_MAX_CHARS`），若把它套在增量上，会**丢掉中段较早的消息但 committed 仍推进到 planned_through** → 被丢的中段永久漏喂，直接违反 at-least-once。因此增量 SHALL **从 committed 之后的最旧一条开始、按连续前缀（contiguous prefix）截取本轮可喂的量**。
+  - **🔴 committed 水位 = 原始扫描水位 `batch_scan_end`，不是「最后一条实际喂达的 id」（Review 第四轮 P0-2）**：早期写「committed 只推进到本轮实际连续喂达的最后一条 id（committed_batch_end）」，在「尾部消息全是本 Agent 自产、被过滤」时会 bug——增量查询返回空、committed 停在旧位置、`committed < planned` 恒成立，于是不断创建没有历史可投递的空 backlog successor 直到批次上限误转人工。改为：`batch_scan_end` = **本批已检查并完成取舍的最高原始 `messages.id`**（含被过滤的自产消息），`committed_msg_id` 收尾推进到 `batch_scan_end`。
+  - 判据：`batch_scan_end` SHALL 满足「[committed_msg_id+1, batch_scan_end] 内所有 eligible（非自产）消息都已纳入本轮 prompt，且该区间已被完整扫描取舍」，中间不得跳过任何 eligible 消息。达上限即在已完整扫描的原始区间末尾截断，宁可分多轮，绝不跳段。
+  - **边界（否则空转）**：① 区间全自产（增量空）→ `batch_scan_end` = planned_through，committed 直接推进到 planned_through、不建 successor;② eligible 尾部之后只剩自产 → `batch_scan_end` 跨过这些已扫描的自产记录到 planned_through，committed 推进过去、不为空尾部建 successor;③ 遇字符/条数上限 → `batch_scan_end` 只到本批已完整扫描的原始区间末尾;④ 单条 eligible 超字符预算 → 仍完整投递该条并推进过该条。
+  - `planned_through_msg_id` 仍记录快照终点（判断「是否还有未扫描尾部」与并发边界），committed 推进以 `batch_scan_end` 为准，二者可不相等（有未扫描尾部时 batch_scan_end < planned_through）。**`batch_scan_end` 可作 attempt 内临时计算结果（不必新增第三个 session 主水位）**，持久字段仍是 committed + planned 两个;收尾写 `committed_msg_id` 时写 `batch_scan_end`。
   - **「连续前缀」= 所有 eligible message（排除本 agent 自产后）的连续扫描区间**，不要求原始消息 ID 无空洞（自产消息造成的 ID 空洞不算跳段）。
-  - **单条消息本身超字符预算**：SHALL 至少完整投递这一条（不能因一条超大消息就永远卡住不推进），必要时该轮只喂这一条。
-- **🔴 自动续批——`history_backlog` successor（Review P0-4）**：连续前缀分批留下的尾部（`committed_batch_end < planned_through_msg_id`）不能等下一次用户 @ 才消费——**无新触发时会永远留在 backlog**。因此本轮 run 成功且 `committed_batch_end < planned_through_msg_id` 时，SHALL 在**同一事务**内自动创建一个 `history_backlog` successor run 继续消费剩余尾部：
+- **🔴 自动续批——`history_backlog` successor（Review P0-4）**：连续前缀分批留下的**未扫描尾部**（`batch_scan_end < planned_through_msg_id`）不能等下一次用户 @ 才消费——**无新触发时会永远留在 backlog**。因此本轮 run 成功且 `batch_scan_end < planned_through_msg_id` 时，SHALL 在**同一事务**内自动创建一个 `history_backlog` successor run 继续消费剩余尾部;**`batch_scan_end` 已达 planned_through（含全自产/尾部自产已跨过）时 SHALL NOT 建 successor**（Review 第四轮 P0-2，防空转）：
   - successor 携带 `trigger=history_backlog`、`history_batch_no`、`history_batch_end`、`history_backlog_from_execution_id`。
-  - **不计 mention-chain**（系统触发，豁免 `MAX_MENTION_CHAIN`）、受**独立的最大批次数 / token 预算**限制。
+  - **🔴 副作用防重 = prompt 约束轻方案（Review 第四轮 P0-3，用户 2026-07-20 拍板走轻方案）**：backlog successor **不禁用工具调用**（Claude/Codex 均无「只注入上下文、不产生模型 turn」的通用接口，硬禁工具会让这批变纯烧 token 空转，且 CLI 层能否可靠禁用存疑）。改靠三条协同防重：① **backlog turn 的 prompt 显式声明「以下为历史上下文同步，非新任务/新指令，不要据此重复执行已完成的操作」**（区别于普通任务 prompt）;② **不计 mention-chain**（系统触发，豁免 `MAX_MENTION_CHAIN`）;③ **不触发任务自动流转**（不因 backlog turn 的产出误判子任务 done / 父任务 reviewing）。**已知残余风险**（写入 tasks/probe 供实现期观测）：模型仍可能对历史里的旧命令产生工具调用;若观测到重复副作用，再评估是否升级到 context-only 重方案。SHALL NOT 依赖服务端 exactly-once。
+  - 受**独立的最大批次数 / token 预算**限制。
   - **复用同一 CLI session**（resume，不新建会话）。
   - `committed_msg_id` 推进、session pointer 更新、backlog successor 创建 SHALL **同事务**提交（避免推进了水位却没建后继、或建了后继但水位没动的半提交）。
-  - **所有批次消费完（committed 追平 planned_through 或新的快照终点）才清除 backlog 标记**;达批次上限仍未消费完 → 进**人工提示**（不无限自动跑）。
+  - **所有批次消费完（committed 追平冻结快照终点）才清除 backlog 标记**;达批次上限仍未消费完 → 进**人工提示**（不无限自动跑）。
+  - **🔴 backlog 快照冻结 + pending intent 优先级（Review 第四轮 P1-5）**：backlog chain SHALL **冻结初始 `planned_through_msg_id`**——chain 全程消费同一冻结快照，SHALL NOT 每批把 planned_through 扩到最新 `MAX(messages.id)`（否则持续有新消息时永远追不完）。chain 期间的新用户触发 SHALL 只**合并进 pending intent**、不扩当前快照;chain 全部批次消费完后，再按 pending intent 创建**至多一个**普通 successor 处理新快照（planned_through 取该时刻最新 MAX）。用户 kill SHALL 同时取消 backlog 与 pending;superseded 时 backlog 与 pending 均 SHALL 由 recovery child 继承。
 - 首次执行（无 session）回灌全量（现状行为，同样连续前缀分批 + backlog 续批：超上限分轮喂、自动建 successor 续，不丢段、不空转）。
 - **等效方案对比**：另一种防漏思路是维护「投递集」（记录已喂给该 agent 哪些 message）+ 排队期消息「折叠」进本轮；我们用「快照水位 + 排除自产」达到等效防漏，省一张投递集表。
 - **一处有意取舍**：也可让 Agent 用 CLI 命令**自己回读**业务历史、平台几乎不喂。我们**保留平台侧增量喂**（不建 Agent 自读命令），因为：① 我们的 `jian` CLI 未暴露全量 message 列表读取；② 增量在快照机制下很小；③ 改动面小于「造一套 Agent 自读历史的命令 + 改 prompt 教 Agent 用」。留待讨论期复核。

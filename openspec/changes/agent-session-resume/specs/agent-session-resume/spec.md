@@ -24,7 +24,7 @@
 
 ### Requirement: session_id 抓取与生命周期
 
-系统 SHALL 从 CLI 输出中提取会话标识并按下述策略维护其生命周期。claude backend SHALL 从 `-p --output-format stream-json` 的 `system`(init)/`result` 行提取 `session_id`;codex backend SHALL 从 app-server 的 `threadId` 提取。生命周期 SHALL 满足：① **流中途首次见到 id 即抢先落库（pin）**,防执行中途崩溃丢指针;② **收尾以本次最新 id 覆盖存**（resume 后 id 可能变,非只存首次）;③ 更新用 **COALESCE 空值保护**（本次没抓到 id 时不清空旧指针）;④ **pin 与覆盖 SHALL 带 CAS 条件（Review P1-3）**：`agent_sessions` SHALL 含 `session_version` 与 `current_task_run_id` 字段，pin/覆盖用 `WHERE current_task_run_id=? AND session_version=?`（写入者仍是当前活跃 attempt/版本才更新），成功后 `session_version` 自增、`current_task_run_id` 指向本 attempt;仅当写入者仍是当前活跃 attempt 时才更新，防上一轮迟到的流事件覆盖下一轮已建立的新 session pointer。
+系统 SHALL 从 CLI 输出中提取会话标识并按下述策略维护其生命周期。claude backend SHALL 从 `-p --output-format stream-json` 的 `system`(init)/`result` 行提取 `session_id`;codex backend SHALL 从 app-server 的 `threadId` 提取。生命周期 SHALL 满足：① **流中途首次见到 id 即抢先落库（pin）**,防执行中途崩溃丢指针;② **收尾以本次最新 id 覆盖存**（resume 后 id 可能变,非只存首次）;③ 更新用 **COALESCE 空值保护**（本次没抓到 id 时不清空旧指针）;④ **session owner SHALL 走 acquire/pin/final/retire 四阶段 CAS 协议（Review 第四轮 P0-4；替代原「仅 pin/覆盖 CAS」）**：`agent_sessions` SHALL 含 `session_version`（= **owner epoch**，只在 owner 切换/退休时递增，SHALL NOT 每次 pin 都递增——否则调用方要追踪不断变化的 token）与 `current_task_run_id` 字段。协议分四阶段（见下方「session owner 四阶段协议」Requirement 详述）：**(1) acquire**——新 attempt 启动时按观察到的旧 `session_version` 原子 CAS 把 `current_task_run_id` 改为本 attempt 并生成新 owner epoch;**(2) pin**——流中途只允许 `(current_task_run_id, owner_version)` 同时匹配的 attempt 更新 `session_id`;**(3) final**——成功收尾同事务更新最终 session pointer + committed 水位 + backlog/pending successor;**(4) retire**——attempt 终态后清空 `current_task_run_id`（或推进 owner epoch），使该 attempt 的迟到流事件全部 CAS 失败。仅当写入者仍是当前 owner attempt 时才更新，防上一轮迟到的流事件覆盖下一轮已建立的新 session pointer。
 
 #### Scenario: 流中途 pin 落库
 - **WHEN** CLI 流中第一次出现 session_id,该 run 尚未收尾
@@ -41,6 +41,51 @@
 #### Scenario: 迟到流事件不覆盖新 session
 - **WHEN** 上一轮 run 的流事件迟到到达，此时该 (task,agent) 已由新一轮 run（新 task_run_id/generation）建立了新的 session pointer
 - **THEN** CAS 条件（task_run_id/generation 不匹配）拒绝迟到写入，新 session pointer 不被旧事件覆盖
+
+### Requirement: session owner 四阶段 CAS 协议
+
+系统 SHALL 用 acquire → pin → final → retire 四阶段协议管理 `agent_sessions` 的 owner，使新 attempt 能原子取得 owner、迟到事件必被拒绝（Review 第四轮 P0-4）。原协议只有 pin/覆盖的校验条件、未定义新 attempt 如何取得所有权——新 attempt 启动时 `current_task_run_id` 仍指向上一 attempt（或为空），若无原子 acquire，新 attempt 第一次 pin 永远不满足 `WHERE current_task_run_id=:this_attempt`;若直接无条件改 owner，又重新引入迟到事件覆盖竞态。四阶段 SHALL 满足：
+
+**(1) acquire（attempt 启动时原子取得 owner）**：按观察到的旧 `session_version` CAS：
+```sql
+UPDATE agent_sessions
+SET current_task_run_id = :new_attempt,
+    session_version = session_version + 1
+WHERE conversation_id = :conversation
+  AND agent_slug = :agent
+  AND session_version = :observed
+RETURNING session_version;   -- 得到本 attempt 的 owner_version
+```
+**首次无 session 行时** SHALL 用 `INSERT ... ON CONFLICT(conversation_id, agent_slug) DO NOTHING` 插入并归属本 attempt（`current_task_run_id=:new_attempt`、`session_version=1`），插入与归属同一步完成;并发下只有一个 attempt 的 acquire 成功，其余按 `RETURNING` 为空重试观察最新 version。
+
+**(2) pin（流中途更新 session_id）**：只允许当前 owner attempt 更新：
+```sql
+UPDATE agent_sessions
+SET session_id = COALESCE(:session_id, session_id)
+WHERE current_task_run_id = :new_attempt
+  AND session_version = :owner_version;
+```
+`owner_version` = acquire 阶段 `RETURNING` 得到的值;pin **SHALL NOT** 递增 `session_version`（epoch 只在 owner 切换/退休时变），使调用方在整个 attempt 生命周期内持有稳定 owner token。
+
+**(3) final（成功收尾同事务）**：成功收尾 SHALL 在**同一事务**内完成：最终 session pointer 覆盖（同 pin 的 CAS 条件）+ `committed_msg_id` 水位推进 + backlog/pending successor 创建（见 committed 水位与 backlog Requirement），任一失败整体回滚。
+
+**(4) retire（owner 退休）**：attempt 终态后 SHALL 原子退休 owner——清空 `current_task_run_id`（或推进 owner epoch），使该 attempt 后续迟到的 pin/final 全部 CAS 失败。**attempt 终态且无 successor 时也 SHALL retire**，SHALL NOT 保留可写 owner 让迟到事件继续改 session。poisoned/降级清 session 与 owner retire SHALL 同事务（清 session_id 的同时退休 owner，不留「session 已清但 owner 仍可写」的空档）。
+
+#### Scenario: 新 attempt 原子取得 owner
+- **WHEN** attempt#1 完成后 attempt#2 启动，`current_task_run_id` 仍指向 attempt#1
+- **THEN** attempt#2 按观察到的旧 `session_version` CAS acquire，原子把 `current_task_run_id` 改为 attempt#2、epoch+1，此后 attempt#2 的 pin/final 满足 CAS 条件正常更新 session
+
+#### Scenario: 上一 attempt 迟到 pin/final 被拒
+- **WHEN** attempt#2 已 acquire owner，attempt#1 的迟到 pin/final 事件到达
+- **THEN** attempt#1 的 CAS 条件（`current_task_run_id`/`owner_version` 不匹配）失败，attempt#2 的 session pointer 不被覆盖
+
+#### Scenario: 终态无 successor 时迟到事件仍被拒
+- **WHEN** 某 attempt 已终态、暂无 successor，其迟到流事件到达
+- **THEN** 因 retire 已清 `current_task_run_id`/推进 epoch，迟到写 CAS 失败，SHALL NOT 因残留 owner 继续修改 session
+
+#### Scenario: 首次无 session 行并发 acquire 只一个成功
+- **WHEN** 某 (conversation, agent) 尚无 session 行，多个 attempt 并发首次 acquire
+- **THEN** `INSERT ... ON CONFLICT DO NOTHING` + version CAS 保证只有一个 attempt 取得 owner 并归属，其余观察最新 version 后重试或让位，不产生两个并发 owner
 
 ### Requirement: resume 落地判定与失效降级（不劣于现状）
 
@@ -72,7 +117,21 @@
 
 ### Requirement: 增量上下文回灌（快照水位 + 排除自产）
 
-系统 SHALL 在复用 session 执行时只回灌「增量上下文」,而非全量历史。增量水位 SHALL 用 **2 字段两阶段**：`agent_sessions.committed_msg_id`（上次**成功**执行确认的水位，**只有 run 成功收尾才推进**）+ `task_runs.planned_through_msg_id`（本次构建 prompt 那刻的快照终点 = 当时 `MAX(messages.id)`）。系统 **SHALL NOT** 用「执行完成时的 MAX(id)」做单一水位（并发下会把执行期间别人新写的消息算进而漏话）。增量 = `messages WHERE conversation_id=? AND id > committed_msg_id AND id <= planned_through_msg_id AND 作者非本 agent`（参数化）：别人/人工在上次成功水位之后、本次快照之前说的话喂给本 Agent,本 Agent 自己的历史发言由 CLI session 记忆承载、不重喂。**不变量 = at-least-once**：崩溃/中断时 committed 未推进 → 续跑从同一起点重取 → 重复但不漏;prompt 构建后、CLI 接收前崩溃时 committed **SHALL NOT** 提前推进。**单次海量增量 SHALL 用连续前缀分批，SHALL NOT 用「保新丢旧」裁剪**：现状历史裁剪按保留最新、丢弃较早裁剪，若套在增量上会丢中段较早消息而 committed 仍推进到 planned_through → 中段永久漏喂，违反 at-least-once。增量 SHALL 从 committed 之后最旧一条起、按连续前缀截取本轮可喂量，`committed_msg_id` 收尾时 **SHALL 只推进到本轮实际连续喂达的最后一条 id（committed_batch_end），SHALL NOT 直接推进到 planned_through**;剩余尾部留到下一轮从新 committed 起点续喂。超上限 SHALL 在连续前缀处截断、分多轮喂，**SHALL NOT 跳段**。「连续前缀」SHALL 指所有 eligible message（排除本 agent 自产后）的连续扫描区间，**不要求原始消息 ID 无空洞**（自产消息造成的 ID 空洞不算跳段）;单条消息本身超字符预算时 SHALL 至少完整投递该条，避免永远无法推进。**剩余尾部 SHALL 自动续批**：本轮 run 成功且 `committed_batch_end < planned_through_msg_id` 时，系统 SHALL 在**同一事务**内（连同 committed 推进、session pointer 更新）创建一个 `history_backlog` successor run 继续消费尾部（携带 `trigger=history_backlog`/`history_batch_no`/`history_batch_end`/`history_backlog_from_execution_id`），SHALL NOT 依赖新的用户 @ 才继续。backlog successor SHALL 不计 mention-chain、受独立最大批次数/token 预算限制、复用同一 CLI session;所有批次消费完才清除 backlog 标记;达批次上限仍未消费完 SHALL 进人工提示而非无限自动跑。首次执行（无 session）SHALL 回灌全量历史（现状行为，同样连续前缀分批 + 自动续批、超上限分轮不丢段不空转）。
+系统 SHALL 在复用 session 执行时只回灌「增量上下文」,而非全量历史。增量水位 SHALL 用 **2 字段两阶段**：`agent_sessions.committed_msg_id`（上次**成功**执行确认的水位，**只有 run 成功收尾才推进**）+ `task_runs.planned_through_msg_id`（本次构建 prompt 那刻的快照终点 = 当时 `MAX(messages.id)`）。系统 **SHALL NOT** 用「执行完成时的 MAX(id)」做单一水位（并发下会把执行期间别人新写的消息算进而漏话）。增量 = `messages WHERE conversation_id=? AND id > committed_msg_id AND id <= planned_through_msg_id AND 作者非本 agent`（参数化）：别人/人工在上次成功水位之后、本次快照之前说的话喂给本 Agent,本 Agent 自己的历史发言由 CLI session 记忆承载、不重喂。**不变量 = at-least-once**：崩溃/中断时 committed 未推进 → 续跑从同一起点重取 → 重复但不漏;prompt 构建后、CLI 接收前崩溃时 committed **SHALL NOT** 提前推进。**单次海量增量 SHALL 用连续前缀分批，SHALL NOT 用「保新丢旧」裁剪**：现状历史裁剪按保留最新、丢弃较早裁剪，若套在增量上会丢中段较早消息而 committed 仍推进到 planned_through → 中段永久漏喂，违反 at-least-once。增量 SHALL 从 committed 之后最旧一条起、按连续前缀截取本轮可喂量。**committed 水位 SHALL 定义为「原始消息扫描水位」`batch_scan_end`，SHALL NOT 定义为「最后一条实际拼入 prompt 的消息 id」**（Review 第四轮 P0-2）——后者在「尾部消息全是本 Agent 自产、被过滤」时会停在旧位置，使 `committed < planned` 恒成立、无限创建没有历史可投递的空 backlog successor 直到批次上限误转人工。正确语义：
+
+```text
+batch_scan_end = 本批已检查并完成取舍的最高原始 messages.id
+eligible messages = 扫描区间内真正拼入 prompt 的非自产消息
+成功后 committed_msg_id = batch_scan_end   （不是最后一条 eligible 的 id）
+```
+
+推进规则 SHALL 覆盖以下边界：
+- **区间内全是本 Agent 自产消息**（增量查询为空）：committed **SHALL 直接推进到 `planned_through_msg_id`**，SHALL NOT 创建 successor（无历史可投递）。
+- **eligible 尾部之后只剩自产消息**：committed SHALL 跨过这些已扫描的自产记录、推进到 `planned_through_msg_id`，SHALL NOT 把这段空尾部误判为未消费 backlog。
+- **遇字符/条数上限**：`batch_scan_end` **只能推进到本批已完整扫描的原始区间末尾**，剩余未扫描区间留下一轮。
+- **单条 eligible 消息超字符预算**：SHALL 仍完整投递该条并推进过该条，避免永远卡住。
+
+超上限 SHALL 在连续前缀处截断、分多轮喂，**SHALL NOT 跳段**。「连续前缀」SHALL 指所有 eligible message（排除本 agent 自产后）的连续扫描区间，**不要求原始消息 ID 无空洞**（自产消息造成的 ID 空洞不算跳段）。`batch_scan_end` 可作为 attempt 内的临时计算结果（`task_runs` 行或计算得出），**不必新增第三个 session 主水位**——持久字段仍是 `committed_msg_id` 与 `planned_through_msg_id` 两个，但收尾写 `committed_msg_id` 时 SHALL 写 `batch_scan_end` 而非最后一条 eligible id。**剩余尾部 SHALL 自动续批**：本轮 run 成功且 `batch_scan_end < planned_through_msg_id`（即确有未扫描的原始区间）时，系统 SHALL 在**同一事务**内（连同 committed 推进、session pointer 更新）创建一个 `history_backlog` successor run 继续消费尾部（携带 `trigger=history_backlog`/`history_batch_no`/`history_batch_end`/`history_backlog_from_execution_id`），SHALL NOT 依赖新的用户 @ 才继续;**若 `batch_scan_end` 已达 `planned_through_msg_id`（含全自产/尾部自产已跨过的情形）SHALL NOT 创建 successor**。backlog successor SHALL 不计 mention-chain、受独立最大批次数/token 预算限制、复用同一 CLI session;所有批次消费完才清除 backlog 标记;达批次上限仍未消费完 SHALL 进人工提示而非无限自动跑。**backlog successor 的副作用防重 SHALL 采用 prompt 约束方案（Review 第四轮 P0-3，用户拍板走轻方案）**：SHALL NOT 禁用工具调用（Claude/Codex 均无「只注入上下文、不产生模型 turn」的通用接口），改由三条协同防重——① `trigger=history_backlog` 的 prompt SHALL 显式声明「以下为历史上下文同步、非新任务/新指令，不要据此重复执行已完成的操作」;② SHALL NOT 计入 mention-chain;③ SHALL NOT 触发任务自动流转（不因 backlog turn 产出误判子任务 done/父任务 reviewing）。副作用防重 SHALL NOT 依赖服务端 exactly-once。首次执行（无 session）SHALL 回灌全量历史（现状行为，同样连续前缀分批 + 自动续批、超上限分轮不丢段不空转）。
 
 #### Scenario: 复用执行只喂增量
 - **WHEN** 某 (conversation, agent) 带 session resume 执行,其间别人新增了若干条 messages
@@ -92,11 +151,23 @@
 
 #### Scenario: 海量增量连续前缀分批不跳段
 - **WHEN** 增量消息条数/字符超单轮上限
-- **THEN** 系统从 committed 之后最旧一条起按连续前缀截取本轮可喂量、在上限处截断（committed_batch_end），committed_msg_id 只推进到 committed_batch_end 而非 planned_through，剩余尾部下一轮从新起点续喂，中间不跳过任何应喂消息
+- **THEN** 系统从 committed 之后最旧一条起按连续前缀截取本轮可喂量、在本批已完整扫描的原始区间末尾截断（`batch_scan_end`），committed_msg_id 推进到 `batch_scan_end` 而非 planned_through，剩余未扫描尾部下一轮从新起点续喂，中间不跳过任何应喂消息
+
+#### Scenario: 尾部全自产不空转（self-only）
+- **WHEN** committed=10、planned=20，且 messages 11..20 全部由本 Agent 自产（增量查询为空）
+- **THEN** 本批扫描区间 11..20 已完整取舍完毕、`batch_scan_end=20`，committed 直接推进到 20，SHALL NOT 因「无 eligible 消息可喂」把 committed 停在 10、SHALL NOT 创建任何 backlog successor
+
+#### Scenario: eligible 尾部之后是自产（trailing-self）
+- **WHEN** committed=10、planned=20，11..15 为他人 eligible 消息、16..20 为本 Agent 自产
+- **THEN** 投递 11..15 后 `batch_scan_end=20`（已扫描过整段），committed 推进到 20，SHALL NOT 只推进到最后一条 eligible（15）而把 16..20 误判为未消费 backlog、SHALL NOT 为空尾部创建 successor
 
 #### Scenario: 无新触发也自动续批消费尾部
 - **WHEN** 海量增量需分 3 批消费，且期间没有新的用户 @ 触发
 - **THEN** 本轮成功后系统在同事务内自动创建 `history_backlog` successor 继续下一批，逐轮推进 committed，直至全部批次消费完才清 backlog；不依赖新触发、不空转在半消费状态
+
+#### Scenario: backlog turn 声明历史同步不重复副作用
+- **WHEN** `trigger=history_backlog` 的 successor 执行，其增量含历史里的旧命令/旧请求
+- **THEN** 该 turn 的 prompt 已显式声明「历史上下文同步、非新指令」，且不计 mention-chain、不触发任务自动流转;若实现期观测到模型仍对旧命令重复副作用，再评估升级为 context-only 重方案（当前不禁用工具）
 
 #### Scenario: 单条超大消息不卡死
 - **WHEN** 某单条消息本身超过字符预算
@@ -109,6 +180,27 @@
 #### Scenario: 首次执行全量回灌
 - **WHEN** 某 (conversation, agent) 首次执行（无 session）
 - **THEN** 系统回灌全量历史（与改造前一致），不因缺 session 而丢上下文
+
+### Requirement: backlog 快照冻结与 pending intent 优先级
+
+系统 SHALL 固定 backlog chain 与新用户触发（pending intent）的优先级与继承规则，避免持续新消息使 backlog 永远追逐移动终点、或普通用户指令长期饥饿（Review 第四轮 P1-5）：
+
+1. **backlog chain SHALL 冻结初始 `planned_through_msg_id`**——chain 全程消费同一冻结快照终点，SHALL NOT 每批把 `planned_through` 扩到最新 `MAX(messages.id)`（否则持续有新消息时永远追不完）。
+2. **chain 期间的新用户触发 SHALL 只合并进 pending intent**，SHALL NOT 扩张当前 backlog 快照。
+3. **backlog 全部批次消费完后 SHALL 至多创建一个普通 successor** 处理 pending intent 的新快照（`planned_through` 取该时刻最新 `MAX`）。
+4. **用户 kill SHALL 同时取消 backlog 与 pending**;**superseded 时 backlog 与 pending 均 SHALL 由 recovery child 继承**（不丢未消费尾部、不丢待处理新意图）。
+
+#### Scenario: backlog 消费期间追加新消息不延长当前 chain
+- **WHEN** backlog chain 正按冻结快照（planned_through=20）分批消费，期间用户又追加了 msg 21..25
+- **THEN** 当前 chain 仍按冻结的 20 有界结束，21..25 折叠进 pending intent，chain 消费完后至多创建一个普通 successor 处理新快照，SHALL NOT 把 21..25 并入当前 chain 使其无限延长
+
+#### Scenario: kill 同时取消 backlog 与 pending
+- **WHEN** 某 (task,agent) 存在未消费 backlog chain 且有 pending intent，用户 kill
+- **THEN** 系统同时取消 backlog 与 pending，不遗留自动续批或待处理意图
+
+#### Scenario: superseded 时 backlog 与 pending 由 recovery child 继承
+- **WHEN** backlog chain 执行中被交棒 superseded，且当时有 pending intent
+- **THEN** recovery child 同时继承未消费的 backlog 快照与 pending intent，续跑后既补完历史尾部又处理新意图，不丢任一
 
 ### Requirement: backend 分流（claude 与 codex 均必选）
 
