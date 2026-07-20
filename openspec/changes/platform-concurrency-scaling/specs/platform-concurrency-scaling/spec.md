@@ -52,6 +52,14 @@
 
 **本 change 与 [platform-graceful-restart]、[agent-session-resume] SHALL 共享同一并发不变量与迁移顺序（Review 第五轮 P1-4）**，SHALL NOT 各自声称「原子领取已具备」而与 PGR 的现状判断（`_claim_one` 尚未达多 Worker 原子安全）冲突。统一迁移顺序：① 先落 execution/attempt/`worker_state` 基础表与状态词汇（PGR 阶段 1 最小地基）;② 再落 task/conversation/agent 粒度的 active 唯一约束（与 PGR、ASR 的 active partial unique index 同源）;③ 再启用多 Worker 的原子容量与 claim（PGR 原子 claim CAS 落地后）;④ 分别写清 **SQLite 当前落地路径**（单语句条件 UPDATE + busy_timeout）与**未来 PostgreSQL 的 `SELECT ... FOR UPDATE SKIP LOCKED`/约束差异**，SHALL NOT 把 PostgreSQL 方案倒推成 SQLite 已具备能力。本 change 的「同 slug 全局串行」约束 SHALL 并入 PGR 的顺序与唯一索引迁移设计，不另起一套。
 
+**多 Worker owner 模型 SHALL 从 PGR 的单行 `worker_state` 演进为多实例结构，SHALL NOT 直接复用单行 `owner_instance_id` 冒充多 Worker（Review 第六轮 P1-6：单行 `worker_state` 只容纳一个 `owner_instance_id`，多个不同 instance id 的 Worker 无法同时通过 claim 校验）**。水平扩展前 SHALL 至少拆为三层：
+```text
+cluster/restart epoch   -- 整个 Worker 集群的部署世代、draining 状态
+worker_instances        -- 每个 Worker 的 instance_id、heartbeat、lease、capacity
+attempt owner           -- attempt 实际归属的 worker_instance_id
+```
+同 slug 全局串行在多 Worker 阶段 SHALL NOT 只靠单进程 `_running`，SHALL 用 DB `agent_leases(agent_slug UNIQUE, owner_attempt_id, lease_until)` 或等价原子容量机制保证。该演进**不阻塞 PGR 单 Worker**，但 SHALL 阻塞本 change 阶段 2（多 Worker）放行——阶段 2 未落地多实例 owner 模型与 `agent_leases` 前 readiness SHALL fail-closed。探针 `multi_worker_owner_model_probe`（两 Worker 同 cluster epoch、不同 instance id，各自持有不同 attempt 且能通过 claim 校验;断言旧单行 `worker_state` 模型不得冒充多 Worker 支持）。
+
 #### Scenario: 多 worker 无状态消费
 - **WHEN** 单机资源成为瓶颈、需多 worker 分担、且 PGR 原子 claim CAS 已落地
 - **THEN** 多个无状态 worker 依 PGR 原子 claim 协议（单语句 CAS + generation/owner/lease 校验）从共享队列领取并执行 run，不重复领取、不丢任务
@@ -59,3 +67,7 @@
 #### Scenario: 不把 PostgreSQL 能力倒推为 SQLite 现状
 - **WHEN** 文档描述当前多 Worker 领取能力
 - **THEN** 明确区分 SQLite 当前落地路径与未来 PostgreSQL `SKIP LOCKED`，不声称 SQLite 阶段「原子领取已具备」
+
+#### Scenario: 多 Worker owner 模型不复用单行 worker_state
+- **WHEN** 进入阶段 2 多 Worker，两个不同 instance id 的 Worker 在同一 cluster epoch 下并行消费
+- **THEN** 各 Worker 通过 `worker_instances` 持有各自 instance 身份、可分别归属不同 attempt;SHALL NOT 用 PGR 单行 `worker_state.owner_instance_id` 承载多实例;同 slug 全局串行由 `agent_leases`（或等价原子容量）保证而非单进程 `_running`;阶段 2 未落地该模型时 readiness fail-closed

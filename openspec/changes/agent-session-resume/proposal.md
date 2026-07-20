@@ -25,11 +25,11 @@
 ## Capabilities
 
 ### New Capabilities
-- `agent-session-resume`: Agent 执行的 CLI 会话复用能力——每个 (task, agent) 维护一条 CLI session,再次执行时 resume 续接 + 只喂增量上下文,替代每次全量回灌;含首次/失败/provider 变更的降级链,保证不劣于现状。
+- `agent-session-resume`: Agent 执行的 CLI 会话复用能力——每个 (conversation, agent) 维护一条 CLI session（`conversation_id` 为空的历史/系统 run 退化到 (task, agent) 兜底，第六轮 P1-1）,再次执行时 resume 续接 + 只喂增量上下文,替代每次全量回灌;含首次/失败/provider 变更的降级链,保证不劣于现状。
 
 ## Impact
 
-- **规划态,暂不改代码。** 落实时预计涉及：`executor/base.py`(`build_cli_prompt` 支持增量模式)、`executor/claude_code.py`(`--resume` 参数 + session_id 提取 + mismatch 判定)、`executor/codex.py`(app-server + thread/resume，每 run 一进程)、`executor/runner.py`(查/写 `agent_sessions`、committed/planned 两阶段水位、增量取历史、折叠模型)、`database.py`(建 `agent_sessions` 表 + `task_runs.planned_through_msg_id` 列 + 折叠所需 run_queue 字段)。
+- **规划态,暂不改代码。** 落实时预计涉及：`executor/base.py`(`build_cli_prompt` 支持增量模式)、`executor/claude_code.py`(`--resume` 参数 + session_id 提取 + mismatch 判定)、`executor/codex.py`(app-server + thread/resume，每 run 一进程)、`executor/runner.py`(查/写 `agent_sessions`、committed/planned 两阶段水位、增量取历史、折叠模型)、`database.py`(建 `agent_sessions` 表——唯一键 `(conversation_id, agent_slug)`、含 `session_version`/`current_task_run_id` owner 字段 + `task_runs.planned_through_msg_id` 列 + 折叠所需 `run_queue.conversation_id` 及两组互补 active 唯一索引)。
 - **关联能力**：[agent-collaboration](多 Agent 协同/会话)、[agent-execution](执行)、[platform-graceful-restart](其阶段 3/4 = 本 change;其阶段 5「温和重启+resume 续跑」依赖本 change 出的 resume 地基与流中途 pin)。
 - **不破坏多 Agent 协同**：每个 Agent 独立 session,互不干扰;别人的发言经「增量回灌」补给,语义正确。
-- **模型适配**：业界常见 session 模型是「1 issue × 1 agent = 1 session」,我们是「多 Agent 在一个 conversation 里 @ 来 @ 去」,故需 per-(task, agent) 粒度 + 增量回灌来适配,而非直接套用单会话。
+- **模型适配**：业界常见 session 模型是「1 issue × 1 agent = 1 session」,我们是「多 Agent 在一个 conversation 里 @ 来 @ 去」,故需 per-(conversation, agent) 粒度 + 增量回灌来适配,而非直接套用单会话。
