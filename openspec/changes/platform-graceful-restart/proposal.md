@@ -15,7 +15,7 @@
 
 > **经技术负责人 Review 修订（2026-07-16，判定 Request changes）**：核心 = 先把方案从「resume 功能列表」升级为「持久化执行协议」——先定义 durable execution 状态机 + 并发不变量，再实现。分期改为**阶段 0-6（Worker 剥离优先、resume 后置）**。**本 change 暂不改任何代码。**
 
-修正原方案 3 处事实错误：① `_claim_one` **非原子**（UPDATE 无 CAS，多 Worker 会双领）——原写「已原子/地基已具备」错误;② 人工 @ 主受理人**在 API 请求内同步执行**（`routes/runs.py`），M2 未覆盖此主路径;③ `run_queue` **无 conversation_id 列**，原 spec 写的 `(conversation_id, agent_slug)` partial index 建不出来——改用**存在的** `(task_id, agent_slug)` partial unique index 保单 active，且「折叠」由丢弃改为合并。
+修正原方案 3 处事实错误：① `_claim_one` **非原子**（UPDATE 无 CAS，多 Worker 会双领）——原写「已原子/地基已具备」错误;② 人工 @ 主受理人**在 API 请求内同步执行**（`routes/runs.py`），M2 未覆盖此主路径;③ `run_queue` **无 conversation_id 列**，原 spec 写的 `(conversation_id, agent_slug)` partial index 建不出来——曾改用 `(task_id, agent_slug)` 保单 active，且「折叠」由丢弃改为合并。**（Review 第五轮 P1-5 拍板方案 B 已改回 conversation 粒度：迁移先给 `run_queue` 补 `conversation_id` 列再建 `(conversation_id, agent_slug)` partial unique index，与 session owner 键同粒度，防同 conversation 多 task 争抢 owner。以此为准。）**
 
 - **阶段 0 — 补执行协议规格**：定义 execution 状态机 `queued→claimed→running→{done/failed/killed/superseded(+recovery child)/recovery_blocked}`（**execution 成功态=`done` 非 `succeeded`；`succeeded` 是 attempt 层终态**，双层状态词汇表见 spec，Review 第四轮 P0-1;**无独立 accepted 态**，Review P0-A）+ 7 条不变量（原子持有、单 active+单 pending intent、CAS 终态、supersede+child 同事务、旧 generation fencing、有界恢复、事务边界）。见 design 决策 0。
 - **阶段 1 — DB 协议地基**：`WAL + 每连接 busy_timeout + 安全在线备份 + 索引`；**所有触发统一入队**；**两段式 dispatch**（POST 幂等入队返回 execution_id + GET 独立 SSE 订阅）；**原子 claim（CAS 单语句）**；重复触发合并（不丢）；`task_run↔run_queue` claim 时即建不可变关联。

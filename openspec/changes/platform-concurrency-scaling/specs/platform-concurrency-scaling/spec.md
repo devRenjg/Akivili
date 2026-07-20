@@ -50,6 +50,12 @@
 
 系统 SHALL 保留水平扩展的演进路径：当规模超出单机时，调度状态 SHALL 可外置（run_queue 已在 DB，`_running`/PID 外置到 DB/Redis），使执行 worker 无状态化、可多进程/多机水平扩展。此为规模超单机时的演进方向，非近期必做。
 
+**本 change 与 [platform-graceful-restart]、[agent-session-resume] SHALL 共享同一并发不变量与迁移顺序（Review 第五轮 P1-4）**，SHALL NOT 各自声称「原子领取已具备」而与 PGR 的现状判断（`_claim_one` 尚未达多 Worker 原子安全）冲突。统一迁移顺序：① 先落 execution/attempt/`worker_state` 基础表与状态词汇（PGR 阶段 1 最小地基）;② 再落 task/conversation/agent 粒度的 active 唯一约束（与 PGR、ASR 的 active partial unique index 同源）;③ 再启用多 Worker 的原子容量与 claim（PGR 原子 claim CAS 落地后）;④ 分别写清 **SQLite 当前落地路径**（单语句条件 UPDATE + busy_timeout）与**未来 PostgreSQL 的 `SELECT ... FOR UPDATE SKIP LOCKED`/约束差异**，SHALL NOT 把 PostgreSQL 方案倒推成 SQLite 已具备能力。本 change 的「同 slug 全局串行」约束 SHALL 并入 PGR 的顺序与唯一索引迁移设计，不另起一套。
+
 #### Scenario: 多 worker 无状态消费
-- **WHEN** 单机资源成为瓶颈、需多 worker 分担
-- **THEN** 多个无状态 worker 可安全地从共享队列原子领取并执行 run，不重复领取、不丢任务
+- **WHEN** 单机资源成为瓶颈、需多 worker 分担、且 PGR 原子 claim CAS 已落地
+- **THEN** 多个无状态 worker 依 PGR 原子 claim 协议（单语句 CAS + generation/owner/lease 校验）从共享队列领取并执行 run，不重复领取、不丢任务
+
+#### Scenario: 不把 PostgreSQL 能力倒推为 SQLite 现状
+- **WHEN** 文档描述当前多 Worker 领取能力
+- **THEN** 明确区分 SQLite 当前落地路径与未来 PostgreSQL `SKIP LOCKED`，不声称 SQLite 阶段「原子领取已具备」

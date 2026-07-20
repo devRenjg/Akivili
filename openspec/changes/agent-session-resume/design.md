@@ -26,13 +26,13 @@
 
 - 粒度取 **(conversation_id, agent_slug)**——同一 task 里每个成员各持独立 session，互不干扰。
 - 新表 `agent_sessions(id, conversation_id, agent_slug, session_id, committed_msg_id, provider_id, backend, workdir, updated_at)`，唯一键 `(conversation_id, agent_slug)`。`committed_msg_id` = 上次**成功**执行确认喂到的水位（见决策 3）。本次执行的快照终点 `planned_through_msg_id` 落在 `task_runs` 行（每 run 一行、天然是历史）。
-- **同 (task, agent) 单 active + 折叠（Review P0-3/P0-B 修正）**：目标 = 同一成员在同一 task 上**至多一个 active run**（active = queued/claimed/running），重复触发**折叠**进下一轮（合并触发意图，不丢），而非并行起第二条、也不是当前 `return None` 丢弃。**DB 级唯一性**：`run_queue` 虽无 conversation_id 列，但有 `task_id`——建 partial unique index `ON run_queue(task_id, agent_slug) WHERE status IN ('queued','claimed','running')` 从 DB 层杜绝两个并发 POST 各插一条 active（应用层查重有 TOCTOU 竞态，Review P0-B）。折叠规则见决策 1b。
+- **同 (conversation, agent) 单 active + 折叠（Review P0-3/P0-B；第五轮 P1-5 粒度改 conversation）**：目标 = 同一成员在同一 conversation 上**至多一个 active run**（active = queued/claimed/running），重复触发**折叠**进下一轮（合并触发意图，不丢），而非并行起第二条、也不是当前 `return None` 丢弃。**DB 级唯一性**：粒度 SHALL 与 session owner 键 `(conversation_id, agent_slug)` 对齐——`run_queue` 现状无 conversation_id 列，迁移先 `ALTER ADD COLUMN conversation_id`（从 tasks 回填）再建 partial unique index `ON run_queue(conversation_id, agent_slug) WHERE status IN ('queued','claimed','running')`，从 DB 层杜绝两个并发 POST 各插一条 active（应用层查重有 TOCTOU 竞态，Review P0-B）;`conversation_id` 为空的历史 run 不进入约束。**为何不用 `(task_id, agent_slug)`**：现状 `tasks.conversation_id` 可空无唯一约束，一个 conversation 可挂多 task，task 粒度会让同 conversation 两 task 争抢同一 session owner。折叠规则见决策 1b。
 
 ### 决策 1b：重复触发折叠模型（Review P0-3，取代「查重丢弃」与「伪 index」）
 
 现状 `collab.py:392` 对同 task/agent 已有 queued/running 时直接 `return None`——触发被静默丢。改为 **DB 级唯一性 + 持久化折叠**：
 
-- **DB 唯一性兜底**：`partial unique index ON run_queue(task_id, agent_slug) WHERE status IN ('queued','claimed','running')`——两个并发触发只有一个能插入 active 行，另一个 insert 冲突后转入折叠路径（而非各插一条 → 双执行）。
+- **DB 唯一性兜底**：`partial unique index ON run_queue(conversation_id, agent_slug) WHERE status IN ('queued','claimed','running')`（第五轮 P1-5 方案 B，先补 conversation_id 列）——两个并发触发只有一个能插入 active 行，另一个 insert 冲突后转入折叠路径（而非各插一条 → 双执行）。
 - **目标 run 为 queued（未 claim）**：把新触发的消息水位/触发来源**用原子 `MAX`/`COALESCE` 更新**合并进该 queued 行（**不先读后写**，避免竞态），不新建行。
 - **目标 run 为 claimed/preparing**：同 running 处理——记 pending intent（不能漏在 queued/running 两分法之外，Review P0-B）。
 - **目标 run 为 running**：在其 `run_queue` 行持久化 `rerun_requested=1` + `pending_through_message_id`（原子合并到最大）+ 触发来源集合。
@@ -47,10 +47,12 @@
 - **空值保护（COALESCE）**：更新用 `SET session_id = COALESCE(?, session_id)`——本次没抓到 id 时不清空旧指针。
 - **流中途抢先落库（pin）**：流里第一次看到 session_id 就落库一次，防执行中途崩溃丢指针（这条对 [platform-graceful-restart] 的 resume 续跑至关重要）。
 - **🔴 session owner 四阶段 CAS 协议（Review 第四轮 P0-4）**：上面的 pin/覆盖需要「写入者仍是当前活跃 attempt」的 CAS 保护，但**只写校验条件不够**——新 attempt 启动时 `current_task_run_id` 仍指向上一 attempt（或为空），第一次 pin 永远不满足 `WHERE current_task_run_id=:this_attempt`;若无条件改 owner 又重新引入迟到覆盖竞态。故 `agent_sessions` 加 `session_version`（= **owner epoch**，只在 owner 切换/退休递增，非每次 pin 递增）+ `current_task_run_id`，走四阶段：
-  - **(1) acquire**：attempt 启动时按观察到的旧 version CAS——`UPDATE ... SET current_task_run_id=:new_attempt, session_version=session_version+1 WHERE (conversation,agent) AND session_version=:observed RETURNING session_version`;首次无行用 `INSERT ... ON CONFLICT(conversation_id,agent_slug) DO NOTHING` 归属本 attempt（并发下只一个成功，其余观察最新 version 重试）。
+  - **(1) acquire**：attempt 启动时按观察到的旧 version CAS——`UPDATE ... SET current_task_run_id=:new_attempt, session_version=session_version+1 WHERE (conversation,agent) AND session_version=:observed AND (旧 owner 资格谓词) RETURNING session_version`;首次无行用 `INSERT ... ON CONFLICT(conversation_id,agent_slug) DO NOTHING` 归属本 attempt。**🔴 acquire 须校验 owner 资格（Review 第五轮 P0-2）**：除 version 外，`current_task_run_id IS NULL` 或旧 owner 已终态 或旧 owner attempt lease 已失效且旧 generation 已 fencing 才允许接管;**active owner（旧 attempt 仍 running 且 lease 未失效）不允许被普通新 attempt 覆盖**——只读到最新 version 不足以抢 owner;acquire 失败走 lease 回收/排队，不强抢。
   - **(2) pin**：流中途 `UPDATE ... SET session_id=COALESCE(:sid,session_id) WHERE current_task_run_id=:new_attempt AND session_version=:owner_version`;**pin 不递增 version**，调用方整段持稳定 owner token。
-  - **(3) final**：成功收尾同事务更新最终 pointer + committed 水位 + backlog/pending successor（任一失败整体回滚）。
+  - **(3) final**：成功收尾**并入 [platform-graceful-restart] 统一 `finish_execution()` 同一提交**（Review 第五轮 P0-4）——最终 pointer + committed 水位 + backlog/pending successor + owner retire 与 execution/attempt 终态、terminal/superseded 事件同事务;final 与 retire 不分两次提交（否则 final 后崩溃残留「终态但 owner 可写」）;任一失败整体回滚。
   - **(4) retire**：attempt 终态后清 `current_task_run_id`/推进 epoch，使迟到 pin/final CAS 失败;**终态无 successor 也 retire**;poisoned/降级清 session 与 retire 同事务。
+  - **🔴 fallback rebind（Review 第五轮 P0-2）**：resume 未落地/provider·workdir 变更/poisoned 需同 attempt 重建会话时，走 `retire old epoch → reacquire/rebind new epoch → start fresh session`，持新 owner token 才 pin;不能清旧 session 后直接用旧 owner_version pin 新 session（旧 epoch CAS 全失败）。
+  - **🔴 lease reclaim/supersede/kill/poisoned 同步退休 owner（Review 第五轮 P0-2）**：owner attempt 被 lease 回收/supersede/kill/poisoned 时，同事务同步退休其 session owner;新 attempt 的 acquire 资格依赖此退休已生效。
 - **resume 落地判定（Review P1-6 修正：mismatch 只在失败时判）**：
   - `失败 && emitted_id != requested_id`（或 stderr "no conversation found"）→ 判 resume **未落地**，返回空触发 fresh 重建。
   - `成功 && emitted_id != requested_id` → **正常**（resume 后 CLI 可能 fork 新 session id）→ **接受并覆盖保存** emitted_id，不判失败。
@@ -80,7 +82,7 @@
   - **「连续前缀」= 所有 eligible message（排除本 agent 自产后）的连续扫描区间**，不要求原始消息 ID 无空洞（自产消息造成的 ID 空洞不算跳段）。
 - **🔴 自动续批——`history_backlog` successor（Review P0-4）**：连续前缀分批留下的**未扫描尾部**（`batch_scan_end < planned_through_msg_id`）不能等下一次用户 @ 才消费——**无新触发时会永远留在 backlog**。因此本轮 run 成功且 `batch_scan_end < planned_through_msg_id` 时，SHALL 在**同一事务**内自动创建一个 `history_backlog` successor run 继续消费剩余尾部;**`batch_scan_end` 已达 planned_through（含全自产/尾部自产已跨过）时 SHALL NOT 建 successor**（Review 第四轮 P0-2，防空转）：
   - successor 携带 `trigger=history_backlog`、`history_batch_no`、`history_batch_end`、`history_backlog_from_execution_id`。
-  - **🔴 副作用防重 = prompt 约束轻方案（Review 第四轮 P0-3，用户 2026-07-20 拍板走轻方案）**：backlog successor **不禁用工具调用**（Claude/Codex 均无「只注入上下文、不产生模型 turn」的通用接口，硬禁工具会让这批变纯烧 token 空转，且 CLI 层能否可靠禁用存疑）。改靠三条协同防重：① **backlog turn 的 prompt 显式声明「以下为历史上下文同步，非新任务/新指令，不要据此重复执行已完成的操作」**（区别于普通任务 prompt）;② **不计 mention-chain**（系统触发，豁免 `MAX_MENTION_CHAIN`）;③ **不触发任务自动流转**（不因 backlog turn 的产出误判子任务 done / 父任务 reviewing）。**已知残余风险**（写入 tasks/probe 供实现期观测）：模型仍可能对历史里的旧命令产生工具调用;若观测到重复副作用，再评估是否升级到 context-only 重方案。SHALL NOT 依赖服务端 exactly-once。
+  - **🔴 副作用安全线 = 方案 A（Review 第五轮 P0-1，用户 2026-07-20 拍板；替代第四轮仅 prompt 约束轻方案）**：prompt 约束不构成工程安全边界——模型仍可能建卡/评论/改文件/调外部接口，或输出普通 assistant 交付间接触发 mention/通知;且历史需多批时首批只拿到上下文前缀就已开始真实推理执行，后批补历史无法撤销首批基于不完整上下文的决定。故 SHALL：① **tool-enabled 自动续批默认 feature flag 关闭**，不随阶段 1 默认开，属独立上线门;② **`history_backlog_side_effect_observe_probe` 升级为 release gate 硬门禁**——发现工具调用/平台写/普通 assistant 交付/mention·通知/任务自动流转即失败;③ **做不到 context-only turn 时先聚合/摘要历史再创建一次正常业务 turn**，首批不完整上下文不得直接执行真实任务;④ 若仍启用轻方案，文档明确 best-effort + 记录「可能重复副作用/可能基于不完整历史决策」已接受风险，不写成「已解决」。无论是否启用：不计 mention-chain、不触发任务自动流转、不依赖服务端 exactly-once。
   - 受**独立的最大批次数 / token 预算**限制。
   - **复用同一 CLI session**（resume，不新建会话）。
   - `committed_msg_id` 推进、session pointer 更新、backlog successor 创建 SHALL **同事务**提交（避免推进了水位却没建后继、或建了后继但水位没动的半提交）。
