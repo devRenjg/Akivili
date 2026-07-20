@@ -2,9 +2,16 @@
 
 ## ADDED Requirements
 
-### Requirement: per-(task, agent) CLI 会话复用与串行
+### Requirement: per-(conversation, agent) CLI 会话复用与串行
 
-系统 SHALL 为每个 `(conversation_id, agent_slug)` 维护一条 CLI session,持久化于 `agent_sessions` 表（唯一键 `(conversation_id, agent_slug)`）。同一 Agent 在同一 task 里再次被触发执行时,系统 SHALL 复用该 session（CLI resume）,而非每次新建会话。session 记录 SHALL 含 `session_id`、`committed_msg_id`（上次成功执行确认的增量水位）、`provider_id`、`backend`、`workdir`;本次执行的快照终点 `planned_through_msg_id` SHALL 落在 `task_runs` 行。粒度 SHALL 为 (conversation, agent)——同一 task 内每个成员各持独立 session,互不干扰。**active 串行唯一索引 SHALL 与 session owner 粒度对齐为 `(conversation_id, agent_slug)`（Review 第五轮 P1-5 拍板方案 B）**：session 键是 `(conversation_id, agent_slug)`，若 active 唯一索引用 `(task_id, agent_slug)`，仅当 `tasks.conversation_id` 被约束为一对一且不可复用时两者才等价;现状 `tasks.conversation_id` 可空且无唯一约束（一个 conversation 可挂多个 task），会出现同一 conversation 的两个 active run 争抢同一 session owner。故系统 SHALL 保证同一 `(conversation, agent)` 至多一个 active run（active = queued/claimed/running），DB 级唯一性 SHALL 用 `partial unique index ON run_queue(conversation_id, agent_slug) WHERE status IN ('queued','claimed','running')` 保证（应用层查重有 TOCTOU 竞态，不足以防两个并发 POST 各插一条）。**`run_queue` 现状无 `conversation_id` 列**，迁移 SHALL 先 `ALTER ADD COLUMN conversation_id`（从 `tasks.conversation_id` 回填存量、新写入路径强制随 task 带入），再建上述 conversation 粒度 partial unique index;建索引前 SHALL 先归并/取消存量同 `(conversation, agent)` 多 active 行。重复触发 SHALL **折叠**进下一轮（合并触发意图，不丢弃），而非并行起第二条;折叠 SHALL 用「queued 原子合并水位 / claimed·running 记 pending intent、收尾据 pending 建至多一个 successor」实现。全局并发上限约束的是不同 (conversation, agent) 的并行度,与此串行正交。（`conversation_id` 为空的历史 run——如无会话的系统任务——SHALL 不进入该 partial index 的约束范围，走 task 级兜底或不约束，避免 NULL 撞唯一键。）
+系统 SHALL 为每个 `(conversation_id, agent_slug)` 维护一条 CLI session,持久化于 `agent_sessions` 表（唯一键 `(conversation_id, agent_slug)`）。同一 Agent 在同一 task 里再次被触发执行时,系统 SHALL 复用该 session（CLI resume）,而非每次新建会话。session 记录 SHALL 含 `session_id`、`committed_msg_id`（上次成功执行确认的增量水位）、`provider_id`、`backend`、`workdir`;本次执行的快照终点 `planned_through_msg_id` SHALL 落在 `task_runs` 行。粒度 SHALL 为 (conversation, agent)——同一 task 内每个成员各持独立 session,互不干扰。**active 串行唯一索引 SHALL 与 session owner 粒度对齐为 `(conversation_id, agent_slug)`（Review 第五轮 P1-5 拍板方案 B）**：session 键是 `(conversation_id, agent_slug)`，若 active 唯一索引用 `(task_id, agent_slug)`，仅当 `tasks.conversation_id` 被约束为一对一且不可复用时两者才等价;现状 `tasks.conversation_id` 可空且无唯一约束（一个 conversation 可挂多个 task），会出现同一 conversation 的两个 active run 争抢同一 session owner。故系统 SHALL 保证同一 `(conversation, agent)` 至多一个 active run（active = queued/claimed/running），DB 级唯一性 SHALL 用 `partial unique index ON run_queue(conversation_id, agent_slug) WHERE status IN ('queued','claimed','running')` 保证（应用层查重有 TOCTOU 竞态，不足以防两个并发 POST 各插一条）。**`run_queue` 现状无 `conversation_id` 列**，迁移 SHALL 先 `ALTER ADD COLUMN conversation_id`（从 `tasks.conversation_id` 回填存量、新写入路径强制随 task 带入），再建上述 conversation 粒度 partial unique index;建索引前 SHALL 先归并/取消存量同 `(conversation, agent)` 多 active 行。重复触发 SHALL **折叠**进下一轮（合并触发意图，不丢弃），而非并行起第二条;折叠 SHALL 用「queued 原子合并水位 / claimed·running 记 pending intent、收尾据 pending 建至多一个 successor」实现。全局并发上限约束的是不同 (conversation, agent) 的并行度,与此串行正交。**NULL 路径 SHALL 用两组互补 partial unique index、SHALL NOT「不约束」（Review 第六轮 P1-1）**：
+```sql
+UNIQUE(conversation_id, agent_slug)
+  WHERE conversation_id IS NOT NULL AND status IN ('queued','claimed','running');
+UNIQUE(task_id, agent_slug)
+  WHERE conversation_id IS NULL     AND status IN ('queued','claimed','running');
+```
+新业务 run SHALL 强制带 `conversation_id`;无法回填 `conversation_id` 的历史/系统 run SHALL 进入第二组 `(task_id, agent_slug)` NULL 兜底索引或先隔离清理，SHALL NOT 留「不约束」空档。
 
 #### Scenario: 首次执行建立 session
 - **WHEN** 某 Agent 在某 task 首次被触发执行（`agent_sessions` 无该 (conversation, agent) 行）
@@ -14,9 +21,13 @@
 - **WHEN** 同一 (conversation, agent) 再次被触发,且已有 session 且 backend/provider/workdir 未变
 - **THEN** 系统以 resume 启动 CLI,复用上次会话上下文,不新建会话
 
-#### Scenario: 同 (task, agent) 串行
-- **WHEN** 某 (task, agent) 已有 active run（queued/claimed/running），此时该成员在同一 task 被再次触发
-- **THEN** partial unique index 挡下并发插入的第二条 run，触发被折叠进下一轮（queued 合并水位 / claimed·running 记 pending intent，收尾据 pending 建至多一个 successor），保证增量边界有确定推进点
+#### Scenario: 同 (conversation, agent) 串行
+- **WHEN** 某 (conversation, agent) 已有 active run（queued/claimed/running），此时该成员在同一 conversation 被再次触发
+- **THEN** partial unique index（`conversation_id` 非空组）挡下并发插入的第二条 run，触发被折叠进下一轮（queued 合并水位 / claimed·running 记 pending intent，收尾据 pending 建至多一个 successor），保证增量边界有确定推进点
+
+#### Scenario: conversation_id 为空走 task 兜底串行
+- **WHEN** 某无会话/系统 run（`conversation_id IS NULL`）的同 `(task, agent)` 并发触发
+- **THEN** 第二组 `UNIQUE(task_id, agent_slug) WHERE conversation_id IS NULL` 兜底索引保证至多一个 active，不因 conversation 为空而失去串行约束
 
 #### Scenario: 会话粒度隔离
 - **WHEN** 同一 task 内两个不同成员各自被触发执行
@@ -46,8 +57,24 @@
 
 系统 SHALL 用 acquire → pin → final → retire 四阶段协议管理 `agent_sessions` 的 owner，使新 attempt 能原子取得 owner、迟到事件必被拒绝（Review 第四轮 P0-4）。原协议只有 pin/覆盖的校验条件、未定义新 attempt 如何取得所有权——新 attempt 启动时 `current_task_run_id` 仍指向上一 attempt（或为空），若无原子 acquire，新 attempt 第一次 pin 永远不满足 `WHERE current_task_run_id=:this_attempt`;若直接无条件改 owner，又重新引入迟到事件覆盖竞态。四阶段 SHALL 满足：
 
-**(1) acquire（attempt 启动时原子取得 owner）**：**acquire 除 version 匹配外 SHALL 校验 owner 资格（Review 第五轮 P0-2）——SHALL NOT 仅凭「读到最新 version」就从仍在运行的旧 owner 手里抢 owner**。合法 acquire 的前置条件 SHALL 为：`current_task_run_id IS NULL`（无 owner）**或** 旧 owner attempt 已终态 **或** 旧 owner 的 attempt lease 已失效且其旧 generation 已被 fencing（见 [platform-graceful-restart] generation/lease）。active owner（旧 attempt 仍 running 且 lease 未失效）SHALL NOT 被普通新 attempt 覆盖。partial unique index 只降低正常路径并发，不能替代 lease 回收/恢复 child/人工修复场景下的 owner 资格判定。
+**(1) acquire（attempt 启动时原子取得 owner）**：**acquire 除 version 匹配外 SHALL 按 owner 资格谓词判定（Review 第五轮 P0-2 / 第六轮 P0-1）——SHALL NOT 仅凭「读到最新 version」或「某个时间戳过期」就从仍在运行的旧 owner 手里抢 owner**。
+
+**lease 字段 SHALL 用统一词汇（Review 第六轮 P0-1：`task_runs` 无 lease 字段，SHALL NOT 引用 `task_runs.lease_expires_at`）**：
+- `run_queue.claim_lease_until` = claimed/preparing 阶段的**领取租约**（attempt 尚未起 CLI，claim lease 超时可回收）。
+- `worker_state.lease_expires_at` = **Worker generation 心跳租约**（代表整个世代，不等价于某一 attempt 自己的租约）。
+- running attempt 的失效 SHALL NOT 只看 claim lease，也 SHALL NOT 直接拿 Worker 世代租约当作该 attempt 的租约——running owner 只有在其 Worker generation lease 已失效、新 generation 已完成 fencing/进程清理或该 attempt 已终态转换后才算失效。
+
+owner acquire 资格谓词 SHALL 固定为五档：
+
+1. `current_task_run_id IS NULL`：可以 acquire。
+2. 旧 attempt **已终态**：可按 version CAS acquire。
+3. 旧 attempt 为 **claimed/preparing**：仅当 `run_queue.claim_lease_until < :db_now` **且** PGR 回收事务已把旧 attempt 落 `abandoned`、退休 owner 后，新 attempt 才可 acquire。
+4. 旧 attempt 为 **running**：仅当 Worker generation lease 已失效、新 generation 已成功 fencing、**且**旧 attempt 已回收/终态、owner 已退休后才能 acquire。
+5. ASR acquire **SHALL NOT 自行凭「时间过期」跳过 PGR 回收事务**；正常路径 SHALL 优先等待 PGR 回收事务退休 owner，然后从 `current_task_run_id IS NULL`（档 1）接管。
+
+active owner（旧 attempt 仍 running 且其 Worker generation lease 未失效）SHALL NOT 被普通新 attempt 覆盖。partial unique index 只降低正常路径并发，不能替代 lease 回收/恢复 child/人工修复场景下的 owner 资格判定。
 ```sql
+-- 档 1 / 档 2 的常态接管（旧 owner 无 或 已终态）：
 UPDATE agent_sessions
 SET current_task_run_id = :new_attempt,
     session_version = session_version + 1
@@ -57,11 +84,11 @@ WHERE conversation_id = :conversation
   AND ( current_task_run_id IS NULL
      OR current_task_run_id IN (SELECT id FROM task_runs
                                  WHERE id = agent_sessions.current_task_run_id
-                                   AND (status IN ('succeeded','failed','killed','abandoned','prestart_failed','superseded')
-                                        OR lease_expires_at < :db_now)) )
+                                   AND status IN ('succeeded','failed','killed',
+                                                  'abandoned','superseded')) )
 RETURNING session_version;   -- 得到本 attempt 的 owner_version
 ```
-（上式为语义示意——精确 SQL 由实现拍板，但资格谓词 SHALL 覆盖「旧 owner 已终态 或 lease 失效」，且 lease 失效路径 SHALL 已完成旧 generation fencing 才允许接管。）**首次无 session 行时** SHALL 用 `INSERT ... ON CONFLICT(conversation_id, agent_slug) DO NOTHING` 插入并归属本 attempt（`current_task_run_id=:new_attempt`、`session_version=1`），插入与归属同一步完成;并发下只有一个 attempt 的 acquire 成功，其余按 `RETURNING` 为空重试观察最新 version。acquire 失败（active owner 未让出）SHALL 让新 attempt 走 lease 回收/排队路径，SHALL NOT 强抢。
+（上式只覆盖档 1/档 2——旧 owner 为空或已终态。档 3/档 4 的 claimed/running owner **不在此 SQL 内凭时间戳直接抢**：SHALL 先由 PGR 侧的回收事务——claim lease 超时回收（读 `run_queue.claim_lease_until`）或 Worker generation lease 失效 + fencing——把旧 attempt 落终态并退休 owner，退休后 `current_task_run_id` 归 NULL，本 acquire 再走档 1 接管。`task_runs` 无 lease 字段，SHALL NOT 在 acquire SQL 里读 `task_runs.lease_expires_at`。）**首次无 session 行时** SHALL 用 `INSERT ... ON CONFLICT(conversation_id, agent_slug) DO NOTHING` 插入并归属本 attempt（`current_task_run_id=:new_attempt`、`session_version=1`），插入与归属同一步完成;并发下只有一个 attempt 的 acquire 成功，其余按 `RETURNING` 为空重试观察最新 version。acquire 失败（active owner 未让出）SHALL 让新 attempt 走 lease 回收/排队路径，SHALL NOT 强抢。
 
 **(2) pin（流中途更新 session_id）**：只允许当前 owner attempt 更新：
 ```sql
@@ -72,7 +99,7 @@ WHERE current_task_run_id = :new_attempt
 ```
 `owner_version` = acquire 阶段 `RETURNING` 得到的值;pin **SHALL NOT** 递增 `session_version`（epoch 只在 owner 切换/退休时变），使调用方在整个 attempt 生命周期内持有稳定 owner token。
 
-**(3) final（成功收尾同事务）**：成功收尾 SHALL 在**同一事务**内完成：最终 session pointer 覆盖（同 pin 的 CAS 条件）+ `committed_msg_id` 水位推进 + backlog/pending successor 创建（见 committed 水位与 backlog Requirement）+ **owner retire（阶段 4）**，任一失败整体回滚。**该事务 SHALL 就是 [platform-graceful-restart] 的统一 `finish_execution()` 收尾事务（Review 第五轮 P0-4）**——session final/committed/owner retire 与获胜 attempt 终态、execution 终态、terminal/superseded/queued 事件写入在**同一次提交**内完成，SHALL NOT 由 ASR 与 PGR 分别提交而出现「committed 已推进但 execution 仍 active」「session pointer 已更新但无 terminal event」「execution 终态但 successor 丢失」等半提交。final 与 retire SHALL NOT 分两次提交（否则 final 后、retire 前崩溃会残留「终态 attempt 仍可写 owner」）。
+**(3) final（成功收尾同事务）**：成功收尾 SHALL 在**同一事务**内完成：最终 session pointer 覆盖（同 pin 的 CAS 条件）+ `committed_msg_id` 水位推进 + backlog/pending successor 创建（见 committed 水位与 backlog Requirement）+ **owner retire（阶段 4）**，任一失败整体回滚。**该事务 SHALL 就是 [platform-graceful-restart] 的统一 `finish_execution()` 收尾事务（Review 第五轮 P0-4）**——session final/committed/owner retire 与定局 attempt 终态、execution 终态、terminal/superseded/queued 事件写入在**同一次提交**内完成，SHALL NOT 由 ASR 与 PGR 分别提交而出现「committed 已推进但 execution 仍 active」「session pointer 已更新但无 terminal event」「execution 终态但 successor 丢失」等半提交。final 与 retire SHALL NOT 分两次提交（否则 final 后、retire 前崩溃会残留「终态 attempt 仍可写 owner」）。
 
 **(4) retire（owner 退休）**：attempt 终态后 SHALL 原子退休 owner——清空 `current_task_run_id`（或推进 owner epoch），使该 attempt 后续迟到的 pin/final 全部 CAS 失败。**attempt 终态且无 successor 时也 SHALL retire**，SHALL NOT 保留可写 owner 让迟到事件继续改 session。poisoned/降级清 session 与 owner retire SHALL 同事务（清 session_id 的同时退休 owner，不留「session 已清但 owner 仍可写」的空档）。
 
@@ -97,8 +124,20 @@ WHERE current_task_run_id = :new_attempt
 - **THEN** `INSERT ... ON CONFLICT DO NOTHING` + version CAS 保证只有一个 attempt 取得 owner 并归属，其余观察最新 version 后重试或让位，不产生两个并发 owner
 
 #### Scenario: 拒绝抢占仍 active 的 owner
-- **WHEN** 旧 owner attempt 仍 running 且 attempt lease 未失效，新 attempt 尝试 acquire
-- **THEN** acquire 资格谓词不满足（owner 非 NULL、未终态、lease 未失效），CAS 失败，旧 owner 不被替换，新 attempt 走 lease 回收/排队路径而非强抢
+- **WHEN** 旧 owner attempt 仍 running 且其 Worker generation lease 未失效，新 attempt 尝试 acquire
+- **THEN** acquire 资格谓词不满足（owner 非 NULL、未终态、其 Worker 世代未失效/未 fencing），CAS 失败，旧 owner 不被替换，新 attempt 走 lease 回收/排队路径而非强抢
+
+#### Scenario: claimed owner 只按 claim lease 回收
+- **WHEN** 旧 owner attempt 处于 claimed/preparing、`run_queue.claim_lease_until` 已过期
+- **THEN** 由 PGR claim lease 回收事务把旧 attempt 落 `abandoned`、退休 owner（`current_task_run_id` 归 NULL），新 attempt 再走档 1 acquire；acquire SQL SHALL NOT 读不存在的 `task_runs.lease_expires_at`
+
+#### Scenario: running owner 未 fencing 不得被抢
+- **WHEN** 旧 owner attempt 仍 running，其 Worker generation lease 已过期但新 generation 尚未完成 fencing
+- **THEN** 新 attempt 不得 acquire（档 4 未满足）；只有新 generation 成功 fencing、旧 attempt 回收/终态、owner 退休后，新 attempt 才唯一 acquire
+
+#### Scenario: lease 字段契约启动校验
+- **WHEN** 系统启动校验 acquire/回收 SQL 使用的 lease 字段
+- **THEN** 校验 `run_queue.claim_lease_until` 与 `worker_state.lease_expires_at` 均存在且语义唯一，`task_runs` 不含 lease 字段，任何引用 `task_runs.lease_expires_at` 的 SQL 视为契约违规
 
 #### Scenario: fallback 同 attempt 重建 session 先 rebind
 - **WHEN** resume mismatch/poisoned 后同一 attempt 需清旧 session 并新建
@@ -109,7 +148,7 @@ WHERE current_task_run_id = :new_attempt
 - **THEN** 因 final 与 retire 在统一 `finish_execution()` 同事务，崩溃整体回滚，不存在「execution 终态但 owner 仍可写」的持久状态
 
 #### Scenario: lease 回收同步退休 owner
-- **WHEN** 某 claimed/running owner attempt 的 lease 过期被回收（落 abandoned）
+- **WHEN** claimed owner attempt 的 `run_queue.claim_lease_until` 过期被回收（落 abandoned），或 running owner 的 Worker generation lease 失效经 fencing 后被回收
 - **THEN** 回收事务内同步退休其 session owner，新 attempt 才能唯一 acquire；旧 owner 不再能对 session 迟到写
 
 ### Requirement: resume 落地判定与失效降级（不劣于现状）
@@ -161,7 +200,8 @@ eligible messages = 扫描区间内真正拼入 prompt 的非自产消息
 1. **默认 feature flag 关闭**：`history_backlog` 的 tool-enabled 自动续批 SHALL 置于独立 feature flag 之后、**默认关闭**，SHALL NOT 随阶段 1 基础协议默认开启;它是独立上线门，与基础平滑重启解耦。
 2. **observe probe 升级为硬门禁**：`history_backlog_side_effect_observe_probe` SHALL 从「只采集现象」升级为 **release gate 硬断言**——发现工具调用、平台写入、普通 assistant 用户交付、mention/通知触发或任务自动流转即判**测试失败**。
 3. **做不到 context-only 则先聚合再单次业务 turn**：若无法可靠实现「只注入上下文、不产生副作用」的 context-only turn，系统 SHALL 先完成历史聚合/摘要，**再创建一次正常业务 turn** 处理，SHALL NOT 让首批不完整上下文直接执行真实任务。
-4. **仍开启轻方案则明确标注 best-effort 已接受风险**：若产品仍决定启用 tool-enabled 轻方案，文档 SHALL 明确其为 **best-effort**、SHALL 记录「可能重复副作用、可能基于不完整历史决策」的已接受风险，SHALL NOT 写成「副作用防重已解决」。
+4. **摘要/聚合 SHALL NOT 削弱「原消息至少一次完整投递」承诺（Review 第六轮 P1-7，用户拍板方案 A）**：本平台采用**「原始消息至少一次完整投递」**契约——聚合/摘要**只用于压缩喂给模型的可见上下文**，SHALL NOT 成为「原消息已消费」的替代。因此 `committed_msg_id` 推进到某 `batch_scan_end` 的前提 SHALL 是「该区间原始消息已至少完整投递过一次给某个真实业务 turn」，SHALL NOT 因「已生成摘要」就跨过原消息推进 committed（否则被摘要覆盖的原消息将永不原样投递）。摘要记录 SHALL 保留其覆盖的 source message id 区间以便追溯。**超模型上下文的处置 SHALL 明确**：软预算（本平台字符/条数上限）下 SHALL 连续前缀分批、逐轮完整投递（现状）;单条原始消息超模型**硬上下文**且无法在一个 turn 内完整投递时，SHALL 停止并转人工/外置为附件·检索，SHALL NOT 对同一不可投递输入无限重试、SHALL NOT 静默丢弃后推进 committed。
+5. **仍开启轻方案则明确标注 best-effort 已接受风险**：若产品仍决定启用 tool-enabled 轻方案，文档 SHALL 明确其为 **best-effort**、SHALL 记录「可能重复副作用、可能基于不完整历史决策」的已接受风险，SHALL NOT 写成「副作用防重已解决」。
 
 无论是否启用，backlog successor SHALL NOT 计入 mention-chain、SHALL NOT 触发任务自动流转;副作用防重 SHALL NOT 依赖服务端 exactly-once。首次执行（无 session）SHALL 回灌全量历史（现状行为，同样连续前缀分批 + 自动续批、超上限分轮不丢段不空转）。
 
@@ -210,8 +250,16 @@ eligible messages = 扫描区间内真正拼入 prompt 的非自产消息
 - **THEN** 若无法可靠实现 context-only turn，系统先聚合/摘要历史再创建一次正常业务 turn，首批 SHALL NOT 在只拿到上下文前缀时直接执行真实任务
 
 #### Scenario: 单条超大消息不卡死
-- **WHEN** 某单条消息本身超过字符预算
+- **WHEN** 某单条消息本身超过字符预算（软预算）
 - **THEN** 系统至少完整投递该条（必要时该轮只喂这一条），committed 得以越过它继续推进，不永久卡住
+
+#### Scenario: 摘要不替代原消息完整投递
+- **WHEN** 系统对某段历史生成聚合/摘要以压缩可见上下文
+- **THEN** `committed_msg_id` 只有在该区间原始消息已至少完整投递过一次给真实业务 turn 后才推进;SHALL NOT 因「已生成摘要」就跨过尚未原样投递的原消息推进 committed;摘要记录保留其覆盖的 source message id 区间以便追溯
+
+#### Scenario: 单条超模型硬上下文转人工不静默丢弃
+- **WHEN** 某单条原始消息超过模型硬上下文、无法在一个 turn 内完整投递
+- **THEN** 系统停止并转人工/外置为附件·检索，SHALL NOT 对同一不可投递输入无限重试、SHALL NOT 静默丢弃后推进 committed 而使该原消息永不投递
 
 #### Scenario: 达批次上限转人工
 - **WHEN** backlog 自动续批达到独立设定的最大批次数/预算仍未消费完

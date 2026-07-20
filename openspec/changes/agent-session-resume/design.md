@@ -1,6 +1,6 @@
 # Design — per-agent CLI session + 增量回灌
 
-> 目标：把「每次执行全量回灌历史」换成「每个 (task, agent) 维护一条 CLI session、再执行时 resume 续接 + 只喂增量」。省 token、上下文连贯，并为 [platform-graceful-restart] M2.5「温和重启+resume」提供 resume 地基。**claude 与 codex 均为必选**（codex 是重度使用的 backend）。本文不含代码改动。
+> 目标：把「每次执行全量回灌历史」换成「每个 (conversation, agent) 维护一条 CLI session、再执行时 resume 续接 + 只喂增量」（`conversation_id` 为空走 (task, agent) 兜底，第六轮 P1-1）。省 token、上下文连贯，并为 [platform-graceful-restart] M2.5「温和重启+resume」提供 resume 地基。**claude 与 codex 均为必选**（codex 是重度使用的 backend）。本文不含代码改动。
 
 ## 设计哲学
 
@@ -18,13 +18,13 @@
 | codex 为一次性 `codex exec --json -m - -` | `codex.py` | 无 thread 复用，resume 需改集成模式 |
 | claude 支持 `--resume <sid>`；codex 支持 app-server `thread/resume` | CLI 原生能力 | 我们都没用 |
 
-**核心**：Agent 的连续记忆 = 每次拼进 prompt 的历史文本，而非 CLI 自己的 session。→ **解法：per-(task, agent) session + resume + 增量回灌。**
+**核心**：Agent 的连续记忆 = 每次拼进 prompt 的历史文本，而非 CLI 自己的 session。→ **解法：per-(conversation, agent) session + resume + 增量回灌。**
 
 ## 关键设计决策
 
-### 决策 1：粒度 = per-(conversation_id, agent_slug)，且同 (task, agent) 串行
+### 决策 1：粒度 = per-(conversation_id, agent_slug)，且同 (conversation, agent) 串行（conversation_id 为空走 task 兜底）
 
-- 粒度取 **(conversation_id, agent_slug)**——同一 task 里每个成员各持独立 session，互不干扰。
+- 粒度取 **(conversation_id, agent_slug)**——同一 conversation 里每个成员各持独立 session，互不干扰;`conversation_id` 为空的历史/系统 run 退化到 `(task_id, agent_slug)` 兜底串行（第六轮 P1-1）。
 - 新表 `agent_sessions(id, conversation_id, agent_slug, session_id, committed_msg_id, provider_id, backend, workdir, updated_at)`，唯一键 `(conversation_id, agent_slug)`。`committed_msg_id` = 上次**成功**执行确认喂到的水位（见决策 3）。本次执行的快照终点 `planned_through_msg_id` 落在 `task_runs` 行（每 run 一行、天然是历史）。
 - **同 (conversation, agent) 单 active + 折叠（Review P0-3/P0-B；第五轮 P1-5 粒度改 conversation）**：目标 = 同一成员在同一 conversation 上**至多一个 active run**（active = queued/claimed/running），重复触发**折叠**进下一轮（合并触发意图，不丢），而非并行起第二条、也不是当前 `return None` 丢弃。**DB 级唯一性**：粒度 SHALL 与 session owner 键 `(conversation_id, agent_slug)` 对齐——`run_queue` 现状无 conversation_id 列，迁移先 `ALTER ADD COLUMN conversation_id`（从 tasks 回填）再建 partial unique index `ON run_queue(conversation_id, agent_slug) WHERE status IN ('queued','claimed','running')`，从 DB 层杜绝两个并发 POST 各插一条 active（应用层查重有 TOCTOU 竞态，Review P0-B）;`conversation_id` 为空的历史 run 不进入约束。**为何不用 `(task_id, agent_slug)`**：现状 `tasks.conversation_id` 可空无唯一约束，一个 conversation 可挂多 task，task 粒度会让同 conversation 两 task 争抢同一 session owner。折叠规则见决策 1b。
 
@@ -39,7 +39,7 @@
 - **该 run 收尾事务内**：检查 pending intent，若有则**至多创建一个** successor run（带合并后的水位），然后清 pending。各终态的 pending 处理：**failed** → 仍据 pending 生成 successor（不丢用户新指令）;**killed** → 用户主动停，**同时取消** pending intent（不生成 successor）;**superseded** → pending intent 由 recovery child 继承（不再单独生成 successor，避免与 recovery child 重复）。
 - **历史数据**：加 partial unique index 前须先清理/归并存量重复 active 行（见 [platform-graceful-restart] 迁移节），否则建索引失败。
 - **区分 enqueue plan 与 delivery receipt**：记录「计划喂到哪」与「实际随 claim 投递了哪些」，避免新旧 Worker 协议不一致时误判消息已送达（简化实现 = 存消息高水位 + 必要触发 ID，不必像多节点那样存完整投递集）。
-- **不降低全局并发**：全局并发上限（当前 8）约束的是「不同 (task, agent) 同时跑几个」，同 (task, agent) 串行与之正交——不同成员、不同任务照旧并行。
+- **不降低全局并发**：全局并发上限（当前 8）约束的是「不同 (conversation, agent) 同时跑几个」，同 (conversation, agent) 串行与之正交——不同成员、不同会话照旧并行。
 
 ### 决策 2：session_id 抓取与生命周期（三件套 + poisoned 丢弃）
 
