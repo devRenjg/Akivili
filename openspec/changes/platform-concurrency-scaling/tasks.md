@@ -17,7 +17,7 @@
 
 ## 阶段 2 — 解耦水平扩展（到单机瓶颈才做）
 - [ ] 2.1 调度状态外置：`_running`/`_RUN_PIDS` 落库或 Redis，worker 无状态化
-- [ ] 2.2 支持多 worker 进程并行消费队列（原子领取已具备基础）
+- [ ] 2.2 支持多 worker 进程并行消费队列。**依赖 [platform-graceful-restart] 的原子 claim CAS 协议——现状 `_claim_one` 尚未达多 Worker 原子安全（Review 第五轮 P1-4，撤销「原子领取已具备基础」表述）**，SHALL 在 PGR 阶段 1 落地原子 claim（单语句 CAS + generation/owner/lease 校验）后才启用多 Worker;三份 change 共享同一并发不变量与迁移顺序（见下）
 - [ ] 2.3 事件驱动唤醒替代 1s 轮询（enqueue 即唤醒）
 
 ## 阶段 3 — 分布式（远期，规模确实到了才做）

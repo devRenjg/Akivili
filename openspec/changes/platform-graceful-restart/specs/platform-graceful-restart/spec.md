@@ -45,8 +45,18 @@
 | `failed` | 该 attempt 执行失败 | 是 |
 | `killed` | 该 attempt 被用户 kill | 是 |
 | `abandoned` | 非获胜、被放弃（lease 回收后 execution 回 queued 时旧 attempt 落此态） | 是 |
-| `prestart_failed` | CLI 起进程前的准备阶段失败（非重试型 prestart failure） | 是 |
+| `prestart_failed` | CLI 起进程前的准备阶段失败（**可重试性与失败归因由正交字段 `failure_class`+`retryable` 决定，不由状态名隐含**，见下） | 是 |
 | `superseded` | 该 attempt 随 execution 交棒中断 | 是 |
+
+**`prestart_failed` SHALL 拆为正交字段（Review 第五轮 P1-2）**——原文档在多处把它同时描述为「非重试型」和「retryable」，一个状态无法同时决定是否重试与是否计失败率。SHALL 用三个正交维度：
+
+```text
+status        = prestart_failed        -- 仅表示「发生在起进程前的准备阶段」
+failure_class = infrastructure | configuration | business   -- 决定失败率/告警归因
+retryable     = true | false           -- 决定是否重排
+```
+
+由 `retryable + recovery_count` 决定是否重排（`retryable=true` 且未达恢复上限 → execution 回 queued 重试;否则落 `failed`/`recovery_blocked`）;由 `failure_class` 决定计入基础设施失败率还是业务失败率（`infrastructure`/`configuration` 不计业务失败率，`business` 计）。`status=prestart_failed` 本身 SHALL NOT 隐含可重试性或失败率归因。
 
 **层间映射 SHALL 恒定**：execution 终态由**获胜 attempt** 决定——获胜 attempt=`succeeded` ⇒ execution=`done`;获胜 attempt=`failed`（且恢复耗尽/不可重试）⇒ execution=`failed`;未获胜 attempt 落 `abandoned`/`prestart_failed`/`superseded` 等非获胜终态，不驱动 execution 终态。所有 execution 自然完成 CAS SHALL 明确写成 `SET status='done' WHERE status='running' AND worker_generation=? AND worker_instance_id=?`，SHALL NOT 写 `SET status='succeeded'`。
 
@@ -58,10 +68,10 @@
 | `failed` | 是（作为该 execution 的失败归因样本） | 失败 | 仅当为**获胜 attempt** 且 execution 落 `failed` 才触发任务失败流转;非获胜 failed attempt 不单独触发 |
 | `killed` | 否（用户主动） | 已终止 | 不触发续跑/流转 |
 | `abandoned` | 否（非获胜、被 lease 回收放弃） | 折叠隐藏或标「已放弃」，SHALL NOT 显示为失败 | 不触发 |
-| `prestart_failed` | 视为 retryable prestart failure，计入恢复计数、SHALL NOT 直接计入业务失败率 | 折叠或标「准备失败」 | 不直接触发任务失败;由 execution 层恢复逻辑决定重试或 `recovery_blocked` |
+| `prestart_failed` | 由 `failure_class` 决定：infrastructure/configuration 不计业务失败率、business 计;retryable 时计入恢复计数 | 折叠或标「准备失败」 | 不直接触发任务失败;由 `retryable + recovery_count` 决定重试、耗尽落 `failed`/`recovery_blocked` |
 | `superseded` | 否 | 折叠（execution 已 superseded、由 recovery child 承接） | 不触发（避免误判 done/reviewing） |
 
-此外 SHALL 明确：① **retryable running failure** 使用 `failed` attempt 终态 + execution 层恢复计数决定是否重试;② **claimed 阶段被 kill** 的合法转换为 attempt→`killed`、execution→`killed`;③ **非重试型 prestart failure** 走 attempt→`prestart_failed`、execution 依恢复上限落 `failed` 或 `recovery_blocked`。完整 attempt 允许转换表 SHALL 在阶段 1 引入 attempt 状态时与 execution 转换表一并落地。
+此外 SHALL 明确：① **retryable running failure** 使用 `failed` attempt 终态 + execution 层恢复计数决定是否重试;② **claimed 阶段被 kill** 的合法转换为 attempt→`killed`、execution→`killed`;③ **prestart failure** 一律走 attempt→`prestart_failed`，其**可重试性由 `retryable` 字段而非状态名决定**——`retryable=true` 且未达恢复上限则 execution 回 queued 重试、否则依恢复上限落 `failed` 或 `recovery_blocked`。完整 attempt 允许转换表 SHALL 在阶段 1 引入 attempt 状态时与 execution 转换表一并落地。
 
 #### Scenario: 非获胜 attempt 不污染失败率与流转
 - **WHEN** 某 execution 的 attempt#1 落 `abandoned`（lease 回收）、attempt#2 落 `succeeded`
@@ -175,9 +185,9 @@
 - **WHEN** 一个针对已被交棒/恢复取代的旧 run 的 kill 请求，其 `target_generation` 不等于当前活跃 generation
 - **THEN** Worker 校验世代不符，作废该 kill 请求不执行，不误杀已接管的恢复 run
 
-### Requirement: 流式输出尾随 run_logs 且可续传
+### Requirement: 流式输出尾随 execution_events 且可续传
 
-API 的 SSE 端点 SHALL 把输出近实时推送给前端而非直连 CLI stdout。**续传游标 SHALL 用统一事件表 `execution_events(id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id, event_type, payload_json, created_at)` 的全局自增 `id`，SHALL NOT 用 `run_logs.id`，SHALL NOT 用 `SELECT MAX(seq)+1` 自算 per-execution seq**（并发写会竞争/撞唯一键）——控制事件（queued/run_started/superseded/terminal）不写在 run_logs，用 log id 做游标会导致断线期间的控制事件（如 superseded 跳转）重连后漏投或错序;全局自增 id 由引擎原子分配，execution 内有间隙不影响单调性。所有 SSE 事件（log 与全部控制事件）SHALL 先落 `execution_events` 再推，`id: <全局id>` 为唯一游标;`run_logs` SHALL 加 `meta_json` 列承载 log 事件的结构化附加信息（channel/tool/tool_input/tool_output），log 事件可从 run_logs + meta 完整重建。**状态/数据写入与其对应事件写入 SHALL 同事务提交**（POST 消息+queued execution+queued event；run_log+log event；claimed/running+run_started event；终态+terminal event；superseded+recovery child+superseded event），SHALL NOT 分离提交而出现「有日志无 event」「已终态无 terminal event」「有 recovery child 无 superseded 跳转」。CLI 输出写 `run_logs` 的**调用入口与日志语义 SHALL 保持不变**(Worker 线程 → `_log()`)，但因 run_log 行与其 log event SHALL 同事务提交，`_log()` 内部落库 SHALL 改为「同事务写 run_logs + execution_events」，SHALL NOT 表述为「整条路径零改动」（Review 第四轮 P1-4）。SSE 断连重连 SHALL 携带 `Last-Event-ID: <id>` 从该 id 之后回放。**切换到 successor execution 时游标 SHALL 沿用同一条全局 `id` 序列、SHALL NOT 声称「successor 有独立 id 序列」**（Review 第四轮 P0-5）——`execution_events.id` 是全局单调自增，不存在 per-execution 独立序列。supersede 时事件插入顺序 SHALL 固定为「建 recovery child execution → 写父 execution 的 `superseded{successor_execution_id}` event → 写 child 的 `queued` event → 提交」，使 child 的 `queued` event 全局 id **必然大于**父 superseded event 的 id;客户端收到父 superseded 后订阅 child 时 SHALL 继续携带当前全局 `Last-Event-ID`，服务端按 `WHERE execution_id=:child AND id > :last_global_id ORDER BY id` 即可无损获得 child 的 queued 及后续事件，SHALL NOT 因「切 execution」把游标重置或漏取 child queued。（若产品选择 child 订阅不带 Last-Event-ID、完整回放 child，则 SHALL 明确幂等去重规则，两种口径不并存。）
+API 的 SSE 端点 SHALL 把输出近实时推送给前端而非直连 CLI stdout。**续传游标 SHALL 用统一事件表 `execution_events(id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id, event_type, payload_json, created_at)` 的全局自增 `id`，SHALL NOT 用 `run_logs.id`，SHALL NOT 用 `SELECT MAX(seq)+1` 自算 per-execution seq**（并发写会竞争/撞唯一键）——控制事件（queued/run_started/superseded/terminal）不写在 run_logs，用 log id 做游标会导致断线期间的控制事件（如 superseded 跳转）重连后漏投或错序;全局自增 id 由引擎原子分配，execution 内有间隙不影响单调性。所有 SSE 事件（log 与全部控制事件）SHALL 先落 `execution_events` 再推，`id: <全局id>` 为唯一游标;`run_logs` SHALL 加 `meta_json` 列承载 log 事件的结构化附加信息（channel/tool/tool_input/tool_output），log 事件可从 run_logs + meta 完整重建。**状态/数据写入与其对应事件写入 SHALL 同事务提交**（POST 消息+queued execution+queued event；run_log+log event；claimed/running+run_started event；终态+terminal event；superseded+recovery child+superseded event），SHALL NOT 分离提交而出现「有日志无 event」「已终态无 terminal event」「有 recovery child 无 superseded 跳转」。CLI 输出写 `run_logs` 的**调用入口与日志语义 SHALL 保持不变**(Worker 线程 → `_log()`)，但因 run_log 行与其 log event SHALL 同事务提交，`_log()` 内部落库 SHALL 改为「同事务写 run_logs + execution_events」，SHALL NOT 表述为「整条路径零改动」（Review 第四轮 P1-4）。SSE 断连重连 SHALL 携带 `Last-Event-ID: <id>` 从该 id 之后回放。**切换到 successor execution 时游标 SHALL 沿用同一条全局 `id` 序列、SHALL NOT 声称「successor 有独立 id 序列」**（Review 第四轮 P0-5）——`execution_events.id` 是全局单调自增，不存在 per-execution 独立序列。supersede 时事件插入顺序 SHALL 固定为「建 recovery child execution → 写父 execution 的 `superseded{successor_execution_id}` event → 写 child 的 `queued` event → 提交」，使 child 的 `queued` event 全局 id **必然大于**父 superseded event 的 id;客户端收到父 superseded 后订阅 child 时 SHALL 继续携带当前全局 `Last-Event-ID`，服务端按 `WHERE execution_id=:child AND id > :last_global_id ORDER BY id` 即可无损获得 child 的 queued 及后续事件，SHALL NOT 因「切 execution」把游标重置或漏取 child queued。（若产品选择 child 订阅不带 Last-Event-ID、完整回放 child，则 SHALL 明确幂等去重规则，两种口径不并存。）**terminal/superseded 后 SHALL 封闭旧 execution/attempt 的事件流（Review 第五轮 P1-8）**：终态或 superseded 事件写入后，对旧 attempt 的任何 log/control event append SHALL 再做 `owner/generation/status` CAS 校验——CAS 失败（该 attempt 已非当前 owner 或 execution 已终态）即丢弃该 event 或写入隔离审计表，SHALL NOT 进入用户事件流。否则迟到的父日志可能在 child queued 之后取得更大的全局 id，虽不漏数据但前端会看到终态后的父输出、甚至被错误消费者当成有效结果。
 
 #### Scenario: 尾随近实时呈现
 - **WHEN** CLI 持续产出输出、Worker 写入 run_logs 并同事务落 log 类 execution_events
@@ -203,9 +213,31 @@ API 的 SSE 端点 SHALL 把输出近实时推送给前端而非直连 CLI stdou
 - **WHEN** 用户在某 run 已终态后进入其详情
 - **THEN** 一次性回放该 run 的全量输出与收尾态,不需要实时尾随
 
+#### Scenario: 终态后旧 attempt 迟到日志不进用户流
+- **WHEN** 某 attempt 已 terminal/superseded，其 CLI 残留线程仍尝试 append log event
+- **THEN** 该 append 的 owner/generation/status CAS 失败，event 被丢弃或写隔离审计，用户事件流中不出现终态后的旧 attempt 日志
+
+### Requirement: 恢复 CLI 前的 generation 最终启动围栏
+
+claim 校验当前 generation、`claimed→running` 用 attempt/run 行的 owner/generation CAS 之外，从 claim 到实际创建 CLI 之间仍存在时间窗——**旧 Worker claim 成功 → 心跳暂停/lease 过期 → 新 Worker 接管 generation → 旧 Worker 恢复并启动 CLI**（Review 第五轮 P0-3）。若 `claimed→running` 只校验旧 Worker 自己此前写入的 generation、不在启动临界区重读当前 `worker_state`，旧 Worker 仍可能把 CLI 跑起来;平台写 fencing 能挡脏写，但**挡不住 CLI 自身的文件/工具/外部系统副作用**。系统 SHALL 把恢复/启动 CLI 固定为一个不可省略的顺序，任一步失败即中止本次启动：
+
+1. **启动前重校验**：起进程前 SHALL 重新读取数据库当前 `worker_state` 的 generation、owner instance、worker lease 与该 attempt 的 attempt lease;任一不匹配 SHALL 立即 self-fence（不启动、不领取、本 generation 停止一切副作用动作）。
+2. **suspended 创建 + containment**：SHALL 以 suspended（挂起）方式创建子进程，并在恢复执行前将其加入 Windows Job Object（POSIX 用等价的父死 containment，见 [agent-session-resume]/部署规格）;SHALL NOT 先跑起来再补 containment。
+3. **CAS 转 running**：SHALL 用 CAS 持久化 `pid + pid_create_time` 并把 attempt/execution 转 `running`，该 CAS **同时校验当前 `worker_state` 的 generation/instance/lease** 仍属本 Worker;校验不过则不转。
+4. **仅 CAS 成功才 resume**：只有第 3 步 CAS 成功才 SHALL 恢复（resume）挂起的子进程;CAS 失败 SHALL 立即销毁该 suspended 进程树，绝不让其执行用户代码。
+5. **续租失败 self-fence**：Worker 心跳或 lease 续租失败后 SHALL 停止 claim、停止启动、终止本 generation 所持的全部进程并退出，SHALL NOT 继续依赖本地缓存的 generation 运行。
+
+#### Scenario: 启动临界区切世代旧 CLI 零执行
+- **WHEN** 旧 Worker claim 成功后心跳暂停、新 Worker 接管 generation，随后旧 Worker 恢复并尝试启动 CLI
+- **THEN** 旧 Worker 在 suspended 创建后的 CAS 转 running 阶段发现当前 `worker_state` generation 已变，CAS 失败并销毁 suspended 进程树，旧 generation 的 CLI 用户代码从未开始执行
+
+#### Scenario: 续租失败后 Worker 自我隔离
+- **WHEN** 某 Worker 的 lease 续租失败（心跳停摆）后又恢复了调度线程
+- **THEN** 该 Worker 停止 claim/launch/finalize 与一切平台写、终止本 generation 进程并退出，不因本地仍缓存旧 generation 而继续运行
+
 ### Requirement: Worker 温和重启 + resume 续跑（改执行层代码）
 
-更新执行层代码需重启 Worker 时,系统 SHALL 优先「温和重启」：收到重启意图后停止领新活、等待在跑 run 自然收尾一个上限窗口（默认 5 分钟，参数化可调）,窗口内全部收尾则零中断重启。仅当超过等待上限仍有在跑 run,才 SHALL 转入「中断 + resume 续跑」硬路径：旧 Worker 收交棒标记后停领新活、杀在跑 CLI 子进程树、把这些 run 落 `superseded` 终态（`superseded` SHALL NOT 触发子任务 done / 父任务 reviewing 等自动流转）,并对每个有可用 `session_id` 的 run 入队一条「续跑 run」(携带 `superseded_from`、resume 意图、系统恢复标记),然后退出;新 Worker 领取续跑 run 后 SHALL **重发原始任务 prompt** 并依 [agent-session-resume] 的 resume 从上次上下文续跑。在跑 Agent SHALL 允许秒级中断,但上下文 SHALL NOT 丢失、SHALL NOT 需要人工从头重跑。无可用 session 的 run（首次执行尚无 session、或 poisoned 已丢 session）SHALL 落 failed 重排队。续跑 run SHALL 标记为系统恢复类,豁免 mention-chain 空转链计数与单任务运行数配额,不与 Agent 自发触发混淆。续跑 SHALL 靠 session 记忆 + prompt 约束防副作用重复,SHALL NOT 依赖服务端精确幂等键。
+更新执行层代码需重启 Worker 时,系统 SHALL 优先「温和重启」：收到重启意图后停止领新活、等待在跑 run 自然收尾一个上限窗口（默认 5 分钟，参数化可调）,窗口内全部收尾则零中断重启。仅当超过等待上限仍有在跑 run,才 SHALL 转入「中断 + resume 续跑」硬路径：旧 Worker 收交棒标记后停领新活、杀在跑 CLI 子进程树、把这些 run 落 `superseded` 终态（`superseded` SHALL NOT 触发子任务 done / 父任务 reviewing 等自动流转）,并对每个有可用 `session_id` 的 run 入队一条「续跑 run」(携带 `superseded_from`、resume 意图、系统恢复标记),然后退出;新 Worker 领取续跑 run 后 SHALL **重发原始任务 prompt** 并依 [agent-session-resume] 的 resume 从上次上下文续跑。在跑 Agent SHALL 允许秒级中断。**恢复承诺 SHALL 按三层口径表述，SHALL NOT 承诺「上下文必然不丢」或 exactly-once（Review 第五轮 P1-7）**：① **平台消息与执行意图 = at-least-once**——不漏、允许重放（committed 水位 + 续跑重取保证）;② **CLI 原生 session = best-effort resume**——平台 pin 住 `session_id` 只证明有 resume 指针，CLI 在被强杀前可能尚未把最新模型 turn/tool result/session metadata 刷入其原生存储，故只能尽力续、不保证所有原生上下文必然落盘;③ **外部副作用 = 不保证 exactly-once**——依赖幂等键/fencing/人工确认。目标是「一般无需人工从头重跑」，而非「上下文绝不丢失」。无可用 session 的 run（首次执行尚无 session、或 poisoned 已丢 session）SHALL 落 failed 重排队。续跑 run SHALL 标记为系统恢复类,豁免 mention-chain 空转链计数与单任务运行数配额,不与 Agent 自发触发混淆。续跑 SHALL 靠 session 记忆 + prompt 约束防副作用重复,SHALL NOT 依赖服务端精确幂等键。
 
 本能力**依赖** [agent-session-resume] 提供 per-agent `session_id`（claude+codex 均已接入）、流中途 pin 落库、续跑重发原 prompt 语义;本 change 只负责「重启时的 defer 等待、中断、落终态与续跑入队」,不实现 resume 本身。
 
@@ -233,6 +265,10 @@ API 的 SSE 端点 SHALL 把输出近实时推送给前端而非直连 CLI stdou
 - **WHEN** 交棒杀与 reclaim 兜底可能对同一被中断 run 各触发一次续跑入队
 - **THEN** 以「该 run 是否已有 `superseded_from` 子 run」为幂等键,同一被中断 run 至多生成一条续跑 run
 
+#### Scenario: 各强杀窗口恢复符合 best-effort/at-least-once 口径
+- **WHEN** 分别在 session_id 首次出现前、出现后、首个工具调用前、工具调用后、assistant 完成前强杀在跑 CLI
+- **THEN** 平台消息与执行意图不漏（at-least-once、允许重放），CLI 原生 session 尽力 resume（可能丢最后未刷盘的 turn），外部副作用可能重复（依赖幂等/fencing/人工），恢复行为符合三层口径而非「上下文必然不丢」
+
 ### Requirement: 异常重启的 resume 兜底
 
 系统在启动 `reclaim_orphan_runs` 回收残留 running 记录时,**SHALL NOT 无条件假设「running 已死」**（硬崩溃/断电/`kill -9` 时 CLI 子进程可能成孤儿存活）。SHALL 按「先接管 → 再判死 → 才续跑」处理：① 先 CAS 升 generation 接管（决策 8），使旧世代被 fencing、孤儿 CLI 无法写平台（杜绝双写）;② 用持久化 `pid + pid_create_time` 探活，进程不存在或 create-time 不匹配才判定已停;③ **仅在旧执行已确认停 或 已被 fencing 且进程树已清理时**，才据 `session_id` 追加入队续跑 run（带 `superseded_from` 幂等标 + 系统恢复豁免配额）;④ 既不能证明已停又不能保证 fencing/清理时,SHALL 置该 run 为 `recovery_blocked`（进 dead-letter 待人工），SHALL NOT 创建 recovery child。无 `session_id` 的 run 落 `failed`/现状兜底不变。**`recovery_blocked` SHALL 有产品闭环（Review P1-7）**：Runtime/任务详情 SHALL 展示阻塞原因、旧 pid、generation、处理建议，并提供人工「确认已清理后重试」入口（人工确认旧进程已清理 → 允许生成 recovery child 续跑），SHALL NOT 只落状态而无出口。
@@ -252,6 +288,20 @@ API 的 SSE 端点 SHALL 把输出近实时推送给前端而非直连 CLI stdou
 #### Scenario: reclaim 不重复续跑
 - **WHEN** 交棒流程已为某中断 run 入队续跑,随后 reclaim 又扫到该 run
 - **THEN** 幂等键命中,reclaim 不再重复入队续跑
+
+### Requirement: 统一收尾事务 finish_execution()（跨 PGR/ASR 单一提交边界）
+
+execution 终态与其事件同事务（本 change SSE Requirement）、session pointer/committed 水位/backlog·pending successor 同事务（[agent-session-resume] 水位与 backlog Requirement）两者各自正确，但 **SHALL 是同一个提交事务**，SHALL NOT 由两份规格分别提交（Review 第五轮 P0-4）。分别提交会产生半提交：committed 水位已推进但 execution 仍 active（恢复后该段消息被认为已消费却无成功 execution）、attempt 已成功且 session pointer 已更新但 terminal event 未提交（前端永久等待）、execution 已终态但 successor 创建失败（pending/backlog 永久丢失）、先建 successor 被 active partial unique index 拒绝（父 execution 尚未在同一事务转终态）、owner 未退休导致终态后迟到 pin/final 仍写 session、`superseded` event 已发但 recovery child 或其 queued event 不存在。
+
+系统 SHALL 定义唯一的 `finish_execution()` 事务边界，在**一次提交**内完成所有适用项：① 获胜 attempt 终态;② execution 终态;③ session final 或 poisoned/fallback 清理;④ committed 水位推进;⑤ session owner retire（见 [agent-session-resume]）;⑥ backlog、pending 或 recovery successor 创建及因果关联（`superseded_from`/`history_backlog_from_execution_id`）;⑦ terminal/superseded/queued 事件写入，遵守全局事件 id 顺序（见 SSE Requirement）。任一 CAS 或唯一约束失败 SHALL 使整个事务回滚，调用方重读状态后决定退出或重试，**SHALL NOT 补偿式地继续提交剩余项**。该事务边界 SHALL 覆盖 pending、backlog、normal success、supersede、poisoned failure 五条完成路径。
+
+#### Scenario: 收尾任一写入点失败则全回滚
+- **WHEN** `finish_execution()` 提交过程中，attempt 终态/execution 终态/session final/committed 推进/owner retire/successor 创建/事件写入中任一 CAS 或唯一约束失败
+- **THEN** 整个事务回滚，不出现「committed 已推进但 execution 仍 active」「attempt 成功但无 terminal event」「execution 终态但 successor 丢失」等半提交状态，调用方重读状态后退出或重试
+
+#### Scenario: successor 与父终态同事务不撞唯一索引
+- **WHEN** 成功收尾需在建 recovery/backlog successor 的同时把父 execution 转终态
+- **THEN** 父终态与 successor 创建在同一事务提交，active partial unique index 不因「父仍 active + 新 successor」瞬时并存而拒绝插入
 
 ### Requirement: 反向代理平滑切换（自动无损重连）
 
@@ -273,7 +323,15 @@ API 的 SSE 端点 SHALL 把输出近实时推送给前端而非直连 CLI stdou
 
 `task_runs.run_queue_id + attempt_no` SHALL 分步落地（加两个可空列 → 反向回填存量关联、存量行 `attempt_no` 置 1 → 建 `UNIQUE(run_queue_id, attempt_no) WHERE run_queue_id IS NOT NULL` partial unique index → 新写入路径强制非空且每次 claim 递增 attempt_no），SHALL NOT 追溯要求历史行非空、SHALL NOT 用 `run_queue_id` 单列唯一。折叠 partial unique index 建立前 SHALL 先归并/取消存量重复 active 行。所有新列 SHALL 带安全默认（NULL/0）使存量行走首次执行/全量分支不报错。回滚到旧代码时旧代码 SHALL 能忽略新列、对未知状态保守兜底不崩。迁移前 SHALL 先安全在线备份（`VACUUM INTO`/online backup API，非 cp）。
 
-**旧 `run_queue.task_run_id` 在模型 A 下的语义 SHALL 明确收口**（Review 第四轮 P1-1）：现有代码把 `run_queue.task_run_id` 当作「本队列项产生的唯一 `task_runs.id`」用于产出判断与因果链，模型 A 后一个 execution 有多条 attempt，该列语义失配。系统 SHALL 采用以下方案（三选一，实现前拍板并全文引用同一选择）：① **新代码统一改走 `task_runs.run_queue_id` 反查该 execution 的所有 attempt**、以获胜 attempt 为准，`run_queue.task_run_id` 仅在 expand 期用于回填、contract 阶段删除该列;或 ② 保留 `run_queue.task_run_id` 但**重定义为始终指向「当前/最终获胜 attempt」**，并在每次 claim 与终态转换时**原子维护**其指向;或 ③ 新增 `run_queue.winning_attempt_id`（终态时写）与 `run_queue.current_attempt_id`（claim 时写），淘汰旧列。SHALL NOT 保留「旧列语义不变 + 多 attempt」的模糊并存态——否则旧消费者可能读到第一次失败的 attempt 而忽略最终获胜 attempt。
+**旧 `run_queue.task_run_id` 在模型 A 下的语义 SHALL 采用方案③**（Review 第五轮 P1-1 拍板；现有代码把它当「本队列项产生的唯一 `task_runs.id`」用于产出判断与因果链，模型 A 后一个 execution 有多条 attempt、语义失配）。方案③ = 新增两个显式指针 + attempt 反向归属：
+
+```text
+run_queue.current_attempt_id   -- claim 时原子更新（指向本 execution 当前 attempt）
+run_queue.winning_attempt_id   -- execution 终态时原子更新（指向最终获胜 attempt）
+task_runs.run_queue_id         -- attempt 反向归属其 execution
+```
+
+expand 期 SHALL 兼容回填旧 `task_run_id`（存量行 `current_attempt_id`/`winning_attempt_id` 由旧 `task_run_id` 回填）;新消费者切换到读 `winning_attempt_id`（终态产出）/`current_attempt_id`（在跑 attempt）后，contract 阶段 SHALL 删除旧 `run_queue.task_run_id` 列。选方案③而非「动态重定义旧列」因其**显式区分「当前尝试」与「最终获胜尝试」**、最不易误读。SHALL NOT 保留「旧列语义不变 + 多 attempt」的模糊并存态——否则旧消费者可能读到第一次失败的 attempt 而忽略最终获胜 attempt。
 
 **回滚边界 SHALL 收窄为「兼容读取版」而非任意旧版本**（Review 第四轮 P1-3）：expand/activate/contract 的回滚保证是「activate（开新状态写入 flag）后可回滚到**已支持读取新状态的 compatibility release**」，SHALL NOT 声称可回滚到完全不认识 `claimed/superseded/recovery_blocked` 的 pre-expand 二进制。系统 SHALL 明确：① activate 后允许回滚到的**最老 protocol_version / compatibility floor**;② 若必须回滚到 pre-expand 旧版本，SHALL 先关新状态写入 flag、停写并排空在跑 execution、把所有新状态存量处理为旧版本可识别的终态，再启动旧版本;③ `mixed_version_probe` 中的「旧 API」SHALL 指兼容读取版，SHALL NOT 指完全未升级的旧 API。`worker_state.protocol_version` 与 DB schema 不匹配时 SHALL fail-closed 不接管（承接原有约定）。
 
@@ -285,13 +343,13 @@ API 的 SSE 端点 SHALL 把输出近实时推送给前端而非直连 CLI stdou
 - **WHEN** 给已有 `task_runs` 表引入 `(run_queue_id, attempt_no)` 关联
 - **THEN** 系统先加可空列并回填存量（attempt_no=1）、再建 partial unique index `UNIQUE(run_queue_id, attempt_no) WHERE run_queue_id IS NOT NULL`（容忍历史空值），新写入强制非空且逐次递增 attempt_no，不因 SQLite 无法直接加 NOT NULL/UNIQUE 而失败
 
-#### Scenario: 折叠索引前清存量重复
-- **WHEN** 建立 `run_queue(task_id, agent_slug)` active partial unique index
-- **THEN** 系统先归并/取消存量同 (task,agent) 多条 active 行，索引建立不因存量重复而失败
+#### Scenario: 折叠索引前补列 + 清存量重复
+- **WHEN** 建立 `run_queue(conversation_id, agent_slug)` active partial unique index（Review 第五轮 P1-5 方案 B）
+- **THEN** 系统先 `ALTER ADD COLUMN conversation_id` 从 tasks 回填、再归并/取消存量同 `(conversation, agent)` 多条 active 行，索引建立不因缺列或存量重复而失败;`conversation_id` 为空的历史 run 不进入该约束
 
 #### Scenario: 多 attempt 下旧 task_run_id 不指向失败 attempt
 - **WHEN** 某 execution 的 attempt#1 失败、attempt#2 成功，消费者读取该 execution 的产出/因果链
-- **THEN** 按选定方案，消费者读到最终获胜 attempt#2（走 `task_runs.run_queue_id` 反查、或 `run_queue.task_run_id` 已被原子维护到获胜 attempt、或读 `winning_attempt_id`），SHALL NOT 仍指向失败的 attempt#1
+- **THEN** 消费者读 `run_queue.winning_attempt_id`（方案③）得到最终获胜 attempt#2，SHALL NOT 仍指向失败的 attempt#1;在跑期读 `current_attempt_id` 得到当前 attempt
 
 #### Scenario: activate 后仅回滚到 compatibility floor
 - **WHEN** 已 activate（开启新状态写入）后需要回滚
