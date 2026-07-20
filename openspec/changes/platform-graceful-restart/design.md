@@ -85,7 +85,7 @@ claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功
 2. 同一 `(conversation, agent)` 最多**一个 running**，且最多**一个持久化 pending intent**（重复触发合并进 intent，不丢不并发;Review 第六轮 P1-1 粒度改 conversation，NULL 走 task 级兜底索引）。
 3. execution 的 `running→done` 与 `running→superseded` 通过 **CAS 竞争，只能一个成功**（自然完成与交棒不互相覆盖）。
 4. `superseded + recovery child 入队` 在**同一事务**提交（不出现「旧 run 已 superseded 但无 child」的半提交）。
-5. **旧 generation 不能 finalize、不能再调用 `jian` 写平台**（fencing：写接口带 run 的 generation，DB 校验 == 当前活跃 generation，不符拒写——防孤儿 CLI 双写）。
+5. **旧 generation 及同世代旧 attempt 不能 finalize、不能再调用 `jian` 写平台**（fencing 到 attempt 级：generation+instance+`task_runs.status=running`+`run_queue.status=running`+`current_attempt_id==task_run_id` 全匹配才放行——只看 generation 挡不住同世代旧 attempt，见决策 8 fencing 段与 spec「attempt 级 fencing」Requirement，第七轮 P0-4）。
 6. recovery chain 有**明确次数上限 + 退避 + dead-letter**（防 crash-loop 无限 resume 烧 token）。
 7. `task_run`、`run_queue`、session watermark、消息投递之间有**明确事务边界**（见决策 6 与 [agent-session-resume] 水位）。
 
@@ -160,8 +160,8 @@ claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功
   2. 对每个残留 `running` run，用持久化的 `pid + pid_create_time` **探活**：进程不存在、或存在但 create-time 不匹配（pid 已被复用）→ 判定旧执行已停。
   3. **仅在「旧执行已确认停 或 已被 fencing 且 containment 已清理其进程树」时**，才据 `session_id` 入队一条续跑 run（`superseded_from` 幂等标 + resume 意图 + 系统恢复豁免配额）。
   4. **既不能证明已停、又不能保证 fencing 生效** → **不创建 recovery child**，该 run 置 `recovery_blocked`（进 dead-letter，见决策 0/有界恢复），等人工介入，宁可不续不可双执行。
-- 无 `session_id` 的 run → 无法 resume → 落 `failed`/现状兜底不变。
-- 好处:复用现有「队列领取 + 起 CLI + 收尾」全链路,收尾幂等由现有 `_finalize_if_running` + generation CAS 保证;fencing + 判死双保险取代「盲目假设已死」。
+- **无/失效 `session_id` 的 run（第七轮 P0-2：异常 reclaim 与温和交棒统一，不再落 failed/不续）**：确认旧进程已停或已 fencing+进程树清理后 → **父 execution 落 `superseded` + 子 execution 入队 `recovery_mode=full_replay`**（清 session 后从平台消息重建上下文），SHALL NOT 落 `failed` 或「现状兜底不续」。「session 不可用」只决定 recovery mode（`session_resume` vs `full_replay`），**不把基础设施中断记成业务 `failed`、也不丢弃执行意图**。须区分两类：① **attempt 自身业务/模型 poisoned failure**（如 iteration_limit/api 400/语义静默）→ 按 failure/recovery policy 处理（可禁自动重试）;② **Worker 崩溃时发现存量 session 不可用** → 清 session、走 `full_replay` child。
+- 好处:复用现有「队列领取 + 起 CLI + 收尾」全链路,收尾幂等由现有 `_finalize_if_running` + generation CAS 保证;fencing + 判死双保险取代「盲目假设已死」;有 session 与无 session 恢复共用同一 `superseded_from`/recovery budget/事件顺序/`recovery_mode` 契约，不出现两套恢复模型。
 
 **防重复续跑**：续跑 run 入队时打标（如 `superseded_from=<旧 run_id>`),避免交棒杀 + reclaim 兜底对同一 run 各入队一次导致双续。以「旧 run 是否已生成续跑 run」为幂等键。
 
@@ -195,7 +195,7 @@ claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功
   - **优雅交棒（3 态 ack）**：`running(g) → draining(g)`（旧 Worker 停领、杀在跑 CLI、superseded+入队 recovery child、置 done） → 新 Worker 读到旧 generation `done` 才 **`g+1` 接管**（ack）。
   - **硬崩溃接管（lease 过期 CAS）**：旧 Worker 未置 `done` 就死（无 ack）→ 新 Worker **不能干等 done**，改判 `lease_expires_at < now`（心跳停摆已过期）→ 用 CAS `WHERE current_generation=g AND lease_expires_at<now SET current_generation=g+1, owner_instance_id=<new>, state=running` 抢占接管;抢占后按决策 5「先 fencing 再判死再续跑」处理残留 running run。CAS 保证并发拉起的多个新 Worker 只有一个接管成功。
 - **claim 与 draining 同一受保护决策点**：draining 后不再 claim（关闭「停领与新任务刚进」的竞态）。**权威判定 SHALL 在 claim CAS 的 WHERE 内完成**——同一条 UPDATE 校验 `worker_state.state='running'`（非 draining/done）+ `claim_generation==当前活跃 generation` + `owner_instance_id` 匹配 + lease 未过期（见 spec「原子 claim」Requirement 与任务 5.2a），不只靠进程内标志;进程内标志仅作本地快速短路，不作最终依据。单机不需 OS 分布式锁。
-- **fencing**：`g` 世代的进程/run 不能 finalize 也不能写平台（不变量 5）;fencing 校验同时比对 `worker_generation` 与 `owner_instance_id`，防 pid/generation 复用误判。
+- **fencing（attempt 级，第七轮 P0-4）**：`g` 世代的进程/run 不能 finalize 也不能写平台（不变量 5）;**fencing SHALL 到 attempt 级、不止 generation**——只看 `generation==current` 挡不住同世代旧 attempt（retry 残留线程 / 已 terminal 未升 generation / 交棒 kill 不完整）。`jian` 写平台两层全匹配才放行：`worker_generation==current` + `owner_instance_id==current owner`（属于当前 Worker）+ `task_runs.status='running'` + `run_queue.status='running'` + `run_queue.current_attempt_id==task_run_id`（仍是当前合法执行）+（写 session 时）owner token 匹配。交棒杀进程须确认完整进程树退出，kill 失败/超时不直接 supersede+建 child，转 `recovery_blocked` 或先完成 fencing。
 - 多个重启请求：单机场景后到的重启覆盖前一个 draining 意图即可，不需 restart_requests 表管合并。
 
 ### 决策 9：SSE 续传完整契约——统一事件序列游标（Review P0-7/P0-E）

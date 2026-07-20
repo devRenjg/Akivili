@@ -13,6 +13,19 @@ UNIQUE(task_id, agent_slug)
 ```
 新业务 run SHALL 强制带 `conversation_id`;无法回填 `conversation_id` 的历史/系统 run SHALL 进入第二组 `(task_id, agent_slug)` NULL 兜底索引或先隔离清理，SHALL NOT 留「不约束」空档。
 
+**🔴 task:conversation SHALL 固化为一对一 DB 不变量（Review 第七轮 P0-3，用户拍板）**：现有业务代码正常创建路径（`routes/tasks.py` 的 `create_task`/`create_subtask`）**每个 task/subtask 都新建独立 conversation**，即产品事实已是 1:1;但 `tasks.conversation_id` 现状可空且无唯一约束，规格上一个 conversation 理论可挂多个 task，会让 `(conversation, agent)` 粒度的**单 pending intent 压掉或错投跨 task 触发**（同 conversation 的 task B 触发被折叠进 task A 的单个 `rerun_requested/pending_through_message_id`，丢掉 B 的 task_id/prompt/idempotency key/优先级/先后）。故 SHALL 把该事实固化为 DB 约束：
+```sql
+CREATE UNIQUE INDEX ... ON tasks(conversation_id) WHERE conversation_id IS NOT NULL;
+```
+迁移前 SHALL 清理历史重复。固化后 conversation 粒度与 task 粒度实际一一对应，现有单 pending intent 才安全。**若未来产品确需多 task 共享 conversation**，SHALL 改模型（二选一）：① active 串行只限制 `claimed/running`、允许多个 queued execution 排队;② 新增 FIFO `pending_intents` 表至少存 `task_id/prompt/source/idempotency_key/created_at`，SHALL NOT 只留一个布尔/水位槽。当前拍板走 1:1 DB 约束，不改模型。
+
+**pending intent SHALL NOT 因 poisoned/failed 而丢失（Review 第七轮 P0-3）**：区分「自动恢复 successor」与「执行期间新到达的外部用户 intent」——
+- 自动恢复 successor：poisoned failure 时不建（禁自动重试）。
+- **外部 pending intent：即便 poisoned，清 session 后仍 SHALL 建一个 `full_replay` 普通 successor 承接**（poisoned 可禁自动重试，但不能丢用户在执行期间新下的指令）。
+- 用户 kill 是唯一明确取消 pending intent 的路径。
+
+**🔴 NULL session scope 不成立，NULL run 固定 full replay、不建/复用 `agent_sessions`（Review 第七轮 P1-2）**：`agent_sessions` 唯一键只有 `(conversation_id, agent_slug)`、无 task_id，且 SQLite `UNIQUE` 对 NULL 不提供 task 级唯一性——「`conversation_id` 为空退化到 (task, agent) session」按现表结构**无法实现**（前文 active 串行的 NULL 兜底只解决排队唯一性，不等于 session 唯一性）。故 SHALL 明确：① **新业务 run 强制 `conversation_id` 非空**（正常创建路径已满足，见 task:conversation 1:1）;② **历史/系统 NULL run 只使用 task 级 active 串行、SHALL NOT 创建或复用 `agent_sessions`、固定走 full replay**（每次全量回灌，不 resume）;③ 若未来确需 NULL task 级 session，SHALL 引入独立 `session_scope_type + session_scope_id`（而非复用 NULL `conversation_id` 当 session key）。当前不引入。
+
 #### Scenario: 首次执行建立 session
 - **WHEN** 某 Agent 在某 task 首次被触发执行（`agent_sessions` 无该 (conversation, agent) 行）
 - **THEN** 系统开新 CLI 会话（不带 resume）、执行成功后把 CLI 返回的 `session_id`、`provider_id`、`backend`、`workdir` 落 `agent_sessions`，并把本次成功喂到的水位作为 `committed_msg_id` 落库
@@ -28,6 +41,26 @@ UNIQUE(task_id, agent_slug)
 #### Scenario: conversation_id 为空走 task 兜底串行
 - **WHEN** 某无会话/系统 run（`conversation_id IS NULL`）的同 `(task, agent)` 并发触发
 - **THEN** 第二组 `UNIQUE(task_id, agent_slug) WHERE conversation_id IS NULL` 兜底索引保证至多一个 active，不因 conversation 为空而失去串行约束
+
+#### Scenario: task:conversation 一对一 DB 约束拒绝共享
+- **WHEN** 迁移建立 `UNIQUE INDEX ON tasks(conversation_id) WHERE conversation_id IS NOT NULL` 后，尝试让两个 task 复用同一 conversation_id
+- **THEN** DB 唯一约束拒绝第二次写入;迁移前历史重复已清理，使 conversation 粒度与 task 粒度一一对应，单 pending intent 安全
+
+#### Scenario: 跨 task 共享 conversation 的触发不丢不错投
+- **WHEN**（1:1 约束下）task A 已 active，其 conversation 不可能再挂 task B——若历史脏数据出现共享，B 的触发
+- **THEN** 按拍板 1:1 模型 B 应属独立 conversation、独立 active run，不被折叠进 A 的单 pending intent、不错投给 task A、不丢失;脏数据在迁移清理阶段被隔离
+
+#### Scenario: NULL conversation_id 的 run 走 full replay 不复用 session
+- **WHEN** 某系统/历史 run 的 `conversation_id IS NULL` 被执行
+- **THEN** 系统只用 task 级 active 串行保证不并发，SHALL NOT 创建或复用 `agent_sessions`（NULL 无法提供 task 级 session 唯一性），该 run 固定全量回灌 full replay、不带 resume;SHALL NOT 把多个 NULL run 误当同一 session
+
+#### Scenario: poisoned 时外部 pending intent 不丢
+- **WHEN** 某 attempt poisoned failure，但执行期间已有用户新触发合并成 pending intent
+- **THEN** 自动恢复 successor 因 poisoned 不建，但 pending 的外部新意图 SHALL 清 session 后生成一个 `full_replay` 普通 successor 承接;仅用户 kill 才取消 pending
+
+#### Scenario: failed 时 pending intent 不丢
+- **WHEN** execution 落 `failed`（非 kill），执行期间已有用户新触发的 pending intent
+- **THEN** SHALL 据 pending 建 successor 承接用户新指令，SHALL NOT 因失败而丢弃执行期间到达的 intent
 
 #### Scenario: 会话粒度隔离
 - **WHEN** 同一 task 内两个不同成员各自被触发执行
@@ -199,8 +232,11 @@ eligible messages = 扫描区间内真正拼入 prompt 的非自产消息
 
 1. **默认 feature flag 关闭**：`history_backlog` 的 tool-enabled 自动续批 SHALL 置于独立 feature flag 之后、**默认关闭**，SHALL NOT 随阶段 1 基础协议默认开启;它是独立上线门，与基础平滑重启解耦。
 2. **observe probe 升级为硬门禁**：`history_backlog_side_effect_observe_probe` SHALL 从「只采集现象」升级为 **release gate 硬断言**——发现工具调用、平台写入、普通 assistant 用户交付、mention/通知触发或任务自动流转即判**测试失败**。
-3. **做不到 context-only 则先聚合再单次业务 turn**：若无法可靠实现「只注入上下文、不产生副作用」的 context-only turn，系统 SHALL 先完成历史聚合/摘要，**再创建一次正常业务 turn** 处理，SHALL NOT 让首批不完整上下文直接执行真实任务。
-4. **摘要/聚合 SHALL NOT 削弱「原消息至少一次完整投递」承诺（Review 第六轮 P1-7，用户拍板方案 A）**：本平台采用**「原始消息至少一次完整投递」**契约——聚合/摘要**只用于压缩喂给模型的可见上下文**，SHALL NOT 成为「原消息已消费」的替代。因此 `committed_msg_id` 推进到某 `batch_scan_end` 的前提 SHALL 是「该区间原始消息已至少完整投递过一次给某个真实业务 turn」，SHALL NOT 因「已生成摘要」就跨过原消息推进 committed（否则被摘要覆盖的原消息将永不原样投递）。摘要记录 SHALL 保留其覆盖的 source message id 区间以便追溯。**超模型上下文的处置 SHALL 明确**：软预算（本平台字符/条数上限）下 SHALL 连续前缀分批、逐轮完整投递（现状）;单条原始消息超模型**硬上下文**且无法在一个 turn 内完整投递时，SHALL 停止并转人工/外置为附件·检索，SHALL NOT 对同一不可投递输入无限重试、SHALL NOT 静默丢弃后推进 committed。
+3. **摘要仅辅助理解、不算「投递」，无 safe ingestion 则转人工（Review 第七轮 P1-3，用户拍板；消解第六轮 P1-7 与「先摘要再单次业务 turn」的互斥）**：backlog 自动消费的上线契约 SHALL 二选一明确，SHALL NOT 让摘要既「不算消费」又「承担自动完成消费」两义并存：
+   - **有可靠 safe ingestion / context-only turn**：原文**逐批**进入该 session（服务端强制禁工具/禁交付），只有原文完整投递后才推进 committed;摘要仅辅助模型理解、不替代原文投递。
+   - **无可靠 safe ingestion**：当原始历史总量超过单 turn 上下文、无法保证原文完整投递时，SHALL **直接转人工/外部检索**，SHALL NOT 声称自动消费完成、SHALL NOT 越过未投递原消息推进 committed。
+   两情形下都 SHALL NOT 让首批不完整上下文直接执行真实任务。
+4. **「原始消息至少一次完整投递」为硬契约（Review 第六轮 P1-7 + 第七轮 P1-3）**：`committed_msg_id` 推进到某 `batch_scan_end` 的前提 SHALL 是「该区间原始消息已至少完整投递过一次给某个真实/safe-ingestion turn」，SHALL NOT 因「已生成摘要」就跨过原消息推进 committed。摘要记录 SHALL 保留其覆盖的 source message id 区间以便追溯。**超模型上下文的处置**：软预算（本平台字符/条数上限）下 SHALL 连续前缀分批、逐轮完整投递（现状）;单条或整体超模型**硬上下文**且无法在一个/多个 safe turn 内完整投递时，SHALL 停止并转人工/外置为附件·检索，SHALL NOT 对同一不可投递输入无限重试、SHALL NOT 静默丢弃后推进 committed。
 5. **仍开启轻方案则明确标注 best-effort 已接受风险**：若产品仍决定启用 tool-enabled 轻方案，文档 SHALL 明确其为 **best-effort**、SHALL 记录「可能重复副作用、可能基于不完整历史决策」的已接受风险，SHALL NOT 写成「副作用防重已解决」。
 
 无论是否启用，backlog successor SHALL NOT 计入 mention-chain、SHALL NOT 触发任务自动流转;副作用防重 SHALL NOT 依赖服务端 exactly-once。首次执行（无 session）SHALL 回灌全量历史（现状行为，同样连续前缀分批 + 自动续批、超上限分轮不丢段不空转）。
@@ -247,7 +283,11 @@ eligible messages = 扫描区间内真正拼入 prompt 的非自产消息
 
 #### Scenario: 多批历史首批不在不完整上下文下执行真实任务
 - **WHEN** 完整历史需分三批，关键否定信息位于第二批
-- **THEN** 若无法可靠实现 context-only turn，系统先聚合/摘要历史再创建一次正常业务 turn，首批 SHALL NOT 在只拿到上下文前缀时直接执行真实任务
+- **THEN** 有 safe ingestion 时原文逐批进 session（禁工具/禁交付）后才执行真实任务、才推进 committed;无 safe ingestion 时转人工，首批 SHALL NOT 在只拿到上下文前缀时直接执行真实任务
+
+#### Scenario: 历史超单 turn 上下文且无 safe ingestion 转人工
+- **WHEN** 原始历史总量超过单 turn 上下文，且系统无可靠 safe ingestion / context-only turn
+- **THEN** 系统 SHALL 转人工/外部检索，SHALL NOT 用摘要冒充完整投递、SHALL NOT 越过未原样投递的原消息推进 committed、SHALL NOT 声称自动消费完成
 
 #### Scenario: 单条超大消息不卡死
 - **WHEN** 某单条消息本身超过字符预算（软预算）

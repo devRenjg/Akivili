@@ -123,7 +123,7 @@
 
 ## 落地技术细节
 
-- **T1 建表**：`agent_sessions`，唯一键 `(conversation_id, agent_slug)`；`database.py` 建表 + 迁移（存量无行，首次执行自然走全量分支）。加同 (task,agent) pending 唯一约束（决策 1 串行）。
+- **T1 建表**：`agent_sessions`，唯一键 `(conversation_id, agent_slug)`；`database.py` 建表 + 迁移（存量无行，首次执行自然走全量分支）。加 **(conversation, agent) active 唯一约束（NULL 走 (task, agent) 兜底，第六轮 P1-1 两组互补 index）**（决策 1 串行）+ **task:conversation 1:1 约束 `UNIQUE(tasks.conversation_id) WHERE NOT NULL`（第七轮 P0-3）**。
 - **T2 claude 抓取**：`claude_code.py::_parse_line` 提 session_id；`ExecEvent` 增字段承载；`runner.py` 流中途 pin + 收尾覆盖存（COALESCE）。
 - **T3 增量取历史**：`runner.py` 执行前查 `agent_sessions`，决定「全量首建 / 增量 + resume」；增量 SQL 参数化 `id > committed_msg_id AND id <= planned_through_msg_id AND author != 本agent`；`planned_through_msg_id`（落 task_runs）= prompt-build 时 `MAX(messages.id)`；`committed_msg_id`（session）只在成功收尾推进。
 - **T4 claude resume**：命中 session 时 `args += ["--resume", sid]`；`resolveSessionID` 落地判定；未落地 → 清 sid + 本次降级全量。
@@ -135,7 +135,7 @@
 
 | 里程碑 | 交付 | 价值 | 验证 |
 |--------|------|------|------|
-| **S1** claude session 建立 | 建表 + 折叠模型 + 抓 session_id（pin + COALESCE 覆盖）；首次全量 | session 被正确建立/存储/可查 | 探针:首次执行后 `agent_sessions` 有正确 session_id + committed_msg_id；同 (task,agent) 不并行起两条（折叠不丢） |
+| **S1** claude session 建立 | 建表 + 折叠模型 + 抓 session_id（pin + COALESCE 覆盖）；首次全量 | session 被正确建立/存储/可查 | 探针:首次执行后 `agent_sessions` 有正确 session_id + committed_msg_id；同 (conversation, agent)（NULL 走 task 兜底）不并行起两条（折叠不丢） |
 | **S2** claude resume + 增量回灌 | `--resume` + committed/planned 两阶段水位增量（排除自产）；mismatch 落地判定（失败才判） | **省 token + 上下文连贯 + 并发不漏话 + 崩溃不漏（at-least-once）** | 探针:二次执行带 resume、prompt 只含增量、并发场景 B 在 A 跑期间的发言下次不漏、prompt 构建后崩溃 committed 不提前推进；token 对比下降 |
 | **S3** 降级链 + poisoned 丢 session | 首次/resume 失败/provider/workdir 回退全量；poisoned 丢 session | **不劣于现状 + 不重放坏状态** | 探针:模拟 "no conversation found"/换 provider/poisoned 失败，均正确回退/丢弃、不报错 |
 | **S4** codex app-server 集成（必选） | `codex exec`→`app-server` + `thread/resume`（回退 `thread/start`）+ `turn/start`；threadId 存库 | **codex 同享 resume（重度使用必选）** | 探针:codex 二次执行 thread/resume 续接、协议错误回退 thread/start、降级链生效 |
