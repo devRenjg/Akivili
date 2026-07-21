@@ -30,8 +30,21 @@
   - attempt 层出现 recovery_blocked（只属 execution）即违规。
   - 终态 recovery_blocked 出现出边 →superseded 即违规（人工恢复只建 child、父终态不变）。
   - manual_recovery_token 被误当父级唯一约束即违规（父子基数须 UNIQUE(superseded_from)）。
-  - STRUCTURAL_ALLOW 增补「纠正/自相矛盾/删除/不走/永久不变/终态不可逆」等解释旧模型语境。
-  - --self-test 增补这三类正负样本，共 19 例。
+  - --self-test 增补这三类正负样本。
+
+第十二轮加固点（P1-D：删宽泛白名单退化 + 两条新结构规则）：
+  - **删除全局宽泛 STRUCTURAL_ALLOW**（纠正/自相矛盾/删除/不走/永久不变/终态不可逆
+    等 sentiment 词）——它们会让「同段含任一 sentiment 词就放行」再次绕过真违规
+    （第十一轮我为放行自己新写的解释文本而加，反而开了后门）。
+  - 结构规则改为**每条自带精确 allow**（只认与该规则直接对应的否定表述，如
+    orphaned→queued 规则只认「SHALL NOT 回 queued」类），与 FORBIDDEN 对齐。
+  - 引入显式历史标记 `HISTORICAL_INVALID:`——需要成段引用旧（已废）模型时，该段
+    SHALL 以此前缀标注，只有带标记的段对结构规则豁免;杜绝用自然语言 sentiment 词
+    隐式豁免。
+  - 新增两条结构规则：① NULL task 可执行/固定 full replay（第十二轮 P0-A 已删）;
+    ② 父 terminal 后向父事件流追加 manual_recovery（第十二轮 P0-B 已禁）。
+  - --self-test 增补 Review 的 5 条绕过负样本 + HISTORICAL_INVALID 标记正负样本 +
+    两条新规则正负样本，共 32 例。
 
 用法：
     python3 spec_consistency_probe.py             # 扫描默认三份 change
@@ -59,8 +72,8 @@ FORBIDDEN = [
          reason="无 session 的 run 不得落 failed，应走 full_replay recovery child",
          allow=["SHALL NOT", "不得", "删除", "删旧", "不再", "而非", "统一", "旧的", "旧「"]),
     dict(pattern=r"NULL\s*conversation[^\n]{0,30}(退化|复用)[^\n]{0,10}task[^\n]{0,6}session",
-         reason="NULL conversation run 不建/复用 agent_sessions，固定 full replay",
-         allow=["SHALL NOT", "不可实现", "无法实现", "不建", "不复用", "而非"]),
+         reason="NULL conversation task 不可执行（三层硬门），不建/复用 agent_sessions",
+         allow=["SHALL NOT", "不可实现", "无法实现", "不建", "不复用", "而非", "不可执行"]),
     dict(pattern=r"(无\s*safe\s*ingestion|做不到\s*context-only)[^\n]{0,40}摘要[^\n]{0,20}(自动完成|正常业务\s*turn)",
          reason="无 safe ingestion 时应转人工，摘要不得冒充自动完成消费",
          allow=["SHALL NOT", "转人工", "不得", "而非", "不算投递"]),
@@ -93,61 +106,95 @@ FORBIDDEN = [
 # 竖线 | 切分，使「orphaned … 回 queued」这类长任务行里同一句段内的旧口径也能被
 # 捕获，而不被 20 字符窗口漏掉;同时避免跨句段误报（相邻两句各自合法却被连读）。
 # 这些是「必须成立/必须不出现」的硬约束。
+# 第十二轮 P1-D：删全局 sentiment 白名单。每条结构规则自带精确 allow（只认与该
+# 规则直接对应的否定表述）;需成段引用旧模型时，该段 SHALL 用显式 HISTORICAL_INVALID:
+# 前缀标注（见 HISTORICAL_INVALID_MARKER），只有带标记的段豁免——杜绝「同段含任一
+# sentiment 词就放行」再次开后门。
 STRUCTURAL = [
     # 交棒/reclaim child 前置若写成「确认停 或 fencing」OR 口径即违规（须 AND）。
     dict(pattern=r"(已确认停|确认停止|旧执行已确认停)\s*或\s*(已被\s*)?fencing",
          reason="交棒/reclaim child 前置必须是 AND（fencing AND 进程树确认退出），不得用 OR",
-         scope="line"),
+         scope="line",
+         allow=["SHALL NOT 用 OR", "不得用 OR", "而非 OR", "SHALL NOT 写", "不得写"]),
     dict(pattern=r"或先(完成|做)\s*(generation\s*)?fencing",
          reason="child 前置不得写「或先完成 generation fencing」OR 口径（仅 fencing 挡不住残留 CLI 副作用）",
-         scope="line"),
+         scope="line",
+         allow=["SHALL NOT", "不得", "而非", "收紧"]),
     # orphaned 不得直接映射/回到 queued（会导致新 Worker 重领 → 双执行）。句段级匹配。
-    # `回` 前用 (?<!不) 排除「不回 queued」这类正确否定表述;`不得回/SHALL NOT 回` 由白名单兜底。
+    # `回` 前用 (?<!不) 排除「不回 queued」这类正确否定表述;`不得回/SHALL NOT 回` 由 allow 兜底。
     dict(pattern=r"orphaned[^。；;!？|]*?((?<!不)回|→|->|映射到?|落)\s*`?queued`?",
          reason="orphaned（未确认死亡）不得回 queued，须 recovery_blocked(process_not_confirmed_dead)",
-         scope="segment"),
+         scope="segment",
+         allow=["SHALL NOT 回 queued", "SHALL NOT 回 `queued`", "不得回 queued", "不得回 `queued`",
+                "SHALL NOT 回队", "不回 queued"]),
     dict(pattern=r"`?orphaned`?\s*(与|和)\s*`?abandoned`?[^。；;!？|]*?(都|均)[^。；;!？|]*?(映射|(?<!不)回|落)[^。；;!？|]*?`?queued`?",
          reason="orphaned 与 abandoned 不得都映射为 queued（前者进程未确认退出，不安全）",
-         scope="segment"),
+         scope="segment",
+         allow=["SHALL NOT", "不得", "不都"]),
     # protocol_incompatible 已起 CLI 分支不得回 queued（句段级覆盖长任务行）。
     dict(pattern=r"protocol[_\s]?incompatible[^。；;!？|]*?(已起|CLI 已启动|gate 已释放)[^。；;!？|]*?((?<!不)回|→|->)\s*`?queued`?",
          reason="protocol_incompatible 已起 CLI/gate 已释放分支不得回 queued（应 orphaned+recovery_blocked，防双执行）",
-         scope="segment"),
+         scope="segment",
+         allow=["SHALL NOT 回 queued", "SHALL NOT 回 `queued`", "不得回 queued", "SHALL NOT 回队"]),
     # 三元一致性：gate 已释放/CLI 已起的分支若把 source 写成 claimed→orphaned 即违规
     # （gate 释放在 CAS 转 running 之后，source 必为 running），第十轮 P1-1。
     dict(pattern=r"(gate 已释放|CLI 已起|CLI 已启动)[^。；;!？|]*?`?claimed`?\s*(→|->)\s*`?orphaned`?",
          reason="gate 已释放/CLI 已起时 source 必为 running（running→orphaned），不得写 claimed→orphaned",
-         scope="segment"),
+         scope="segment",
+         allow=["SHALL NOT 写 claimed", "不得写 claimed", "source 必为 running", "非 claimed"]),
     dict(pattern=r"`?claimed`?\s*(→|->)\s*`?orphaned`?[^。；;!？|]*?(gate 已释放|CLI 已起|CLI 已启动)",
          reason="gate 已释放/CLI 已起时 source 必为 running（running→orphaned），不得写 claimed→orphaned",
-         scope="segment"),
+         scope="segment",
+         allow=["SHALL NOT 写 claimed", "不得写 claimed", "source 必为 running", "非 claimed"]),
     # 第十一轮 P1-D：三类人工恢复语义 gate。
     # (1) attempt 层出现未定义状态 recovery_blocked（它只属 execution）。句段级匹配
     #     「attempt … recovery_blocked」同段共现。
-    dict(pattern=r"attempt[^。；;!？|]*?(层|状态|终态|status)[^。；;!？|]*?recovery_blocked",
+    # R7 收紧（第十二轮）：只在「attempt 层/状态/终态」紧邻（≤4 字）recovery_blocked 时
+    # 才判违规，杜绝「attempt/execution 终态、…、落 recovery_blocked」这类跨大段的误报。
+    dict(pattern=r"attempt\s*(层\s*)?(状态|终态|status)[^。；;!？|]{0,4}`?recovery_blocked",
          reason="recovery_blocked 只属 execution，SHALL NOT 出现在 attempt 层状态/终态",
-         scope="segment"),
-    dict(pattern=r"recovery_blocked[^。；;!？|]*?(是|为|作为)[^。；;!？|]*?attempt[^。；;!？|]*?(状态|终态)",
+         scope="segment",
+         allow=["SHALL NOT", "只属 execution", "不属 attempt", "不是 attempt"]),
+    # R8 收紧（第十二轮）：只在 recovery_blocked **直接**「是/为/作为 attempt」时判违规，
+    # 杜绝「recovery_blocked 是 execution 终态，不是 attempt 状态」这类正确表述被 bridge 误报。
+    dict(pattern=r"`?recovery_blocked`?\s*(是|为|作为)\s*`?attempt",
          reason="recovery_blocked 只属 execution，SHALL NOT 定义为 attempt 状态/终态",
-         scope="segment"),
+         scope="segment",
+         allow=["SHALL NOT", "只属 execution", "不属 attempt", "不是 attempt"]),
     # (2) recovery_blocked 出现出边 →superseded（终态不可逆，人工恢复只建 child 不改父）。
     dict(pattern=r"`?recovery_blocked`?\s*(→|->)\s*`?superseded`?",
          reason="终态 recovery_blocked 不得有出边 →superseded（人工恢复只建 child、父终态不变）",
-         scope="segment"),
+         scope="segment",
+         allow=["SHALL NOT", "不得", "终态不可逆", "父终态不变", "只建 child"]),
     dict(pattern=r"父[^。；;!？|]*?`?recovery_blocked`?\s*(→|->|改写?为|变(成|为))\s*`?superseded`?",
          reason="父 recovery_blocked 终态不可逆，不得改写为 superseded（人工恢复只建 child）",
-         scope="segment"),
+         scope="segment",
+         allow=["SHALL NOT", "不得", "终态不可逆", "永久不变", "只建 child"]),
     # (3) manual_recovery_token 被误当父级唯一约束（父子基数必须 UNIQUE(superseded_from)）。
     dict(pattern=r"UNIQUE\s*\([^)]*manual_recovery_token[^)]*\)[^。；;!？|]*?(保证|防|挡)[^。；;!？|]*?(一父|父.*child|至多.*child|双续|重复 child)",
          reason="父子基数须 UNIQUE(superseded_from)，manual_recovery_token 只做请求幂等、不承担父子唯一",
-         scope="segment"),
+         scope="segment",
+         allow=["SHALL NOT", "不得", "而非", "不承担", "只做请求幂等", "挡不住"]),
+    # 第十二轮 P1-D 新增结构规则 ①：NULL task 可执行/固定 full replay（P0-A 已删该口径）。
+    # 收紧：NULL/空 conversation/task 紧邻（≤8 字）肯定式「可执行/固定 full replay/走 task
+    # 兜底执行」才判违规;「不可执行/不设可执行/非可执行」等否定由 (?<!不)(?<!设) 前视 + allow 排除。
+    dict(pattern=r"(NULL|空)\s*(conversation|task)[^。；;!？|]{0,8}(固定\s*full[_\s]?replay|走\s*task\s*兜底[^。；;!？|]{0,4}执行|退化[^。；;!？|]{0,6}执行|(?<!不)(?<!非)(?<!设)可执行(?!必))",
+         reason="NULL conversation 的 task 不可执行（三层硬门），无「固定 full replay」可执行口径（第十二轮 P0-A）",
+         scope="segment",
+         allow=["SHALL NOT", "不可执行", "不得", "而非", "已删", "删旧", "非可执行", "不代表可执行",
+                "不设可执行", "仅防", "只作", "只防", "拒绝执行", "存量脏数据", "必须拥有非 NULL"]),
+    # 第十二轮 P1-D 新增结构规则 ②：父 terminal 后向父事件流追加 manual_recovery（P0-B 已禁）。
+    # 收紧：需出现「父流/父事件流 + 追加/append/写/发 + manual_recovery」的肯定式才判违规;
+    # 「manual_recovery 走 child 流/独立审计/不追加父流」等正确表述由 allow 排除。
+    dict(pattern=r"(父\s*(事件)?流|父\s*execution\s*事件流)[^。；;!？|]{0,20}(追加|append|写入?|发)[^。；;!？|]{0,12}manual_recovery",
+         reason="父 terminal 后事件流已封闭，SHALL NOT 向父流追加 manual_recovery（走 child 流首事件/审计表，第十二轮 P0-B）",
+         scope="segment",
+         allow=["SHALL NOT", "不得", "不追加", "而非", "封闭", "child 流", "child 事件流", "独立审计"]),
 ]
 
-# 结构规则的豁免片段（说明「不得如此」的合法语境）——比通用整行放行更克制。
-# 含「纠正/自相矛盾/删除…可选性/不走」等词的句段，是在解释旧模型为何被废，非现行口径。
-STRUCTURAL_ALLOW = ["SHALL NOT", "不得", "禁止", "而非", "OR 口径", "不能写成", "错误", "违规",
-                    "收紧", "改成", "同一真相源", "防双执行", "旧口径",
-                    "纠正", "自相矛盾", "删除", "不走", "永久不变", "终态不可逆"]
+# 显式历史标记（第十二轮 P1-D）：需成段引用已废旧模型时，该段以此前缀标注，结构规则
+# 对带标记段豁免。这是**唯一**的成段豁免，且必须显式书写，取代旧的 sentiment 白名单。
+HISTORICAL_INVALID_MARKER = "HISTORICAL_INVALID:"
 
 # 行级 meta 语境标记：命中的行是「描述本 probe 自身/清理清单」的元文档，会成段
 # 罗列旧口径作为清理目标，整行豁免（仅限这类自述行，不是通用整行放行）。
@@ -213,18 +260,27 @@ def scan_line(line):
             hits.append(("forbidden", rule["reason"]))
     for rule in STRUCTURAL:
         scope = rule.get("scope", "line")
+        rule_allow = rule.get("allow", [])
         if scope == "segment":
-            # 逐句段匹配：某句段命中 pattern 且该**句段内**无白名单片段才算违规。
+            # 逐句段匹配：某句段命中 pattern，且该**句段内**既无本规则专属 allow 片段、
+            # 也无显式 HISTORICAL_INVALID 标记，才算违规（第十二轮：删全局 sentiment 白名单）。
             hit = False
             for seg in _segments(line):
-                if re.search(rule["pattern"], seg) and not any(snip in seg for snip in STRUCTURAL_ALLOW):
-                    hit = True
-                    break
+                if not re.search(rule["pattern"], seg):
+                    continue
+                if HISTORICAL_INVALID_MARKER in seg:
+                    continue
+                if any(snip in seg for snip in rule_allow):
+                    continue
+                hit = True
+                break
             if hit:
                 hits.append(("structural", rule["reason"]))
         else:
             if re.search(rule["pattern"], line):
-                if any(snip in line for snip in STRUCTURAL_ALLOW):
+                if HISTORICAL_INVALID_MARKER in line:
+                    continue
+                if any(snip in line for snip in rule_allow):
                     continue
                 hits.append(("structural", rule["reason"]))
     return hits
@@ -383,6 +439,55 @@ def _self_test():
     check("UNIQUE(superseded_from) 父子基数放行",
           not any(k == "structural" for _, k, _, _ in scan_text(
               "UNIQUE(superseded_from) 保证一父至多一个 child，token 只做请求幂等")))
+
+    # ── 第十二轮 P1-D：删全局 sentiment 白名单后，5 条绕过负样本必须被拦 ──
+    # 这些句子含旧 sentiment 词（纠正/删除/不走/自相矛盾/终态不可逆），旧版本会整段放行、
+    # 放过其中真违规;新版本每规则精确 allow + HISTORICAL_INVALID 显式标记后必须 CAUGHT。
+    bypass_cases = [
+        "纠正旧模型后，orphaned 回 queued 等兼容 Worker。",
+        "删除冗余字段，父 recovery_blocked→superseded 后建 child。",
+        "不走老路径，attempt 状态 recovery_blocked 直接落终态。",
+        "自相矛盾已消除，UNIQUE(recovery_chain_id, manual_recovery_token) 保证一父至多一个 child。",
+        "终态不可逆原则下，gate 已释放时 claimed→orphaned 落 recovery_blocked。",
+    ]
+    for i, bc in enumerate(bypass_cases, start=1):
+        check(f"P1-D sentiment 绕过负样本{i} 被拦",
+              any(k == "structural" for _, k, _, _ in scan_text(bc)))
+
+    # 19. HISTORICAL_INVALID 显式标记段：成段引用旧模型 → 放行（唯一成段豁免）
+    check("HISTORICAL_INVALID 标记段放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "SHALL NOT 保留旧 HISTORICAL_INVALID:「orphaned 一律回 queued」的口径")))
+    # 20. 无标记的同类旧口径 → 仍被拦（marker 必须显式书写）
+    check("无 HISTORICAL_INVALID 标记的旧口径仍被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "保留旧的 orphaned 一律回 queued 口径继续跑。")))
+
+    # 21. 新规则①：NULL task 固定 full replay 可执行 → 命中
+    check("NULL task 固定 full replay 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "某 NULL conversation 的 run 固定 full replay 执行不复用 session。")))
+    # 22. 正确口径：NULL task 不可执行 → 放行
+    check("NULL task 不可执行放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "conversation_id IS NULL 的 task 一律不可执行，NULL 组索引仅防存量脏数据并发。")))
+    # 22b. NULL task 直接说「可执行」→ 命中（裸「可执行」触发，(?<!不)(?<!非)(?<!设) 排除否定）
+    check("NULL task 可执行被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "某 NULL conversation 的 task 可执行并复用 session。")))
+    # 22c. 正确不变量标题「可执行 task 必须拥有非 NULL」→ 放行（(?!必) + allow 双重排除）
+    check("可执行必有真 conversation 标题放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "可执行 task 必须拥有非 NULL conversation，NULL/quarantined task 一律不可执行。")))
+
+    # 23. 新规则②：父流追加 manual_recovery → 命中
+    check("父流追加 manual_recovery 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "人工恢复时向父事件流追加 manual_recovery 事件让客户端发现 child。")))
+    # 24. 正确口径：manual_recovery 走 child 流首事件、不追加父流 → 放行
+    check("manual_recovery 走 child 流放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "manual_recovery 作为 child 事件流首个控制事件，SHALL NOT 追加到已封闭的父流。")))
 
     passed = sum(1 for _, ok in cases if ok)
     print("🧪 self-test")

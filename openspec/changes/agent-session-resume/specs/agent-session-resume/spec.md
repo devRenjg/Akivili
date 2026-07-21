@@ -11,7 +11,7 @@ UNIQUE(conversation_id, agent_slug)
 UNIQUE(task_id, agent_slug)
   WHERE conversation_id IS NULL     AND status IN ('queued','claimed','running');
 ```
-新业务 run SHALL 强制带 `conversation_id`;无法回填 `conversation_id` 的历史/系统 run SHALL 进入第二组 `(task_id, agent_slug)` NULL 兜底索引或先隔离清理，SHALL NOT 留「不约束」空档。
+新业务 run SHALL 强制带 `conversation_id`;无法回填 `conversation_id` 的历史/系统 run SHALL 先隔离清理。**第二组 `(task_id, agent_slug) WHERE conversation_id IS NULL` 索引的定位 = 存量脏数据并发防御约束（保证即便历史遗留 NULL active 行也至多一个），SHALL NOT 被理解为「NULL run 可执行的 task 级串行兜底」**——`conversation_id IS NULL` 的 task 一律不可执行（见「可执行 task 必须拥有非 NULL conversation」Requirement 的三层硬门），该索引只防存量脏数据，不代表 NULL run 有合法执行口径;SHALL NOT 留「不约束」空档。
 
 **🔴 task:conversation SHALL 固化为一对一 DB 不变量（Review 第七轮 P0-3，用户拍板）**：现有业务代码正常创建路径（`routes/tasks.py` 的 `create_task`/`create_subtask`）**每个 task/subtask 都新建独立 conversation**，即产品事实已是 1:1;但 `tasks.conversation_id` 现状可空且无唯一约束，规格上一个 conversation 理论可挂多个 task，会让 `(conversation, agent)` 粒度的**单 pending intent 压掉或错投跨 task 触发**（同 conversation 的 task B 触发被折叠进 task A 的单个 `rerun_requested/pending_through_message_id`，丢掉 B 的 task_id/prompt/idempotency key/优先级/先后）。故 SHALL 把该事实固化为 DB 约束：
 ```sql
@@ -22,7 +22,7 @@ CREATE UNIQUE INDEX ... ON tasks(conversation_id) WHERE conversation_id IS NOT N
 **历史重复迁移 SHALL 是可执行、可回滚的完整流程（Review 第八轮 P1-D，「迁移前清理历史重复」不足以直接实施）**：
 1. **dry-run 查询**：先输出所有重复 `conversation_id` 及其关联的 task、messages、run_queue、task_runs、agent_sessions（人工可审），SHALL NOT 静默改数据。
 2. **保留规则确定性**：明确重复中哪个 task 保留原 conversation（如最早创建/有 active run 的 task），规则 SHALL 确定、可复现。
-3. **其他 task 处置（隔离必须让 UNIQUE index 可创建，Review 第九轮）**：partial unique index 谓词是 `WHERE conversation_id IS NOT NULL`，因此「隔离阻断」若保留原重复 `conversation_id` 值，第 5 步建 index 仍会因重复而失败。隔离 SHALL 落到具体列值二选一——① **隔离 task 的 `conversation_id` 置 `NULL`**（退出 partial index 覆盖），同时把原值存入新增 lineage 列 `quarantined_from_conversation_id`（保留血缘、可人工追溯/回迁），该 task 转由 `(task_id, agent_slug) WHERE conversation_id IS NULL` 兜底串行;② 或**为隔离 task 新建独立 conversation 并迁移其消息/执行历史**（使 conversation 粒度与 task 粒度重新一一对应）。当前默认走 ①（置 NULL + lineage，最小侵入、不复制历史）;需要保留独立会话上下文时人工选 ②。SHALL NOT 只在业务层「标记需人工处理」而不改 `conversation_id` 列值——否则 index 建不出来。
+3. **其他 task 处置（隔离必须让 UNIQUE index 可创建，Review 第九轮）**：partial unique index 谓词是 `WHERE conversation_id IS NOT NULL`，因此「隔离阻断」若保留原重复 `conversation_id` 值，第 5 步建 index 仍会因重复而失败。隔离 SHALL 落到具体列值二选一——① **隔离 task 的 `conversation_id` 置 `NULL`**（退出 partial index 覆盖），同时把原值存入新增 lineage 列 `quarantined_from_conversation_id`（保留血缘、可人工追溯/回迁），该 task 由 `(task_id, agent_slug) WHERE conversation_id IS NULL` 索引**仅作存量脏数据并发防御（不可执行、非可执行兜底，第十二轮 P0-A）**;② 或**为隔离 task 新建独立 conversation 并迁移其消息/执行历史**（使 conversation 粒度与 task 粒度重新一一对应）。当前默认走 ①（置 NULL + lineage，最小侵入、不复制历史）;需要保留独立会话上下文时人工选 ②。SHALL NOT 只在业务层「标记需人工处理」而不改 `conversation_id` 列值——否则 index 建不出来。
 
    **🔴 走 ① 的 quarantined task（`conversation_id=NULL` + lineage）SHALL NOT 自动执行，人工恢复唯一路径 = 迁移到新 conversation（Review 第十轮 P1-2 + 第十一轮 P1-C 收口）**：ASR 历史读取固定 `messages WHERE conversation_id=?`，且 `messages` 无通用 `task_id`——直接以 NULL 执行读不到历史、直接用 `quarantined_from_conversation_id` 读又会把**原共享 conversation 里其他 task 的消息**一起喂入。因此 quarantined task **不进 claim/dispatch 自动执行**，只走人工出口：**人工把该 task 迁移到一个新独立 conversation**（走上面 ②），在**可审计的消息切分**后把归属本 task 的消息迁入新 conversation（**切分无法可靠判定时保持 quarantine、不允许「猜测迁移」**），迁移后该 task 有真 conversation、进入 1:1 约束、正常 full replay/resume。**第十轮设想的「指定 `history_source_conversation_id` + 消息切分规则、只喂本 task 消息」缺数据结构支撑（messages 无 task_id、结果消息无法带 NULL conversation 落库），第十一轮已删除该可执行口径**——统一为「无真 conversation 不可执行、恢复必先建真 conversation」。见「可执行 task 必须拥有非 NULL conversation」Requirement。
 4. **不串档**：迁移 SHALL 保证 `agent_sessions`、pending intent、`run_queue`、`task_runs` 归属正确 task/conversation，SHALL NOT 把 A 的 session/run 串到 B。
@@ -34,7 +34,7 @@ CREATE UNIQUE INDEX ... ON tasks(conversation_id) WHERE conversation_id IS NOT N
 - **外部 pending intent：即便 poisoned，清 session 后仍 SHALL 建一个 `full_replay` 普通 successor 承接**（poisoned 可禁自动重试，但不能丢用户在执行期间新下的指令）。
 - 用户 kill 是唯一明确取消 pending intent 的路径。
 
-**🔴 可执行 task 必须拥有非 NULL conversation，NULL/quarantined task 一律不可执行（Review 第七轮 P1-2 + 第十一轮 P1-C 收口）**：根因是数据模型——`messages` 表 `conversation_id NOT NULL`、**无通用 `task_id` 列**（`run_id` 只覆盖 run 产出的 assistant 消息，人工 user 消息 `run_id` 常为 NULL），且 `agent_sessions` 唯一键只有 `(conversation_id, agent_slug)`、无 task_id。因此「NULL task 从本 task 读取/写入消息」**既无可靠查询条件、结果消息也无法合法落库**（写入必须带 conversation_id），第十轮设想的「以本 task 归属消息 full replay」与「`history_source_conversation_id` + 消息切分」缺数据结构支撑、SHALL NOT 作为可执行口径。故 SHALL 明确：① **新业务 run 强制 `conversation_id` 非空**（正常创建路径已满足，见 task:conversation 1:1）;② **所有可执行 task 必须拥有非 NULL conversation**——`conversation_id IS NULL` 的 task（含无会话归属的系统/历史 task 与迁移隔离的 quarantined task）**一律不进入 claim/dispatch、不可自动执行**;③ 人工恢复一个 NULL/quarantined task 时，SHALL **创建独立 conversation** 并在**可审计的消息切分**后迁移对应消息（切分无法可靠判定时保持 quarantine、**不允许「猜测迁移」**），迁移后该 task 有真 conversation、进入 1:1 约束、正常 full replay/resume;④ 若未来确需支持永久 NULL task，SHALL 新增明确的消息 scope（如 `message_scope_type + message_scope_id` 或可空 `task_id`）并定义 user/assistant/system/tool 全部读写 SQL，SHALL NOT 只加一个 `history_source_conversation_id` 指针。当前**不引入**永久 NULL task 模型，统一走「可执行必有真 conversation」。
+**🔴 可执行 task 必须拥有非 NULL conversation，NULL/quarantined task 一律不可执行（Review 第七轮 P1-2 + 第十一轮 P1-C 收口）**：根因是数据模型——`messages` 表 `conversation_id NOT NULL`、**无通用 `task_id` 列**（`run_id` 只覆盖 run 产出的 assistant 消息，人工 user 消息 `run_id` 常为 NULL），且 `agent_sessions` 唯一键只有 `(conversation_id, agent_slug)`、无 task_id。因此「NULL task 从本 task 读取/写入消息」**既无可靠查询条件、结果消息也无法合法落库**（写入必须带 conversation_id），第十轮设想的「以本 task 归属消息 full replay」与「`history_source_conversation_id` + 消息切分」缺数据结构支撑、SHALL NOT 作为可执行口径。故 SHALL 明确：① **新业务 run 强制 `conversation_id` 非空**（正常创建路径已满足，见 task:conversation 1:1）;② **所有可执行 task 必须拥有非 NULL conversation**——`conversation_id IS NULL` 的 task（含无会话归属的系统/历史 task 与迁移隔离的 quarantined task）**一律不进入 claim/dispatch、不可自动执行**，此约束 SHALL 落为**三层硬门**（Review 第十二轮 P0-A，任一层单独即可挡住，三层纵深防御）：**(1) dispatch 拒绝**——`POST /tasks/{id}/dispatch` 创建可执行 run 前 SHALL 校验目标 task `conversation_id IS NOT NULL`，为空则拒绝入队并返回结构化人工迁移原因，SHALL NOT 入队一个 NULL run;**(2) scheduler 排除**——调度器/auto-dispatch 扫描候选 task 时 SHALL 在查询谓词内 `AND conversation_id IS NOT NULL`，NULL task 不进入候选集;**(3) claim CAS 排除**——原子 claim 的 CAS 谓词 SHALL 含 `AND conversation_id IS NOT NULL`，即便脏数据绕过前两层入了队，也无法被 claim 成 running;③ 人工恢复一个 NULL/quarantined task 时，SHALL **创建独立 conversation** 并在**可审计的消息切分**后迁移对应消息（切分无法可靠判定时保持 quarantine、**不允许「猜测迁移」**），迁移后该 task 有真 conversation、进入 1:1 约束、正常 full replay/resume;④ **存量 `conversation_id IS NULL` 的 queued/claimed/running 行 SHALL 在 activate 前统一 quarantine/人工迁移**，SHALL NOT 让其在硬门上线后停留在可执行状态;⑤ 若未来确需支持永久 NULL task，SHALL 新增明确的消息 scope（如 `message_scope_type + message_scope_id` 或可空 `task_id`）并定义 user/assistant/system/tool 全部读写 SQL，SHALL NOT 只加一个 `history_source_conversation_id` 指针。当前**不引入**永久 NULL task 模型，统一走「可执行必有真 conversation」。
 
 #### Scenario: 首次执行建立 session
 - **WHEN** 某 Agent 在某 task 首次被触发执行（`agent_sessions` 无该 (conversation, agent) 行）
@@ -48,9 +48,9 @@ CREATE UNIQUE INDEX ... ON tasks(conversation_id) WHERE conversation_id IS NOT N
 - **WHEN** 某 (conversation, agent) 已有 active run（queued/claimed/running），此时该成员在同一 conversation 被再次触发
 - **THEN** partial unique index（`conversation_id` 非空组）挡下并发插入的第二条 run，触发被折叠进下一轮（queued 合并水位 / claimed·running 记 pending intent，收尾据 pending 建至多一个 successor），保证增量边界有确定推进点
 
-#### Scenario: conversation_id 为空走 task 兜底串行
-- **WHEN** 某无会话/系统 run（`conversation_id IS NULL`）的同 `(task, agent)` 并发触发
-- **THEN** 第二组 `UNIQUE(task_id, agent_slug) WHERE conversation_id IS NULL` 兜底索引保证至多一个 active，不因 conversation 为空而失去串行约束
+#### Scenario: NULL conversation 脏数据并发被存量防御索引挡下（不代表可执行，Review 第十二轮 P0-A）
+- **WHEN** 存量历史遗留某 `conversation_id IS NULL` 的行，同 `(task, agent)` 出现并发写入
+- **THEN** 第二组 `UNIQUE(task_id, agent_slug) WHERE conversation_id IS NULL` 索引保证至多一个 NULL active 行、防止脏数据并发放大;但该 NULL task **仍不可执行**——调度器/dispatch/claim 三层硬门（见下方 Requirement）拒绝 `conversation_id IS NULL` 的 task 进入执行，该索引 SHALL NOT 被理解为「NULL run 走 task 兜底串行后即可执行」;人工恢复唯一路径 = 迁移到新独立 conversation
 
 #### Scenario: task:conversation 一对一 DB 约束拒绝共享
 - **WHEN** 迁移建立 `UNIQUE INDEX ON tasks(conversation_id) WHERE conversation_id IS NOT NULL` 后，尝试让两个 task 复用同一 conversation_id
@@ -66,11 +66,19 @@ CREATE UNIQUE INDEX ... ON tasks(conversation_id) WHERE conversation_id IS NOT N
 
 #### Scenario: 隔离 task 置列值后 UNIQUE index 可成功创建（Review 第九轮）
 - **WHEN** 多 task 共享同一 conversation_id，按保留规则留一个 task 原值、其余 task 隔离——把隔离 task 的 `conversation_id` 置 `NULL` 并写入 `quarantined_from_conversation_id` lineage（或为其新建独立 conversation）
-- **THEN** partial unique index（`WHERE conversation_id IS NOT NULL`）覆盖的行不再有重复 conversation_id，`UNIQUE INDEX ON tasks(conversation_id)` 成功创建;隔离 task 走 `(task_id, agent_slug) WHERE conversation_id IS NULL` 兜底串行;lineage 列可人工追溯/回迁;SHALL NOT 出现「业务层标记隔离但 conversation_id 仍为重复值导致 index 创建失败」
+- **THEN** partial unique index（`WHERE conversation_id IS NOT NULL`）覆盖的行不再有重复 conversation_id，`UNIQUE INDEX ON tasks(conversation_id)` 成功创建;隔离 task 的 `(task_id, agent_slug) WHERE conversation_id IS NULL` 索引仅作存量脏数据并发防御（**该 task 不可执行**，第十二轮 P0-A）;lineage 列可人工追溯/回迁;SHALL NOT 出现「业务层标记隔离但 conversation_id 仍为重复值导致 index 创建失败」
 
 #### Scenario: 无真 conversation 的 task 一律不可执行（Review 第十一轮 P1-C）
 - **WHEN** 任一 `conversation_id IS NULL` 的 task（quarantined task，或无会话归属的系统/历史 task）被调度器扫描或被触发
 - **THEN** 该 task **不进入 claim/dispatch、不可自动执行**、不自动 full replay;系统仅在 Runtime 提供人工出口（迁移到新 conversation）;SHALL NOT 以 NULL 空历史执行、SHALL NOT 直接用 lineage conversation 的全部消息执行、SHALL NOT 靠不存在的 `task_id` 查询「本 task 消息」
+
+#### Scenario: NULL task 三层硬门纵深拦截（Review 第十二轮 P0-A）
+- **WHEN** 分别在 dispatch、scheduler、claim 三个入口尝试执行一个 `conversation_id IS NULL` 的 task（含构造脏数据直接插入 queued 行的情形）
+- **THEN** ① dispatch 校验拒绝入队并返回结构化人工迁移原因;② scheduler 查询谓词 `AND conversation_id IS NOT NULL` 使其不进候选集;③ claim CAS 谓词 `AND conversation_id IS NOT NULL` 使脏数据绕过前两层也无法被 claim 成 running;三层任一单独即可挡住，纵深防御下 NULL task 零执行
+
+#### Scenario: 存量 NULL 行 activate 前统一隔离（Review 第十二轮 P0-A）
+- **WHEN** 硬门 activate 前，库中存在 `conversation_id IS NULL` 的 queued/claimed/running 行
+- **THEN** 迁移 SHALL 先把这些行 quarantine 或人工迁移到新 conversation，使 activate 后不存在停留在可执行状态的 NULL 行;SHALL NOT 让硬门只拦新入队而放过存量在途 NULL run
 
 #### Scenario: quarantined task 人工迁移到新 conversation 后正常执行
 - **WHEN** 人工把 quarantined task 迁移到一个新独立 conversation，并在可审计消息切分后把归属本 task 的消息迁入
@@ -84,9 +92,9 @@ CREATE UNIQUE INDEX ... ON tasks(conversation_id) WHERE conversation_id IS NOT N
 - **WHEN**（1:1 约束下）task A 已 active，其 conversation 不可能再挂 task B——若历史脏数据出现共享，B 的触发
 - **THEN** 按拍板 1:1 模型 B 应属独立 conversation、独立 active run，不被折叠进 A 的单 pending intent、不错投给 task A、不丢失;脏数据在迁移清理阶段被隔离
 
-#### Scenario: NULL conversation_id 的 run 走 full replay 不复用 session
-- **WHEN** 某系统/历史 run 的 `conversation_id IS NULL` 被执行
-- **THEN** 系统只用 task 级 active 串行保证不并发，SHALL NOT 创建或复用 `agent_sessions`（NULL 无法提供 task 级 session 唯一性），该 run 固定全量回灌 full replay、不带 resume;SHALL NOT 把多个 NULL run 误当同一 session
+#### Scenario: NULL conversation_id 的 run 三层硬门拒绝执行（Review 第十二轮 P0-A，删旧「NULL 固定 full replay」口径）
+- **WHEN** 某系统/历史 run 的 `conversation_id IS NULL` 被 dispatch 提交、被调度器扫描、或被 Worker claim
+- **THEN** 三层硬门各自拒绝——① dispatch 插入前拒绝 `conversation_id IS NULL` 的可执行 run;② 调度器扫描排除 `conversation_id IS NULL`;③ claim CAS 谓词含 `AND conversation_id IS NOT NULL`;该 run **不进入任何执行路径**，SHALL NOT 以 NULL「固定 full replay」执行、SHALL NOT 创建或复用 `agent_sessions`;恢复唯一路径 = 人工迁移到新独立 conversation 后按 `messages WHERE conversation_id=<新 conversation>` 正常执行
 
 #### Scenario: poisoned 时外部 pending intent 不丢
 - **WHEN** 某 attempt poisoned failure，但执行期间已有用户新触发合并成 pending intent
