@@ -107,7 +107,8 @@ retryable     = true | false                    -- 是否重排
 | attempt | `running→succeeded/failed/killed` | `running` | owner/generation/instance CAS | — | — | `terminal`/`retry_scheduled` |
 | attempt | `running→orphaned`（unsafe orphan，第八轮 P1-B） | `running` | 进程未确认死亡 | — | 是（指该 orphaned attempt） | `terminal(recovery_blocked)` |
 | attempt | `claimed→abandoned`（lease 回收放弃/未起 CLI/gate 未释放 protocol mismatch） | `claimed` | claim lease 过期 或 protocol mismatch 且 launch gate 未释放（CLI 未起） | — | — | — |
-| attempt | `claimed→orphaned`（protocol mismatch 且 gate 已释放/CLI 已起，第九轮 P0-C） | `claimed` | protocol mismatch AND launch gate 已释放（进程未确认退出） | — | 是（指该 orphaned attempt） | `terminal(recovery_blocked)` |
+| attempt | `running→orphaned`（protocol mismatch 且 gate 已释放/CLI 已起，第九轮 P0-C + 第十轮 source 对齐） | `running`（**gate 释放在 CAS 转 running 之后，故 source 必为 running 非 claimed**，见启动闸门 Requirement 步骤 2→3→4） | protocol mismatch AND launch gate 已释放（此时 attempt 已 running、进程未确认退出） | — | 是（指该 orphaned attempt） | `terminal(recovery_blocked)` |
+| attempt | `recovery_blocked→superseded`（人工确认清理后恢复，第十轮 P1-3） | `recovery_blocked` | 人工确认进程树已清理（`manual_recovery_token` 幂等键）+ 无并发 reclaim 已建 child | 否（父保持定局的 orphaned 指针） | `manual_recovery`+`superseded` | 与 unsafe orphan/protocol orphan 的 `recovery_blocked` 复用同一人工出口 |
 | attempt | `running→superseded`（交棒，第九轮拆 wildcard） | `running` | `AND worker_generation=? AND worker_instance_id=? AND current_attempt_id=?` | 交棒且前置 AND 条件满足 | — | `superseded` |
 | attempt | `claimed→superseded`（交棒发生在 CLI 起前，第九轮拆 wildcard） | `claimed` | `AND worker_generation=? AND worker_instance_id=?` | 交棒 | — | `superseded` |
 
@@ -437,7 +438,7 @@ local_safe_deadline = local_mono_before_request
 - **无法确认旧执行已停** → `recovery_blocked`，无 child。
 - **恢复预算耗尽** → `recovery_blocked`，无 child。
 
-「session 不可用」只决定 recovery mode，不应把基础设施中断记成业务 `failed`。SHALL 区分：① attempt 因业务/模型 poisoned failure 自身失败 → 按 failure/recovery policy（可禁自动重试）;② Worker 崩溃时发现已存 session 不可用 → 清 session、用 `full_replay` child。异常 reclaim 与温和交棒的父子因果链（`superseded_from`）、recovery budget、事件顺序与 `recovery_mode` SHALL 完全一致。**`recovery_blocked` SHALL 有产品闭环（Review P1-7）**：Runtime/任务详情 SHALL 展示阻塞原因、旧 pid、generation、处理建议，并提供人工「确认已清理后重试」入口（人工确认旧进程已清理 → 允许生成 recovery child 续跑），SHALL NOT 只落状态而无出口。
+「session 不可用」只决定 recovery mode，不应把基础设施中断记成业务 `failed`。SHALL 区分：① attempt 因业务/模型 poisoned failure 自身失败 → 按 failure/recovery policy（可禁自动重试）;② Worker 崩溃时发现已存 session 不可用 → 清 session、用 `full_replay` child。异常 reclaim 与温和交棒的父子因果链（`superseded_from`）、recovery budget、事件顺序与 `recovery_mode` SHALL 完全一致。**`recovery_blocked` SHALL 有产品闭环（Review P1-7）**：Runtime/任务详情 SHALL 展示阻塞原因、旧 pid、generation、处理建议，并提供人工「确认已清理后重试」入口（人工确认旧进程已清理 → 允许生成 recovery child 续跑），SHALL NOT 只落状态而无出口。**该人工入口 SHALL 走「recovery_blocked 人工恢复原子事务」（见 finish 矩阵 manual recovery 行与 Requirement，第十轮 P1-3）**——`recovery_blocked→superseded` + recovery child + `manual_recovery` 事件 + 幂等键同一提交，SHALL NOT 绕过 `finish_execution()`。
 
 #### Scenario: 硬崩溃后先接管再判死才 resume
 - **WHEN** Worker 非交棒地异常退出(崩溃),重启后 reclaim 发现残留 running run 且其有 session_id
@@ -471,7 +472,7 @@ local_safe_deadline = local_mono_before_request
 
 execution 终态与其事件同事务（本 change SSE Requirement）、session pointer/committed 水位/backlog·pending successor 同事务（[agent-session-resume] 水位与 backlog Requirement）两者各自正确，但 **SHALL 是同一个提交事务**，SHALL NOT 由两份规格分别提交（Review 第五轮 P0-4）。分别提交会产生半提交：committed 水位已推进但 execution 仍 active（恢复后该段消息被认为已消费却无成功 execution）、attempt 已成功且 session pointer 已更新但 terminal event 未提交（前端永久等待）、execution 已终态但 successor 创建失败（pending/backlog 永久丢失）、先建 successor 被 active partial unique index 拒绝（父 execution 尚未在同一事务转终态）、owner 未退休导致终态后迟到 pin/final 仍写 session、`superseded` event 已发但 recovery child 或其 queued event 不存在。
 
-系统 SHALL 定义唯一的 `finish_execution()` 事务边界，在**一次提交**内完成所有适用项：① 定局 attempt 终态;② execution 终态;③ session final 或 poisoned/fallback 清理;④ committed 水位推进;⑤ session owner retire（见 [agent-session-resume]）;⑥ backlog、pending 或 recovery successor 创建及因果关联（`superseded_from`/`history_backlog_from_execution_id`）;⑦ terminal/superseded/queued 事件写入，遵守全局事件 id 顺序（见 SSE Requirement）。任一 CAS 或唯一约束失败 SHALL 使整个事务回滚，调用方重读状态后决定退出或重试，**SHALL NOT 补偿式地继续提交剩余项**。该事务边界 SHALL 覆盖下方字段矩阵的全部完成路径：normal success、pending success、retryable failure（未达上限）、普通终局 failure（无/有 external pending）、kill、supersede、poisoned failure、history_backlog success、unsafe orphan recovery_blocked、recovery budget exhausted、protocol_incompatible（pre-claim / claimed·gate 未释放 / claimed·CLI 已起）、full_replay child（Review 第七轮 P1-1 补齐 backlog 与各类 recovery_blocked;第八轮 P0-A 拆普通终局 failure + external pending、P1-C 补 protocol_incompatible;第九轮 P0-C 拆 claimed 阶段「gate 未释放 CLI 未起」与「gate 已释放 CLI 已起」两分支）。
+系统 SHALL 定义唯一的 `finish_execution()` 事务边界，在**一次提交**内完成所有适用项：① 定局 attempt 终态;② execution 终态;③ session final 或 poisoned/fallback 清理;④ committed 水位推进;⑤ session owner retire（见 [agent-session-resume]）;⑥ backlog、pending 或 recovery successor 创建及因果关联（`superseded_from`/`history_backlog_from_execution_id`）;⑦ terminal/superseded/queued 事件写入，遵守全局事件 id 顺序（见 SSE Requirement）。任一 CAS 或唯一约束失败 SHALL 使整个事务回滚，调用方重读状态后决定退出或重试，**SHALL NOT 补偿式地继续提交剩余项**。该事务边界 SHALL 覆盖下方字段矩阵的全部完成路径：normal success、pending success、retryable failure（未达上限）、普通终局 failure（无/有 external pending）、kill、supersede、poisoned failure、history_backlog success、unsafe orphan recovery_blocked、recovery budget exhausted、protocol_incompatible（pre-claim / claimed·gate 未释放 / running·CLI 已起）、manual recovery（人工确认清理后恢复）、full_replay child（Review 第七轮 P1-1 补齐 backlog 与各类 recovery_blocked;第八轮 P0-A 拆普通终局 failure + external pending、P1-C 补 protocol_incompatible;第九轮 P0-C 拆 claimed 阶段「gate 未释放 CLI 未起」与「gate 已释放 CLI 已起」两分支;第十轮 P1-1 gate 已释放 source 对齐 running、P1-3 补 manual recovery 人工恢复事务）。
 
 **每条路径的字段写入矩阵 SHALL 明确定义（Review 第六轮 P1-5，防「成功路径顺手推进而失败/被杀路径误推 committed」）**。列含义：attempt=定局 attempt 终态;execution=execution 终态;committed=是否推进 `committed_msg_id` 水位;session=session pointer 处置;owner=owner retire;successor=后继 execution。
 
@@ -490,12 +491,15 @@ execution 终态与其事件同事务（本 change SSE Requirement）、session 
 | recovery budget exhausted（Review 第七轮 P1-1） | 定局 attempt 保持其终态 | `recovery_blocked`(`blocked_reason=recovery_budget_exhausted`) | **不推进** | 保留 `session_id`（供人工恢复） | retire | 自动不建;**external pending intent SHALL 持久保留、由人工出口恢复**（不自动建，人工据 pending 重启） |
 | protocol_incompatible / pre-claim（Review 第八轮 P1-C） | 无（未创建 attempt） | **保持 `queued` 不变** | **不推进** | 不动 | 不涉及 | 无（Worker readiness fail-closed 不领取，execution 等兼容 Worker，SHALL NOT 污染为 recovery_blocked） |
 | protocol_incompatible / claimed·gate 未释放（CLI 未起，Review 第九轮 P0-C） | attempt 落 `abandoned`（launch gate 尚未释放，CLI 从未启动，无残留进程） | 回 `queued`（等兼容 Worker 重领，安全） | **不推进** | 不动 | retire | 无（pending 保留待兼容 Worker 领取）;仅当反复不兼容且预算耗尽才落 `recovery_blocked`(`blocked_reason=protocol_incompatible`) |
-| protocol_incompatible / claimed·CLI 已起（Review 第九轮 P0-C，防双执行） | attempt 落 `orphaned`（launch gate 已释放/CLI 已启动，进程未确认退出——与 unsafe orphan 同口径） | `recovery_blocked`(`blocked_reason=process_not_confirmed_dead`) | **不推进** | 不动（未确认停，不清） | retire | 无（`final_attempt_id` 指向该 orphaned attempt;**SHALL NOT 回 `queued`**——否则新 Worker 重领同 execution，旧 CLI 若存活则并行双执行;须完整进程树清理并经人工/可靠 reclaim 确认后才建 recovery child） |
+| protocol_incompatible / running·CLI 已起（Review 第九轮 P0-C，防双执行;第十轮 source=running） | attempt 落 `orphaned`（launch gate 已释放意味着 CAS 已转 running、CLI 已启动、进程未确认退出——source 为 `running` 非 `claimed`，与 unsafe orphan 同口径） | `recovery_blocked`(`blocked_reason=process_not_confirmed_dead`) | **不推进** | 不动（未确认停，不清） | retire | 无（`final_attempt_id` 指向该 orphaned attempt;**SHALL NOT 回 `queued`**——否则新 Worker 重领同 execution，旧 CLI 若存活则并行双执行;须完整进程树清理并经人工/可靠 reclaim 确认后才建 recovery child） |
+| manual recovery（人工确认清理后恢复，第十轮 P1-3） | 父定局 orphaned attempt 保持不变 | 父 `recovery_blocked→superseded` | **不推进**（由 child 完成后推进） | 交由 recovery child 继承 | 已 retire（不重复） | **恰好 1 个 recovery child**（`superseded_from`+`recovery_mode`+`manual_recovery_token` 幂等键;人工点击与 reclaim 并发至多一个 child） |
 | full_replay child（作为普通 execution 收尾） | 依其结果 `succeeded`/`failed` | 依其结果 `done`/`failed`/`queued`(retry) | 成功才**推进**（与 normal success 同规则） | 无 session 起步→成功后 final 落新 session;失败按对应失败路径 | retire | 同 normal/retry 规则 |
 
 **只有 normal success / pending success / history_backlog success / full_replay child success 路径 SHALL 推进 `committed_msg_id`;retryable failure / kill / supersede / poisoned failure / recovery_blocked 各类路径 SHALL NOT 推进 committed**——失败/被杀/交棒/阻塞不代表这批原始消息已被成功消费，推进会使恢复后这批消息被误判已消费而丢失。
 
 **`recovery_blocked` SHALL 带结构化 `blocked_reason`（Review 第七轮 P1-1）**，至少区分：`process_not_confirmed_dead`（无法确认旧进程已停）/ `recovery_budget_exhausted`（恢复预算耗尽）/ `poisoned_session`（session 不可用且已按 poisoned policy 处理）/ `protocol_incompatible`（协议版本不兼容 fail-closed）。人工出口据 `blocked_reason` 给不同处理建议。
+
+**🔴 recovery_blocked 的人工恢复 SHALL 走完整原子事务、不得绕过 `finish_execution()`（Review 第十轮 P1-3）**：人工在 Runtime 点击「确认已清理后重试」时，SHALL 复用 `finish_execution()` 的同一原子协议，在**一次提交**内完成：① 父 execution `recovery_blocked→superseded`（CAS 条件 `WHERE status='recovery_blocked' AND id=?`）;② 创建**恰好一个** recovery child execution（`queued`，`superseded_from=父` + `recovery_mode`——有安全 session→`session_resume`/无或失效→`full_replay`）;③ 写 `manual_recovery` + 父 `superseded` + 子 `queued` 事件（遵全局 id 顺序）;④ 幂等键。父定局的 `orphaned`（或其他 blocked）attempt 指针保持不变;owner 此前已在落 recovery_blocked 时 retire，不重复 retire。**人工恢复复用 `superseded_from` 因果键，SHALL NOT 新增 `recovered_from` 第二套父子键**（自动交棒与人工恢复共用同一恢复链模型，consistency probe/消费者只认一套）。**幂等：人工重复点击、或人工点击与后台 reclaim 并发 SHALL 至多创建一个 child**——用唯一幂等键 `UNIQUE(recovery_chain_id, manual_recovery_token)`（或复用 `superseded_from` 唯一约束「一个父至多一个 recovery child」），第二次尝试 CAS/唯一约束失败即视为已恢复、不再建 child。人工恢复前置 SHALL 与自动 recovery child 一致：**仅在人工确认「完整进程树已清理」后**才允许（`process_not_confirmed_dead` 的语义前提未变），SHALL NOT 让人工入口跳过进程树清理确认。
 
 **🔴 普通终局失败不得丢失 external pending intent（Review 第八轮 P0-A）**：SHALL 把「自动 retry/recovery 判断」与「执行期间新到达的外部用户 intent 判断」**分开**——`retryable=false` 或 `retryable=true 且预算耗尽` 使 execution 落 `failed` 时，若执行期间已有外部 pending intent，SHALL 在同一 `finish_execution()` 事务内建**恰好一个普通 successor** 承接该 intent（session 安全→resume/增量;poisoned/失效→`full_replay`），SHALL NOT 因「失败」而丢弃用户新指令。**只有用户明确 kill 才取消 pending**。terminal failure 创建 pending successor SHALL 与父 execution 终态、owner retire、事件写入仍在同一 `finish_execution()` 事务内（半提交防护同其他路径）。recovery budget exhausted 落 `recovery_blocked` 时 external pending intent SHALL 持久保留、由人工出口恢复（不自动建 successor，但不丢）。此矩阵是研发实现的**真相源**，与 ASR「execution failed 后新到达 intent 仍建 successor」口径一致，不留两种合法理解。
 
@@ -559,13 +563,25 @@ execution 终态与其事件同事务（本 change SSE Requirement）、session 
 - **WHEN** 协议不兼容在 **claimed/preparing 阶段被发现，且 launch gate 尚未释放**（CLI 从未启动、无任何残留进程）
 - **THEN** attempt 落 `abandoned`，execution 回 `queued` 等兼容 Worker 重领、owner 退休、pending 保留;因 CLI 从未起、无双执行风险，回队安全;仅当反复不兼容且恢复预算耗尽才落 `recovery_blocked`(`blocked_reason=protocol_incompatible`)
 
-#### Scenario: protocol_incompatible 在 CLI 已起时不得回队（Review 第九轮 P0-C，防双执行）
-- **WHEN** 协议不兼容在 **claimed 阶段被发现，但 launch gate 已释放/CLI 已启动**（进程未确认退出）
-- **THEN** attempt 落 `orphaned`（与 unsafe orphan 同口径），execution 落 `recovery_blocked`(`blocked_reason=process_not_confirmed_dead`)、`final_attempt_id` 指向该 orphaned attempt、owner 退休;**SHALL NOT 回 `queued`**——否则新 Worker 重领同 execution、旧 CLI 若存活则并行双执行
+#### Scenario: protocol_incompatible 在 CLI 已起时不得回队（Review 第九轮 P0-C，防双执行;第十轮 source=running）
+- **WHEN** 协议不兼容被发现时 **launch gate 已释放/CLI 已启动**——按启动闸门 Requirement，gate 释放在「CAS 转 running」之后，故此时 attempt/execution 已是 `running`（进程未确认退出）
+- **THEN** attempt 从 `running` 落 `orphaned`（**source 为 `running` 非 `claimed`**，与 unsafe orphan 同口径），execution 落 `recovery_blocked`(`blocked_reason=process_not_confirmed_dead`)、`final_attempt_id` 指向该 orphaned attempt、owner 退休;**SHALL NOT 回 `queued`**——否则新 Worker 重领同 execution、旧 CLI 若存活则并行双执行
 
 #### Scenario: CLI 已起的 protocol mismatch orphan 不被重新 claim
 - **WHEN** 上一 scenario 产生的 `recovery_blocked`(`process_not_confirmed_dead`) execution 存在，调度器扫描可领取 execution
 - **THEN** 该 execution **不出现在可 claim 集合**（claim CAS 谓词排除 `recovery_blocked`）;只有完整进程树清理并经人工「确认已清理后重试」或可靠 reclaim（fencing 生效 AND 进程树确认退出）确认后，才允许生成 recovery child 或重新排队
+
+#### Scenario: recovery_blocked 人工恢复走 finish_execution 原子事务
+- **WHEN** 某 `recovery_blocked(process_not_confirmed_dead)` execution，人工在 Runtime 点击「确认已清理后重试」
+- **THEN** 在一次提交内：父 `recovery_blocked→superseded`（CAS `WHERE status='recovery_blocked'`）+ 建恰好一个 recovery child（`queued`，`superseded_from=父`，有安全 session→`session_resume`/否则 `full_replay`）+ 写 `manual_recovery`/父 `superseded`/子 `queued` 事件（遵全局 id 顺序）+ 幂等键;任一步失败整体回滚，SHALL NOT 绕过 `finish_execution()` 或分离提交;复用 `superseded_from` 因果键，SHALL NOT 新增 `recovered_from`
+
+#### Scenario: 人工恢复重复点击与并发 reclaim 幂等
+- **WHEN** 人工连续点击「确认已清理后重试」多次，或人工点击与后台 reclaim 同时尝试恢复同一 `recovery_blocked` execution
+- **THEN** 唯一幂等键 `UNIQUE(recovery_chain_id, manual_recovery_token)`（或 `superseded_from` 唯一约束）保证**至多一个 recovery child**;第二次及以后尝试 CAS/唯一约束失败即视为已恢复、不再建 child、不重复推进任何状态
+
+#### Scenario: 人工恢复不得跳过进程树清理确认
+- **WHEN** 某 `recovery_blocked(process_not_confirmed_dead)` execution 的旧进程树尚未确认清理，人工尝试恢复
+- **THEN** 人工入口 SHALL 要求先确认「完整进程树已清理」才放行恢复，SHALL NOT 让人工点击跳过该确认直接建 child（否则重新引入旧进程与新 attempt 双执行）
 
 #### Scenario: 普通 retry 始终同 execution 新 attempt，不建 recovery child
 - **WHEN** attempt#1 瞬时失败（`failed`+`retryable=true`，未达恢复上限）
