@@ -22,7 +22,7 @@ CREATE UNIQUE INDEX ... ON tasks(conversation_id) WHERE conversation_id IS NOT N
 **历史重复迁移 SHALL 是可执行、可回滚的完整流程（Review 第八轮 P1-D，「迁移前清理历史重复」不足以直接实施）**：
 1. **dry-run 查询**：先输出所有重复 `conversation_id` 及其关联的 task、messages、run_queue、task_runs、agent_sessions（人工可审），SHALL NOT 静默改数据。
 2. **保留规则确定性**：明确重复中哪个 task 保留原 conversation（如最早创建/有 active run 的 task），规则 SHALL 确定、可复现。
-3. **其他 task 处置**：其余 task SHALL 二选一——隔离阻断（标记需人工处理、不进 1:1 约束）或新建 conversation 并迁移其消息/执行历史;当前默认隔离阻断，需迁移历史时人工确认。
+3. **其他 task 处置（隔离必须让 UNIQUE index 可创建，Review 第九轮）**：partial unique index 谓词是 `WHERE conversation_id IS NOT NULL`，因此「隔离阻断」若保留原重复 `conversation_id` 值，第 5 步建 index 仍会因重复而失败。隔离 SHALL 落到具体列值二选一——① **隔离 task 的 `conversation_id` 置 `NULL`**（退出 partial index 覆盖），同时把原值存入新增 lineage 列 `quarantined_from_conversation_id`（保留血缘、可人工追溯/回迁），该 task 转由 `(task_id, agent_slug) WHERE conversation_id IS NULL` 兜底串行、固定 full replay、不复用 agent_sessions（与 NULL run 口径一致）;② 或**为隔离 task 新建独立 conversation 并迁移其消息/执行历史**（使 conversation 粒度与 task 粒度重新一一对应）。当前默认走 ①（置 NULL + lineage，最小侵入、不复制历史）;需要保留独立会话上下文时人工选 ②。SHALL NOT 只在业务层「标记需人工处理」而不改 `conversation_id` 列值——否则 index 建不出来。
 4. **不串档**：迁移 SHALL 保证 `agent_sessions`、pending intent、`run_queue`、`task_runs` 归属正确 task/conversation，SHALL NOT 把 A 的 session/run 串到 B。
 5. **原子回滚**：`UNIQUE INDEX` 创建 SHALL 在清理事务成功后进行;创建失败 SHALL 整体回滚，不留部分重写。
 6. **备份 + 完整性校验**：迁移前 SHALL `VACUUM INTO`/online backup 安全备份，迁移后运行完整性探针核对无孤儿/串档。
@@ -61,6 +61,10 @@ CREATE UNIQUE INDEX ... ON tasks(conversation_id) WHERE conversation_id IS NOT N
 #### Scenario: UNIQUE index 创建失败整体回滚
 - **WHEN** 迁移清理 + 建 `UNIQUE INDEX` 过程中任一步失败（如仍有未清理重复）
 - **THEN** 整个迁移事务回滚，不留部分重写;迁移前已 `VACUUM INTO`/online backup 备份，迁移后完整性探针核对无孤儿/串档
+
+#### Scenario: 隔离 task 置列值后 UNIQUE index 可成功创建（Review 第九轮）
+- **WHEN** 多 task 共享同一 conversation_id，按保留规则留一个 task 原值、其余 task 隔离——把隔离 task 的 `conversation_id` 置 `NULL` 并写入 `quarantined_from_conversation_id` lineage（或为其新建独立 conversation）
+- **THEN** partial unique index（`WHERE conversation_id IS NOT NULL`）覆盖的行不再有重复 conversation_id，`UNIQUE INDEX ON tasks(conversation_id)` 成功创建;隔离 task 走 `(task_id, agent_slug) WHERE conversation_id IS NULL` 兜底串行、full replay、不复用 agent_sessions;lineage 列可人工追溯/回迁;SHALL NOT 出现「业务层标记隔离但 conversation_id 仍为重复值导致 index 创建失败」
 
 #### Scenario: 跨 task 共享 conversation 的触发不丢不错投
 - **WHEN**（1:1 约束下）task A 已 active，其 conversation 不可能再挂 task B——若历史脏数据出现共享，B 的触发

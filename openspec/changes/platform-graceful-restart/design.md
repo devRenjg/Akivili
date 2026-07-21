@@ -66,9 +66,12 @@ attempt 层（task_runs.status）：
 claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功 = execution 的定局 attempt)
                              ├─→ failed             (含 failure_stage=prestart|running，第六轮 P1-2 方案 B)
                              ├─→ killed
-                             ├─→ abandoned          (非定局；lease 回收后旧 attempt 落此态)
+                             ├─→ abandoned          (非定局；claimed lease 回收后旧 attempt 落此态，CLI 未起)
+                             ├─→ orphaned           (running 中未确认死亡的孤儿；进程可能存活，非 abandoned，第八轮 P1-B)
                              └─→ superseded
   失败正交字段：failure_stage(prestart|running) + failure_class(infra|config|business) + retryable(bool)
+  abandoned vs orphaned：abandoned=claimed lease 回收、CLI 从未起、无残留进程、可安全回队；
+                         orphaned=running 中进程树未确认退出、驱动 execution=recovery_blocked、不得回队
 ```
 
 - **无 accepted 独立态（Review P0-A，用户拍板删）**：`POST /tasks/{id}/dispatch` 在**同一事务**内写用户消息 + 建 `queued` execution，**事务提交后才返回** `execution_id`（= run_queue_id）。不设「已 accepted 但未 queued」的悬空态，省一个 outbox/promoter + orphan sweeper。
@@ -77,7 +80,7 @@ claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功
 - **running**：CLI 已起、`pid + pid_create_time + worker_generation + worker_instance_id` 落该 attempt 行。`claimed→running` 亦用 CAS（校验 `claim_owner`/`claim_generation` 未变才转）。
 - **终态**：execution 终态 `done`/failed/killed/superseded/recovery_blocked（成功=`done`，非 `succeeded`），由定局 attempt 决定，均以 CAS 落定（自然完成 `SET status='done' WHERE status='running' AND worker_generation=? AND worker_instance_id=?`，或 reclaim 场景的 generation CAS）；定局 attempt 成功=`succeeded` 驱动 execution=`done`，非定局 attempt 落 `abandoned/superseded`（失败 attempt 一律 `failed` + `failure_stage`，第六轮 P1-2 方案 B）。`recovery_blocked` 为 dead-letter 终态，需人工介入，不自动再生成 recovery child。
 
-**状态消费者矩阵（Review P0-A：从阶段 6 前移到阶段 0/1）**：引入 `claimed`/`superseded` 后，所有只认 `queued`/`running` 的消费者（progress 聚合、Runtime 总览、任务自动流转、孤儿巡检、失败归因、前端 `RunRow.vue`/`Runtime.vue` 状态色）**必须同步识别新状态**，否则会把 `claimed` 误判为空闲、把 `superseded` 落入成功图标。完整状态矩阵 + 允许转换表在阶段 1 引入状态时同步落地，不留到阶段 6。
+**状态消费者矩阵（Review P0-A：从阶段 6 前移到阶段 0/1；第九轮补 `orphaned`）**：引入 `claimed`/`superseded`/`orphaned` 后，所有只认 `queued`/`running` 的消费者（progress 聚合、Runtime 总览、任务自动流转、孤儿巡检、失败归因、前端 `RunRow.vue`/`Runtime.vue` 状态色）**必须同步识别新状态**，否则会把 `claimed` 误判为空闲、把 `superseded` 落入成功图标、把 `orphaned` 误当业务 failed 或 abandoned。`orphaned`（第八轮 P1-B）SHALL 全消费者对齐：不计业务失败率、Runtime 显示「孤儿·进程未确认退出」+ 旧 pid/generation + 人工「确认已清理后重试」入口、`final_attempt_id` 指向它、其 execution=`recovery_blocked(process_not_confirmed_dead)`、纳入孤儿巡检但不触发自动流转、SSE terminal/recovery payload 带 orphaned+blocked_reason。完整状态矩阵 + 允许转换表在阶段 1 引入状态时同步落地，不留到阶段 6。
 
 **7 条不变量**（实现必须逐条满足）：
 
@@ -195,22 +198,23 @@ claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功
   - **优雅交棒（3 态 ack）**：`running(g) → draining(g)`（旧 Worker 停领、杀在跑 CLI、superseded+入队 recovery child、置 done） → 新 Worker 读到旧 generation `done` 才 **`g+1` 接管**（ack）。
   - **硬崩溃接管（lease 过期 CAS）**：旧 Worker 未置 `done` 就死（无 ack）→ 新 Worker **不能干等 done**，改判 `lease_expires_at < now`（心跳停摆已过期）→ 用 CAS `WHERE current_generation=g AND lease_expires_at<now SET current_generation=g+1, owner_instance_id=<new>, state=running` 抢占接管;抢占后按决策 5「先 fencing 再判死再续跑」处理残留 running run。CAS 保证并发拉起的多个新 Worker 只有一个接管成功。
 - **claim 与 draining 同一受保护决策点**：draining 后不再 claim（关闭「停领与新任务刚进」的竞态）。**权威判定 SHALL 在 claim CAS 的 WHERE 内完成**——同一条 UPDATE 校验 `worker_state.state='running'`（非 draining/done）+ `claim_generation==当前活跃 generation` + `owner_instance_id` 匹配 + lease 未过期（见 spec「原子 claim」Requirement 与任务 5.2a），不只靠进程内标志;进程内标志仅作本地快速短路，不作最终依据。单机不需 OS 分布式锁。
-- **fencing（attempt 级，第七轮 P0-4）**：`g` 世代的进程/run 不能 finalize 也不能写平台（不变量 5）;**fencing SHALL 到 attempt 级、不止 generation**——只看 `generation==current` 挡不住同世代旧 attempt（retry 残留线程 / 已 terminal 未升 generation / 交棒 kill 不完整）。`jian` 写平台两层全匹配才放行：`worker_generation==current` + `owner_instance_id==current owner`（属于当前 Worker）+ `task_runs.status='running'` + `run_queue.status='running'` + `run_queue.current_attempt_id==task_run_id`（仍是当前合法执行）+（写 session 时）owner token 匹配。交棒杀进程须确认完整进程树退出，kill 失败/超时不直接 supersede+建 child，转 `recovery_blocked` 或先完成 fencing。
+- **fencing（attempt 级，第七轮 P0-4）**：`g` 世代的进程/run 不能 finalize 也不能写平台（不变量 5）;**fencing SHALL 到 attempt 级、不止 generation**——只看 `generation==current` 挡不住同世代旧 attempt（retry 残留线程 / 已 terminal 未升 generation / 交棒 kill 不完整）。`jian` 写平台两层全匹配才放行：`worker_generation==current` + `owner_instance_id==current owner`（属于当前 Worker）+ `task_runs.status='running'` + `run_queue.status='running'` + `run_queue.current_attempt_id==task_run_id`（仍是当前合法执行）+（写 session 时）owner token 匹配。交棒杀进程须确认完整进程树退出，kill 失败/超时不直接 supersede+建 child;child 启动前置 = 「fencing 生效 **AND** 完整进程树确认退出/containment 清理」双条件（第八轮 P0-B，SHALL NOT 用「或先完成 fencing」OR 口径——仅 fencing 挡不住残留 CLI 改文件/shell/外部 API），任一未满足转 `recovery_blocked`(`process_not_confirmed_dead`) 不建 child。
 - 多个重启请求：单机场景后到的重启覆盖前一个 draining 意图即可，不需 restart_requests 表管合并。
 
 ### 决策 9：SSE 续传完整契约——统一事件序列游标（Review P0-7/P0-E）
 
-SSE 不止「带最大 log id 重连」，需完整契约。**核心修正：Last-Event-ID SHALL NOT 用 `run_logs.id`**——控制事件（`queued/run_started/superseded/terminal`）不写在 `run_logs` 里，用 log id 当游标会导致这些控制事件在重连后**漏投或错序**（例如断线期间刚好发生 superseded，重连按 log id 续传收不到跳转事件，前端卡在死 run）。
+SSE 不止「带最大 log id 重连」，需完整契约。**核心修正：Last-Event-ID SHALL NOT 用 `run_logs.id`**——控制事件（`queued/run_claimed/run_started/retry_scheduled/superseded/terminal`）不写在 `run_logs` 里，用 log id 当游标会导致这些控制事件在重连后**漏投或错序**（例如断线期间刚好发生 superseded，重连按 log id 续传收不到跳转事件，前端卡在死 run）。
 
 - **新增 `execution_events` 统一事件表 + 全局 AUTOINCREMENT 游标（Review P0-3）**：`(id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id, event_type, payload_json, created_at)`。**游标用全局自增 `id`**，不自己算 per-execution seq——`SELECT MAX(seq)+1` 在 API/Worker/日志线程/终态线程并发写时会竞争或撞唯一键。SSE 查询 `WHERE execution_id=? AND id > ? ORDER BY id`，`id: <全局id>` 做 Last-Event-ID。全局自增在 execution 内**有间隙没关系**（只要单调），实现最简、天然原子（SQLite AUTOINCREMENT 由引擎保证）。（备选：run_queue 加 `next_event_seq` 用 `UPDATE ... SET next_event_seq=next_event_seq+1 RETURNING` 原子分配 per-execution seq；本方案取更简的全局自增。）**所有** SSE 事件（含 log 与所有控制事件）都先落这张表再推。
 - **🔴 双写同事务（Review P0-3，避免半提交）**：状态/数据写入与其对应事件写入 SHALL 在**同一事务**提交，否则会出现「有日志无 log event」「已终态但 SSE 永远收不到 terminal」「recovery child 已建但父 execution 无 superseded 跳转」。必须同事务的组合：
   - POST 用户消息 + queued execution + `queued` event
   - run_log 行 + `log` event
-  - `claimed`/`running` 状态转换 + `run_started` event
+  - `queued→claimed` 状态转换 + `run_claimed` event（领取、CLI 未起，第九轮）
+  - `claimed→running` 状态转换 + `run_started` event（CLI 启动，唯一发 run_started）
   - 终态转换 + `terminal` event
   - `superseded` + recovery child 入队 + `superseded` event
 - **`run_logs` 加 `meta_json` 列**：承载 log 事件需要的结构化附加信息（channel/tool/tool_input/tool_output 等），使 log 事件可从 run_logs + meta 完整重建，`execution_events` 的 log 行只需引用 run_log id。
-- 事件类型：`queued / run_started{task_run_id, attempt_no} / log{run_log_id,channel,content,tool,tool_input,tool_output,meta} / superseded{successor_execution_id} / terminal{status} / heartbeat`（heartbeat 不落表、不占游标）。
+- 事件类型：`queued / run_claimed{task_run_id, attempt_no}（领取、CLI 未起，第九轮） / run_started{task_run_id, attempt_no}（CLI 启动） / retry_scheduled{attempt_id, attempt_no, failure_stage, failure_class, retryable, next_retry_at} / log{run_log_id,channel,content,tool,tool_input,tool_output,meta} / superseded{successor_execution_id} / terminal{status} / heartbeat`（heartbeat 不落表、不占游标）。
 - **重连**：客户端带 `Last-Event-ID: <id>` → 服务端 `SELECT ... FROM execution_events WHERE execution_id=? AND id > ? ORDER BY id` 回放，控制事件与 log 事件**统一有序、不重不漏**。
 - **superseded 跳转 + 全局游标续订（Review 第四轮 P0-5：删除「独立 id 序列」表述）**：run 被交棒中断 → 同事务按固定插入顺序「建 recovery child execution → 写父 `superseded{successor_execution_id}` event → 写 child 的 `queued` event → 提交」，使 child queued event 的全局 id **必然大于**父 superseded event id → 前端收到父 superseded 后订阅 successor，**继续携带当前全局 `Last-Event-ID`**（`execution_events.id` 全局单调，不存在 per-execution 独立序列，不重置游标），服务端 `WHERE execution_id=child AND id > last_global_id ORDER BY id` 即无损取到 child queued 及后续。断线期间发生的 superseded 因落在 execution_events，重连必能收到。
 - queue 尚未建 attempt 时订阅 → 先收 `queued` 占位（同样是 execution_events 的一条）。
@@ -224,7 +228,7 @@ SSE 不止「带最大 log id 重连」，需完整契约。**核心修正：Las
 
 **T1 — SSE 统一事件序列 + 断点续传（M1 唯一改造）**：SSE 端点从「直连 CLI stdout 边读边推」改为「尾随 `execution_events`」——所有 log 与控制事件先落 `execution_events(id AUTOINCREMENT, execution_id, ...)` 再推;查 `execution_events WHERE execution_id=? AND id > <前端已收最大 id> ORDER BY id`,轮询(~200ms)推新增。前端重连带 `Last-Event-ID:<id>` 即从断点续,控制事件与 log 统一不重不漏（含断线期间的 superseded/terminal，见决策 9）。CLI 写 run_logs 的**调用入口与日志语义不变**(Worker 线程 → `_log()`)，但因 run_log 行与其 log event SHALL 同事务提交（决策 9），`_log()` 内部的 DB 写入必然改造为「同事务写 run_logs + execution_events」——表达为「调用入口/日志语义不变、内部落库改同事务」，而非「整条路径零改动」;log 事件引用 run_logs.id + `run_logs.meta_json`。（单机单 API 不需要跨节点消息中继。）
 
-**T2 — 交棒时的中断与重入队（M2.5 核心）**：交棒标记轮询到后,旧 Worker 对每个在跑 run:① `taskkill /F /T` 杀 CLI 进程树(pid 指纹防误杀);② 父 execution 落终态(`superseded`,**不触发自动流转**——不误判子任务 done/父任务 reviewing);③ **恰好入队一个子 execution（recovery child）**,标 `superseded_from=父` + 系统恢复标记豁免配额,并按有无可用 session_id 设 `recovery_mode`——有 `session_resume`、无 `full_replay`（Review 第六轮 P0-3：不再「无则落 failed 从头」，统一走 recovery child 状态机）。新 Worker 领取子 execution,`session_resume` 重发原 prompt 交 [agent-session-resume] resume 起 CLI、`full_replay` 从平台消息重建上下文起 CLI。
+**T2 — 交棒时的中断与重入队（M2.5 核心）**：交棒标记轮询到后,旧 Worker 对每个在跑 run:① `taskkill /F /T` 杀 CLI 进程树(pid 指纹防误杀);② **确认前置**——`taskkill` 只是发起终止，SHALL 校验「fencing 已生效 **AND** 完整进程树已确认退出/containment 已确认清理（所有后代进程，非只根 PID）」双条件（与决策 5「交棒/reclaim child 启动前置」同一真相源），双条件满足才继续 ③;任一未满足 → 父 execution 落 `recovery_blocked`(`blocked_reason=process_not_confirmed_dead`)、**不建 child**、保留 pid/create_time/generation/instance/containment 待人工;③ 父 execution 落终态(`superseded`,**不触发自动流转**——不误判子任务 done/父任务 reviewing);④ **恰好入队一个子 execution（recovery child）**,标 `superseded_from=父` + 系统恢复标记豁免配额,并按有无可用 session_id 设 `recovery_mode`——有 `session_resume`、无 `full_replay`（Review 第六轮 P0-3：不再「无则落 failed 从头」，统一走 recovery child 状态机）。新 Worker 领取子 execution,`session_resume` 重发原 prompt 交 [agent-session-resume] resume 起 CLI、`full_replay` 从平台消息重建上下文起 CLI。**SHALL NOT 用「kill 后即 supersede+child」或「或先完成 generation fencing」的 OR 口径**——仅 fencing 不挡残留 CLI 的文件/shell/外部 API 副作用。
 
 **T3 — reclaim 增强（异常重启也能续，先接管再判死才续）**：`reclaim_orphan_runs` **不再无条件假设「running 已死」**（硬崩溃可能留孤儿 CLI）——先 CAS 升 generation 接管（fencing 旧世代杜绝双写）→ 用 `pid + pid_create_time` 探活判死 → 仅确认停或已 fencing+清理时才据 `session_id` 追加入队续跑 run（`superseded_from` 幂等标）;既不能证明已停又不能保证 fencing/清理 → 置 `recovery_blocked` 进 dead-letter 不建 child（见决策 5/8）。覆盖非交棒的硬崩溃场景。
 
