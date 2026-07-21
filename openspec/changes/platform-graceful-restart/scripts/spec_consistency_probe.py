@@ -26,6 +26,13 @@
   - --self-test 增补真实长任务行、正确三分支长行、gate/source 三元、不可读文件（读取
     失败分支）共 14 例。
 
+第十一轮加固点（三类人工恢复语义 gate）：
+  - attempt 层出现 recovery_blocked（只属 execution）即违规。
+  - 终态 recovery_blocked 出现出边 →superseded 即违规（人工恢复只建 child、父终态不变）。
+  - manual_recovery_token 被误当父级唯一约束即违规（父子基数须 UNIQUE(superseded_from)）。
+  - STRUCTURAL_ALLOW 增补「纠正/自相矛盾/删除/不走/永久不变/终态不可逆」等解释旧模型语境。
+  - --self-test 增补这三类正负样本，共 19 例。
+
 用法：
     python3 spec_consistency_probe.py             # 扫描默认三份 change
     python3 spec_consistency_probe.py <root> ...  # 扫描指定文件/目录
@@ -114,11 +121,33 @@ STRUCTURAL = [
     dict(pattern=r"`?claimed`?\s*(→|->)\s*`?orphaned`?[^。；;!？|]*?(gate 已释放|CLI 已起|CLI 已启动)",
          reason="gate 已释放/CLI 已起时 source 必为 running（running→orphaned），不得写 claimed→orphaned",
          scope="segment"),
+    # 第十一轮 P1-D：三类人工恢复语义 gate。
+    # (1) attempt 层出现未定义状态 recovery_blocked（它只属 execution）。句段级匹配
+    #     「attempt … recovery_blocked」同段共现。
+    dict(pattern=r"attempt[^。；;!？|]*?(层|状态|终态|status)[^。；;!？|]*?recovery_blocked",
+         reason="recovery_blocked 只属 execution，SHALL NOT 出现在 attempt 层状态/终态",
+         scope="segment"),
+    dict(pattern=r"recovery_blocked[^。；;!？|]*?(是|为|作为)[^。；;!？|]*?attempt[^。；;!？|]*?(状态|终态)",
+         reason="recovery_blocked 只属 execution，SHALL NOT 定义为 attempt 状态/终态",
+         scope="segment"),
+    # (2) recovery_blocked 出现出边 →superseded（终态不可逆，人工恢复只建 child 不改父）。
+    dict(pattern=r"`?recovery_blocked`?\s*(→|->)\s*`?superseded`?",
+         reason="终态 recovery_blocked 不得有出边 →superseded（人工恢复只建 child、父终态不变）",
+         scope="segment"),
+    dict(pattern=r"父[^。；;!？|]*?`?recovery_blocked`?\s*(→|->|改写?为|变(成|为))\s*`?superseded`?",
+         reason="父 recovery_blocked 终态不可逆，不得改写为 superseded（人工恢复只建 child）",
+         scope="segment"),
+    # (3) manual_recovery_token 被误当父级唯一约束（父子基数必须 UNIQUE(superseded_from)）。
+    dict(pattern=r"UNIQUE\s*\([^)]*manual_recovery_token[^)]*\)[^。；;!？|]*?(保证|防|挡)[^。；;!？|]*?(一父|父.*child|至多.*child|双续|重复 child)",
+         reason="父子基数须 UNIQUE(superseded_from)，manual_recovery_token 只做请求幂等、不承担父子唯一",
+         scope="segment"),
 ]
 
 # 结构规则的豁免片段（说明「不得如此」的合法语境）——比通用整行放行更克制。
+# 含「纠正/自相矛盾/删除…可选性/不走」等词的句段，是在解释旧模型为何被废，非现行口径。
 STRUCTURAL_ALLOW = ["SHALL NOT", "不得", "禁止", "而非", "OR 口径", "不能写成", "错误", "违规",
-                    "收紧", "改成", "同一真相源", "防双执行", "旧口径"]
+                    "收紧", "改成", "同一真相源", "防双执行", "旧口径",
+                    "纠正", "自相矛盾", "删除", "不走", "永久不变", "终态不可逆"]
 
 # 行级 meta 语境标记：命中的行是「描述本 probe 自身/清理清单」的元文档，会成段
 # 罗列旧口径作为清理目标，整行豁免（仅限这类自述行，不是通用整行放行）。
@@ -335,6 +364,25 @@ def _self_test():
         Path(tmpdir).rmdir()
     except OSError:
         pass
+
+    # 14. 第十一轮 P1-D：attempt 层出现 recovery_blocked → 命中
+    check("attempt 层 recovery_blocked 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text("attempt 状态 recovery_blocked→superseded 人工恢复")))
+    # 15. 终态 recovery_blocked→superseded 出边 → 命中
+    check("recovery_blocked→superseded 出边被拦",
+          any(k == "structural" for _, k, _, _ in scan_text("人工恢复时父 recovery_blocked→superseded 并建 child")))
+    # 16. 正确口径：父 recovery_blocked 永久不变、只建 child → 放行
+    check("父终态不变只建 child 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "父 recovery_blocked 永久不变，SHALL NOT 改 superseded，只原子建一个 superseded_from=父 的 child")))
+    # 17. manual_recovery_token 误当父级唯一约束 → 命中
+    check("manual_recovery_token 冒充父级唯一约束被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "UNIQUE(recovery_chain_id, manual_recovery_token) 保证一父至多一个 child")))
+    # 18. 正确口径：UNIQUE(superseded_from) 保证父子基数 → 放行
+    check("UNIQUE(superseded_from) 父子基数放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "UNIQUE(superseded_from) 保证一父至多一个 child，token 只做请求幂等")))
 
     passed = sum(1 for _, ok in cases if ok)
     print("🧪 self-test")

@@ -25,7 +25,7 @@
 ## Capabilities
 
 ### New Capabilities
-- `agent-session-resume`: Agent 执行的 CLI 会话复用能力——每个 (conversation, agent) 维护一条 CLI session,再次执行时 resume 续接 + 只喂增量上下文,替代每次全量回灌;含首次/失败/provider 变更的降级链,保证不劣于现状。`conversation_id` 为空的历史/系统 run **只走 (task, agent) 级 active 串行兜底、固定 full replay、不创建/复用 `agent_sessions`**（第八轮 P1-F：agent_sessions 键无 task_id、SQLite UNIQUE 对 NULL 不提供 task 级 session 唯一性，故 NULL run 不是「退化到 task session」而是不建 session）。
+- `agent-session-resume`: Agent 执行的 CLI 会话复用能力——每个 (conversation, agent) 维护一条 CLI session,再次执行时 resume 续接 + 只喂增量上下文,替代每次全量回灌;含首次/失败/provider 变更的降级链,保证不劣于现状。**所有可执行 task 必须拥有非 NULL conversation**;`conversation_id` 为空的 task（历史/系统 task 与迁移隔离的 quarantined task）**一律不可执行、不进 claim/dispatch**，人工恢复时先创建独立 conversation + 可审计消息切分后迁移（第八轮 P1-F + 第十一轮 P1-C：`messages` 无 task_id、`conversation_id NOT NULL`，NULL task 无法合法读写「本 task 消息」，故不设可执行的 NULL run 口径;`agent_sessions` 键无 task_id、SQLite UNIQUE 对 NULL 不提供 task 级 session 唯一性）。
 
 ## Impact
 
