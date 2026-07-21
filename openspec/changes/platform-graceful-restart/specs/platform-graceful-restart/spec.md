@@ -146,7 +146,7 @@ SHALL NOT 用一条 `WHERE status='running'` 覆盖 source 为 `claimed`/`prepar
 
 ### Requirement: 原子 claim（CAS 单语句领取）
 
-系统 SHALL 用单语句条件更新原子领取 queued run：`UPDATE run_queue SET status='claimed', claim_owner=?, claim_generation=?, claimed_at=... WHERE id=(子查询选一条 queued) AND status='queued' RETURNING *`。`AND status='queued'` 的 CAS 条件 SHALL 保证多个 Worker 竞争同一行时至多一个成功。**claim 与 draining/generation 的互斥 SHALL 在同一条 CAS 内校验、SHALL NOT 只靠本地进程标志（Review P1-1）**：claim SQL 的 WHERE 条件 SHALL 同时校验领取者的 `worker_state.state='running'`（非 draining/done）、`claim_generation == 当前活跃 generation`、`owner_instance_id` 匹配、且 lease 未过期，任一不满足则不命中——关闭「旧世代/正在 draining 的 Worker 仍领到新活」的竞态。SHALL NOT 使用「先 SELECT 再无条件 UPDATE」的两步领取。并发上限判断在多 Worker 下 SHALL 使用原子容量机制而非「先 COUNT 再 claim」（单 Worker 阶段可用进程内 semaphore）。
+系统 SHALL 用单语句条件更新原子领取 queued run：`UPDATE run_queue SET status='claimed', claim_owner=?, claim_generation=?, claimed_at=... WHERE id=(子查询选一条 queued) AND status='queued' AND conversation_id IS NOT NULL RETURNING *`。`AND status='queued'` 的 CAS 条件 SHALL 保证多个 Worker 竞争同一行时至多一个成功。**CAS 谓词 SHALL 含 `AND conversation_id IS NOT NULL`（Review 第十二轮 P0-A，NULL task 不可执行的第三层硬门）**——即便脏数据绕过 dispatch/scheduler 前两层入了队，`conversation_id IS NULL` 的 run 也无法被 claim 成 running;调度器扫描候选与 dispatch 入队时也 SHALL 各自排除 NULL conversation（见两段式 dispatch Requirement 与 [agent-session-resume] 的「可执行 task 必须拥有非 NULL conversation」Requirement），三层任一单独即可挡住。**claim 与 draining/generation 的互斥 SHALL 在同一条 CAS 内校验、SHALL NOT 只靠本地进程标志（Review P1-1）**：claim SQL 的 WHERE 条件 SHALL 同时校验领取者的 `worker_state.state='running'`（非 draining/done）、`claim_generation == 当前活跃 generation`、`owner_instance_id` 匹配、且 lease 未过期，任一不满足则不命中——关闭「旧世代/正在 draining 的 Worker 仍领到新活」的竞态。SHALL NOT 使用「先 SELECT 再无条件 UPDATE」的两步领取。并发上限判断在多 Worker 下 SHALL 使用原子容量机制而非「先 COUNT 再 claim」（单 Worker 阶段可用进程内 semaphore）。
 
 #### Scenario: 并发竞争同一行只有一个成功
 - **WHEN** 多个 Worker 同时尝试领取同一个 queued run
@@ -164,9 +164,13 @@ SHALL NOT 用一条 `WHERE status='running'` 覆盖 source 为 `claimed`/`prepar
 - **WHEN** 同一 execution 连续两次瞬时失败后重试
 - **THEN** attempt#1/#2/#3 各保留为独立 `task_runs` 行（不互相覆盖），execution 终态由最终定局 attempt 决定，SSE 事件全部归入同一 execution 事件流
 
+#### Scenario: NULL conversation 脏数据不被 claim 成 running（Review 第十二轮 P0-A）
+- **WHEN** 构造一条 `conversation_id IS NULL` 的 queued 行（绕过 dispatch/scheduler 前两层硬门的脏数据），调度器尝试领取
+- **THEN** claim CAS 谓词 `AND conversation_id IS NOT NULL` 使其永不命中，该 NULL run 无法被任何 Worker claim 成 running;三层硬门（dispatch 拒绝 / scheduler 排除 / claim CAS 排除）任一单独即可挡住，NULL task 零执行
+
 ### Requirement: 两段式 dispatch（提交与订阅分离）
 
-系统 SHALL 把所有触发（人工 @、auto-dispatch、mention、leader 协同）统一经持久化队列，采用两段式协议：① `POST /tasks/{id}/dispatch` 接收客户端 idempotency key，**同一事务**内幂等持久化用户消息 + 创建 `queued` execution、提交后返回稳定 `execution_id`，SHALL NOT 在请求内直接执行 CLI;② `GET /executions/{execution_id}/events` 独立 SSE 订阅，按 execution_id 尾随，API 重启后可重新订阅。idempotency 作用域 SHALL 为 `UNIQUE(task_id, actor_id, idempotency_key)`;相同 key 重试 SHALL 只产生一条用户消息与一个 execution;同 key 不同 payload SHALL 返回 409。
+系统 SHALL 把所有触发（人工 @、auto-dispatch、mention、leader 协同）统一经持久化队列，采用两段式协议：① `POST /tasks/{id}/dispatch` 接收客户端 idempotency key，**同一事务**内幂等持久化用户消息 + 创建 `queued` execution、提交后返回稳定 `execution_id`，SHALL NOT 在请求内直接执行 CLI;**创建 `queued` execution 前 SHALL 校验目标 task `conversation_id IS NOT NULL`（Review 第十二轮 P0-A，NULL task 不可执行的第一层硬门），为空 SHALL 拒绝入队并返回结构化人工迁移原因，SHALL NOT 入队一个 NULL conversation 的可执行 run**;调度器/auto-dispatch 扫描候选 task 时 SHALL 在查询谓词内 `AND conversation_id IS NOT NULL`（第二层硬门）;② `GET /executions/{execution_id}/events` 独立 SSE 订阅，按 execution_id 尾随，API 重启后可重新订阅。idempotency 作用域 SHALL 为 `UNIQUE(task_id, actor_id, idempotency_key)`;相同 key 重试 SHALL 只产生一条用户消息与一个 execution;同 key 不同 payload SHALL 返回 409。
 
 #### Scenario: 提交不在请求内执行
 - **WHEN** 用户人工 @ 一位成员触发执行
@@ -304,6 +308,8 @@ THEN 父 execution 才允许 superseded + recovery child 入队
 
 API 的 SSE 端点 SHALL 把输出近实时推送给前端而非直连 CLI stdout。**续传游标 SHALL 用统一事件表 `execution_events(id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id, event_type, payload_json, created_at)` 的全局自增 `id`，SHALL NOT 用 `run_logs.id`，SHALL NOT 用 `SELECT MAX(seq)+1` 自算 per-execution seq**（并发写会竞争/撞唯一键）——控制事件（queued/**run_claimed**/run_started/**retry_scheduled**/superseded/terminal）不写在 run_logs，用 log id 做游标会导致断线期间的控制事件（如 superseded 跳转）重连后漏投或错序;全局自增 id 由引擎原子分配，execution 内有间隙不影响单调性。`run_claimed`（领取、CLI 未起）与 `run_started`（CLI 启动）SHALL 是两个不同事件（第九轮缺陷3），SHALL NOT 让 `queued→claimed` 与 `claimed→running` 都发 `run_started`。**`retry_scheduled` 为 attempt 边界控制事件（Review 第七轮 P1-6）**：同一 execution 多 attempt 共用一条事件流，attempt#N failed 回队时 SHALL 与 attempt 状态转换**同事务**写 `retry_scheduled{attempt_id, attempt_no, failure_stage, failure_class, retryable, next_retry_at}`——否则前端只会先后看到两个 `run_started` 而无法解释中间的失败、退避与 attempt 编号变化;execution terminal event 只在 execution 真正落终态时出现。所有 SSE 事件（log 与全部控制事件）SHALL 先落 `execution_events` 再推，`id: <全局id>` 为唯一游标;`run_logs` SHALL 加 `meta_json` 列承载 log 事件的结构化附加信息（channel/tool/tool_input/tool_output），log 事件可从 run_logs + meta 完整重建。**状态/数据写入与其对应事件写入 SHALL 同事务提交**（POST 消息+queued execution+queued event；queued→claimed+run_claimed event；claimed→running+run_started event；run_log+log event；终态+terminal event；superseded+recovery child+superseded event），SHALL NOT 分离提交而出现「有日志无 event」「已终态无 terminal event」「有 recovery child 无 superseded 跳转」。CLI 输出写 `run_logs` 的**调用入口与日志语义 SHALL 保持不变**(Worker 线程 → `_log()`)，但因 run_log 行与其 log event SHALL 同事务提交，`_log()` 内部落库 SHALL 改为「同事务写 run_logs + execution_events」，SHALL NOT 表述为「整条路径零改动」（Review 第四轮 P1-4）。SSE 断连重连 SHALL 携带 `Last-Event-ID: <id>` 从该 id 之后回放。**切换到 successor execution 时游标 SHALL 沿用同一条全局 `id` 序列、SHALL NOT 声称「successor 有独立 id 序列」**（Review 第四轮 P0-5）——`execution_events.id` 是全局单调自增，不存在 per-execution 独立序列。supersede 时事件插入顺序 SHALL 固定为「建 recovery child execution → 写父 execution 的 `superseded{successor_execution_id}` event → 写 child 的 `queued` event → 提交」，使 child 的 `queued` event 全局 id **必然大于**父 superseded event 的 id;客户端收到父 superseded 后订阅 child 时 SHALL 继续携带当前全局 `Last-Event-ID`，服务端按 `WHERE execution_id=:child AND id > :last_global_id ORDER BY id` 即可无损获得 child 的 queued 及后续事件，SHALL NOT 因「切 execution」把游标重置或漏取 child queued。（若产品选择 child 订阅不带 Last-Event-ID、完整回放 child，则 SHALL 明确幂等去重规则，两种口径不并存。）**terminal/superseded 后 SHALL 封闭旧 execution/attempt 的事件流（Review 第五轮 P1-8）**：终态或 superseded 事件写入后，对旧 attempt 的任何 log/control event append SHALL 再做 `owner/generation/status` CAS 校验——CAS 失败（该 attempt 已非当前 owner 或 execution 已终态）即丢弃该 event 或写入隔离审计表，SHALL NOT 进入用户事件流。否则迟到的父日志可能在 child queued 之后取得更大的全局 id，虽不漏数据但前端会看到终态后的父输出、甚至被错误消费者当成有效结果。
 
+**🔴 `recovery_blocked` 父的人工恢复 SHALL NOT 向已封闭的父事件流追加任何事件（含 `manual_recovery`），发现 child 走「POST 响应 + 查询」而非父流迟到事件（Review 第十二轮 P0-B，修第十一轮引入的封流冲突）**：`superseded` 是父的**最后一个**事件、且它带 `successor_execution_id`，故交棒/reclaim 路径的客户端能在父流内收到 superseded 后按全局游标切 child（见下方 supersede scenario）;但 **`recovery_blocked` 是终态、父流在 `terminal(recovery_blocked)` 后已永久封闭**，人工恢复发生在父终态**之后**，此时 SHALL NOT 再向父流写 `manual_recovery`（会破坏「终态是父流最后一个事件」的封流不变量、且父终态后关闭订阅的客户端也收不到）。因此：① **`manual_recovery{recovery_parent_id, recovery_source(manual|reclaim), blocked_reason, request_token?}` SHALL 作为 recovery child 事件流的首个控制事件**（写在 child `queued` event 之前或同批、绑 child 的 execution_id）**或**写入**独立恢复审计表**，SHALL NOT append 到父 execution 的事件流;② 触发恢复的调用端 SHALL 从 **`POST /executions/{parent_id}/resume` 响应体**直接得到 `child_execution_id`，据此订阅 child 流（`GET /executions/{child_id}/events`），不依赖父流迟到事件;③ 未持有 POST 响应的其他客户端 SHALL 经 **`GET /executions/{parent_id}` 查询** 得到 `recovery_child_id`/`recovery_resolution` 发现 child。父流封闭不变量对所有终态（含 `recovery_blocked`）一致成立。
+
 #### Scenario: 尾随近实时呈现
 - **WHEN** CLI 持续产出输出、Worker 写入 run_logs 并同事务落 log 类 execution_events
 - **THEN** 前端经 SSE 近实时(亚秒级延迟)逐段看到新输出,体验与直连 stdout 基本一致
@@ -440,7 +446,7 @@ local_safe_deadline = local_mono_before_request
 - **无法确认旧执行已停** → `recovery_blocked`，无 child。
 - **恢复预算耗尽** → `recovery_blocked`，无 child。
 
-「session 不可用」只决定 recovery mode，不应把基础设施中断记成业务 `failed`。SHALL 区分：① attempt 因业务/模型 poisoned failure 自身失败 → 按 failure/recovery policy（可禁自动重试）;② Worker 崩溃时发现已存 session 不可用 → 清 session、用 `full_replay` child。异常 reclaim 与温和交棒的父子因果链（`superseded_from`）、recovery budget、事件顺序与 `recovery_mode` SHALL 完全一致。**`recovery_blocked` SHALL 有产品闭环（Review P1-7）**：Runtime/任务详情 SHALL 展示阻塞原因、旧 pid、generation、处理建议，并提供人工「确认已清理后重试」入口（人工确认旧进程已清理 → 允许生成 recovery child 续跑），SHALL NOT 只落状态而无出口。**该人工入口 SHALL 走独立事务 `resume_blocked_execution()`（见下方 Requirement，第十轮 P1-3 + 第十一轮 P0-A/P1-A）**——**父 `recovery_blocked` 终态永久不变**（不改 superseded、不发第二终态事件），仅原子创建一个 `superseded_from=父` 的 recovery child + `manual_recovery`/child queued 事件，由 `UNIQUE(superseded_from)` 保证至多一个 child;SHALL NOT 复用 `finish_execution()`、SHALL NOT 二次 retire/terminal。
+「session 不可用」只决定 recovery mode，不应把基础设施中断记成业务 `failed`。SHALL 区分：① attempt 因业务/模型 poisoned failure 自身失败 → 按 failure/recovery policy（可禁自动重试）;② Worker 崩溃时发现已存 session 不可用 → 清 session、用 `full_replay` child。异常 reclaim 与温和交棒的父子因果链（`superseded_from`）、recovery budget、事件顺序与 `recovery_mode` SHALL 完全一致。**`recovery_blocked` SHALL 有产品闭环（Review P1-7）**：Runtime/任务详情 SHALL 展示阻塞原因、旧 pid、generation、处理建议，并提供人工「确认已清理后重试」入口（人工确认旧进程已清理 → 允许生成 recovery child 续跑），SHALL NOT 只落状态而无出口。**该人工入口 SHALL 走独立事务 `resume_blocked_execution()`（见下方 Requirement，第十轮 P1-3 + 第十一轮 P0-A/P1-A）**——**父 `recovery_blocked` 终态永久不变**（不改 superseded、不发第二终态事件），仅原子创建一个 `superseded_from=父` 的 recovery child + 在 **child 事件流首部**写 `manual_recovery`/child queued 事件（**不追加到已封闭的父流**，第十二轮 P0-B），由 `UNIQUE(superseded_from)` 保证至多一个 child;SHALL NOT 复用 `finish_execution()`、SHALL NOT 二次 retire/terminal。
 
 #### Scenario: 硬崩溃后先接管再判死才 resume
 - **WHEN** Worker 非交棒地异常退出(崩溃),重启后 reclaim 发现残留 running run 且其有 session_id
@@ -494,7 +500,7 @@ execution 终态与其事件同事务（本 change SSE Requirement）、session 
 | protocol_incompatible / pre-claim（Review 第八轮 P1-C） | 无（未创建 attempt） | **保持 `queued` 不变** | **不推进** | 不动 | 不涉及 | 无（Worker readiness fail-closed 不领取，execution 等兼容 Worker，SHALL NOT 污染为 recovery_blocked） |
 | protocol_incompatible / claimed·gate 未释放（CLI 未起，Review 第九轮 P0-C） | attempt 落 `abandoned`（launch gate 尚未释放，CLI 从未启动，无残留进程） | 回 `queued`（等兼容 Worker 重领，安全） | **不推进** | 不动 | retire | 无（pending 保留待兼容 Worker 领取）;仅当反复不兼容且预算耗尽才落 `recovery_blocked`(`blocked_reason=protocol_incompatible`) |
 | protocol_incompatible / running·CLI 已起（Review 第九轮 P0-C，防双执行;第十轮 source=running） | attempt 落 `orphaned`（launch gate 已释放意味着 CAS 已转 running、CLI 已启动、进程未确认退出——source 为 `running` 非 `claimed`，与 unsafe orphan 同口径） | `recovery_blocked`(`blocked_reason=process_not_confirmed_dead`) | **不推进** | 不动（未确认停，不清） | retire | 无（`final_attempt_id` 指向该 orphaned attempt;**SHALL NOT 回 `queued`**——否则新 Worker 重领同 execution，旧 CLI 若存活则并行双执行;须完整进程树清理并经人工/可靠 reclaim 确认后才建 recovery child） |
-| manual recovery（人工恢复，第十轮 P1-3 + 第十一轮 P0-A/P1-A 收口——走独立 `resume_blocked_execution()`，不复用 finish_execution 的定局语义） | 父定局 attempt（如 `orphaned`）**永久不变** | **父 `recovery_blocked` 永久不变**（终态不可逆，SHALL NOT 改 superseded） | **不推进**（由 child 完成后推进） | 交由 recovery child 继承 | **不重复 retire**（落 recovery_blocked 时已 retire） | **恰好 1 个 recovery child**（`queued`，`superseded_from=父`，`UNIQUE(superseded_from)` 强约束;`manual_recovery_token` 仅 API 请求幂等）;父**不发第二个 terminal/superseded 事件**，只发 `manual_recovery`+child `queued` |
+| manual recovery（人工恢复，第十轮 P1-3 + 第十一轮 P0-A/P1-A 收口——走独立 `resume_blocked_execution()`，不复用 finish_execution 的定局语义） | 父定局 attempt（如 `orphaned`）**永久不变** | **父 `recovery_blocked` 永久不变**（终态不可逆，SHALL NOT 改 superseded） | **不推进**（由 child 完成后推进） | 交由 recovery child 继承 | **不重复 retire**（落 recovery_blocked 时已 retire） | **恰好 1 个 recovery child**（`queued`，`superseded_from=父`，`UNIQUE(superseded_from)` 强约束;`manual_recovery_token` 仅 API 请求幂等）;父事件流已封闭、**不发第二个 terminal/superseded 事件、也不追加 `manual_recovery`**;`manual_recovery`+child `queued` 写在 **child 事件流首部**（或独立恢复审计表），调用端从 `POST /resume` 响应得 child、其他客户端经 `GET` 查询发现（第十二轮 P0-B） |
 | full_replay child（作为普通 execution 收尾） | 依其结果 `succeeded`/`failed` | 依其结果 `done`/`failed`/`queued`(retry) | 成功才**推进**（与 normal success 同规则） | 无 session 起步→成功后 final 落新 session;失败按对应失败路径 | retire | 同 normal/retry 规则 |
 
 **只有 normal success / pending success / history_backlog success / full_replay child success 路径 SHALL 推进 `committed_msg_id`;retryable failure / kill / supersede / poisoned failure / recovery_blocked 各类路径 SHALL NOT 推进 committed**——失败/被杀/交棒/阻塞不代表这批原始消息已被成功消费，推进会使恢复后这批消息被误判已消费而丢失。
@@ -513,6 +519,14 @@ execution 终态与其事件同事务（本 change SSE Requirement）、session 
 | `protocol_incompatible` | 已有满足 compatibility floor 的 Worker/readiness | 通常无需进程清理;按 session 健康度处理 | 不满 floor 时 SHALL NOT 建注定再次 blocked 的 child |
 
 每种 reason 的 external pending intent SHALL 都不丢，**kill 仍是唯一取消 pending 的路径**。该矩阵 SHALL 同步进 spec、tasks 与 Runtime 产品动作（前端据 `blocked_reason` 给不同确认表单/前置提示），每种 reason SHALL 有独立 API/事务测试，避免「UI 都显示确认清理」但后台缺真正恢复条件。
+
+**🔴 分原因的真实写操作 SHALL 全部纳入 `resume_blocked_execution()` 单一原子事务（Review 第十二轮 P1-B）**：各 `blocked_reason` 除「校验前置」外还各有**副作用写入**，SHALL NOT 让它们在建 child 之外单独提交（否则「预算已加但 child 没建」「session 已清但恢复失败」半提交）。事务内固定步骤：校验前置 → 写 reason 对应副作用 → 定 `recovery_mode` → 转移/保留 external pending → 插唯一 child（`superseded_from=父`） → 写 `manual_recovery`/`recovery_resumed`+child `queued` 事件 → 单次提交，任一步失败整体回滚。各 reason 的副作用写入：
+- `recovery_budget_exhausted`：把人工给的**新预算值写入该 recovery chain 的预算记录 + 写审计**，child 带新 budget（SHALL NOT 原值重启后立刻再 blocked）;
+- `poisoned_session`：**清除 poisoned session pointer**（禁 resume 旧 session）、强制 `recovery_mode=full_replay`;
+- 所有 reason：把 external pending intent 的归属/水位**转移到 child**（不丢用户新指令）;
+- 所有 reason：写恢复审计（`recovery_resumed`）。
+
+**唯一冲突时 SHALL NOT 重复 apply 副作用（Review 第十二轮 P1-B）**：并发或重试触发第二次 `resume_blocked_execution()` 时，`UNIQUE(superseded_from)` 冲突后 SHALL **读回并返回已存在 child、直接返回 `idempotent_replay=true`**，SHALL NOT 再次加预算 / 再次清 session / 再次转移 pending / 再写一条审计——副作用只在首次成功建 child 的事务里发生一次。
 
 **🔴 普通终局失败不得丢失 external pending intent（Review 第八轮 P0-A）**：SHALL 把「自动 retry/recovery 判断」与「执行期间新到达的外部用户 intent 判断」**分开**——`retryable=false` 或 `retryable=true 且预算耗尽` 使 execution 落 `failed` 时，若执行期间已有外部 pending intent，SHALL 在同一 `finish_execution()` 事务内建**恰好一个普通 successor** 承接该 intent（session 安全→resume/增量;poisoned/失效→`full_replay`），SHALL NOT 因「失败」而丢弃用户新指令。**只有用户明确 kill 才取消 pending**。terminal failure 创建 pending successor SHALL 与父 execution 终态、owner retire、事件写入仍在同一 `finish_execution()` 事务内（半提交防护同其他路径）。recovery budget exhausted 落 `recovery_blocked` 时 external pending intent SHALL 持久保留、由人工出口恢复（不自动建 successor，但不丢）。此矩阵是研发实现的**真相源**，与 ASR「execution failed 后新到达 intent 仍建 successor」口径一致，不留两种合法理解。
 
@@ -590,7 +604,11 @@ execution 终态与其事件同事务（本 change SSE Requirement）、session 
 
 #### Scenario: 终态父不产生第二个终态事件（late_event_after_terminal 保护）
 - **WHEN** 父 execution 已发 `terminal(recovery_blocked)`，随后人工恢复建 child
-- **THEN** 事件流只出现 `manual_recovery` + child `queued`，父 execution **不出现第二个 terminal/superseded 事件**;SSE 客户端即使在父 terminal 后关闭父订阅，也能经 `manual_recovery` 事件/查询发现 child;progress/Runtime/失败归因/`final_attempt_id` 层间映射不失真
+- **THEN** 父 execution 事件流保持封闭、**不出现第二个 terminal/superseded 事件、也不追加 `manual_recovery`**;`manual_recovery{recovery_parent_id, recovery_source, blocked_reason}` 作为 **child 事件流的首个控制事件**（或独立恢复审计表），child `queued` 紧随;progress/Runtime/失败归因/`final_attempt_id` 层间映射不失真
+
+#### Scenario: 父终态后经 POST 响应/查询发现 child 而非父流迟到事件（Review 第十二轮 P0-B）
+- **WHEN** 客户端在父 `recovery_blocked` 终态后关闭了父订阅，随后人工恢复建 child
+- **THEN** 触发恢复的调用端从 `POST /executions/{parent_id}/resume` 响应体直接取得 `child_execution_id` 并订阅 child 流;其他客户端经 `GET /executions/{parent_id}` 查询得到 `recovery_child_id`/`recovery_resolution` 发现 child;两条发现路径都 SHALL NOT 依赖向已封闭父流追加的迟到事件
 
 #### Scenario: 人工恢复至多一个 child 由 UNIQUE(superseded_from) 保证（第十一轮 P0-B）
 - **WHEN** 人工用同一 token 连续提交多次、用**不同 `manual_recovery_token` 并发**提交、或人工点击与后台 reclaim 用两个独立连接同时尝试恢复同一 `recovery_blocked` execution
@@ -599,6 +617,14 @@ execution 终态与其事件同事务（本 change SSE Requirement）、session 
 #### Scenario: 分原因恢复前置各不相同（第十一轮 P1-B）
 - **WHEN** 分别对 `process_not_confirmed_dead`/`recovery_budget_exhausted`/`poisoned_session`/`protocol_incompatible` 四种 blocked_reason 触发人工恢复
 - **THEN** `resume_blocked_execution()` 按 reason 校验不同前置——process 须确认全树退出、budget 须人工写新预算+审计、poisoned 须清 session 强制 full_replay、protocol 须有满足 floor 的 Worker;前置不满足 SHALL 拒绝建 child（不产生注定再次 blocked 的 child）;每种 reason 的 external pending 都不丢，kill 仍是唯一取消 pending 的路径
+
+#### Scenario: reason 副作用写入与建 child 同一原子事务（第十二轮 P1-B）
+- **WHEN** 对 `recovery_budget_exhausted` 恢复（写新预算+审计）、对 `poisoned_session` 恢复（清 poisoned pointer + 强制 full_replay），在插入 child 前后任一写入点注入故障
+- **THEN** 预算写入/审计/清 session/转移 pending/插 child/写事件全在 `resume_blocked_execution()` 单次提交内，任一失败整体回滚，不出现「预算已加但 child 没建」「session 已清但恢复失败」半提交;成功则 child 带新预算（不原值立刻再 blocked）、poisoned 走 full_replay
+
+#### Scenario: 唯一冲突读回已存在 child 不重复 apply 副作用（第十二轮 P1-B）
+- **WHEN** 并发/重试触发第二次 `resume_blocked_execution()`，`UNIQUE(superseded_from)` 冲突
+- **THEN** 读回并返回已存在 child、`idempotent_replay=true`，SHALL NOT 再次加预算/再次清 session/再次转移 pending/再写审计——副作用只在首次成功建 child 的事务里发生一次
 
 #### Scenario: 人工恢复不得跳过 blocked_reason 前置确认
 - **WHEN** 某 `recovery_blocked(process_not_confirmed_dead)` execution 的旧进程树尚未确认清理，人工尝试恢复
@@ -615,6 +641,84 @@ execution 终态与其事件同事务（本 change SSE Requirement）、session 
 #### Scenario: retry 产生 retry_scheduled 边界事件而非 execution terminal
 - **WHEN** attempt#1 `failed` → 退避 → attempt#2 claim
 - **THEN** 事件流出现 `retry_scheduled{attempt_id,attempt_no,next_retry_at,failure_stage,failure_class,retryable}` 与随后的 attempt#2 `run_started`，中间 SHALL NOT 出现 execution terminal event;execution terminal 只在 execution 真正落终态时出现
+
+### Requirement: 人工恢复 API 契约与恢复审计（POST /resume + 查询发现）
+
+系统 SHALL 为 `recovery_blocked` execution 的人工恢复提供明确的 API 契约，使调用端从**响应体**获得 child、其他客户端从**查询**发现 child，而非依赖向已封闭父事件流追加迟到事件（Review 第十二轮 P0-B/P1-C）。
+
+**恢复端点** `POST /executions/{parent_id}/resume` SHALL 满足：
+- **请求体**：`{blocked_reason_ack, recovery_request}`——`recovery_request` 按 `blocked_reason` 携带对应前置证据（如 `process_not_confirmed_dead` 的「进程树已清理」确认、`recovery_budget_exhausted` 的新预算值 + 审计理由）;客户端 SHALL 携带 `manual_recovery_token`（请求幂等键）。
+- **鉴权**：SHALL 要求人工恢复的操作者身份（`actor`），记入审计。
+- **成功响应**（201/200）：`{parent_execution_id, child_execution_id, recovery_mode(session_resume|full_replay), recovery_source: manual, idempotent_replay: bool}`——调用端据 `child_execution_id` 订阅 `GET /executions/{child_execution_id}/events`。
+- **幂等**：同 `manual_recovery_token` 重试 SHALL 返回**同一** `child_execution_id` 且 `idempotent_replay=true`（第二层请求幂等）;父子基数由 `UNIQUE(superseded_from)` 硬约束保证（第一层）——同父不同 token 并发时，第二个 INSERT 冲突后 SHALL 读回并返回已存在 child、`idempotent_replay=true`，SHALL NOT 报 500。
+- **前置不满足**（409/422）：`blocked_reason` 对应前置未满足（如进程树未确认清理）SHALL 拒绝并返回结构化原因，SHALL NOT 建 child。
+- **父非 recovery_blocked**（409）：父不在 `recovery_blocked` 终态时拒绝。
+- 事务 SHALL 走 `resume_blocked_execution()`（父终态不变，见上）。
+
+**查询发现** `GET /executions/{parent_id}` SHALL 在响应中返回 `recovery_child_id`（无则 null）与 `recovery_resolution`（`unresolved`/`resumed`），使未持有 POST 响应的客户端能发现 child。
+
+**`manual_recovery_token` 持久化** SHALL 用 `(parent_execution_id, manual_recovery_token)` 唯一索引 + 请求 payload hash + 生成的 `child_execution_id`，使「响应丢失后重试」返回同一 child、「同 token 不同 payload」返回 409、「不同 token 命中已有 child」返回已存在 child。它 SHALL NOT 承担父子基数（那是 `UNIQUE(superseded_from)`）。
+
+**恢复审计事件** SHALL 为 `recovery_resumed{source: manual|reclaim, actor, parent_execution_id, child_execution_id, blocked_reason, request_token?}`——**自动 reclaim（后台交棒/接管）产生的恢复 `source=reclaim` 且不记为人工操作**，人工 POST 恢复 `source=manual` 带 `actor`;该事件写 child 事件流首部或独立恢复审计表，SHALL NOT 追加到已封闭的父事件流。
+
+#### Scenario: POST /resume 返回 child_execution_id 供订阅
+- **WHEN** 人工对某 `recovery_blocked(process_not_confirmed_dead)` execution 调用 `POST /executions/{parent_id}/resume`，前置已满足
+- **THEN** 走 `resume_blocked_execution()` 建恰好一个 recovery child，响应返回 `{parent_execution_id, child_execution_id, recovery_mode, recovery_source: manual, idempotent_replay: false}`，调用端据 `child_execution_id` 订阅 child 流;父事件流保持封闭
+
+#### Scenario: 同 token 重试与同父不同 token 并发都返回同一 child
+- **WHEN** 恢复响应丢失后客户端用**同一** `manual_recovery_token` 重试；另有后台 reclaim 用**不同 token** 并发恢复同一父
+- **THEN** 同 token 重试经 `(parent_execution_id, token)` 唯一索引返回同一 `child_execution_id`、`idempotent_replay=true`;不同 token 并发时 `UNIQUE(superseded_from)` 冲突后读回已存在 child 返回、`idempotent_replay=true`，两路径都 SHALL NOT 建第二个 child、SHALL NOT 报 500
+
+#### Scenario: 前置不满足或父非 recovery_blocked 拒绝恢复
+- **WHEN** 对进程树尚未确认清理的 `process_not_confirmed_dead` execution、或对一个非 `recovery_blocked` 的 execution 调用 resume
+- **THEN** 分别返回 409/422 结构化原因，不建 child、不改父状态
+
+#### Scenario: 自动 reclaim 恢复不记为人工操作
+- **WHEN** 后台交棒/可靠 reclaim 自动为某 execution 生成 recovery child
+- **THEN** `recovery_resumed` 事件 `source=reclaim`、不带人工 `actor`;人工 POST 恢复才 `source=manual` 且带 `actor`;两者都写 child 流首部/审计表，不追加父流
+
+#### Scenario: GET 详情暴露 recovery_child_id 供查询发现
+- **WHEN** 某客户端未持有 POST 响应，需知道 `recovery_blocked` 父是否已恢复
+- **THEN** `GET /executions/{parent_id}` 返回 `recovery_child_id`（已恢复则为 child id，否则 null）与 `recovery_resolution`（`unresolved`/`resumed`），据此发现并订阅 child，不依赖父流迟到事件
+
+### Requirement: recovery_blocked 的 resolved/unresolved 派生态与链叶消费矩阵
+
+`recovery_blocked` 是**永久终态**、父状态不因恢复而改变（见「终态无出边」约束），故「该 execution 是否还阻塞」SHALL 是一个**派生态**而非父 `run_queue.status` 的新值，所有消费者 SHALL 从 `UNIQUE(superseded_from)` 关系派生，SHALL NOT 依赖改写父 status（Review 第十二轮 P1-A）。派生定义：
+
+```text
+unresolved blocked   = 父 status='recovery_blocked' AND NOT EXISTS(child WHERE superseded_from=父)
+resumed blocked      = 父 status='recovery_blocked' AND EXISTS(child WHERE superseded_from=父)
+effective chain state= 沿 superseded_from 链一路走到叶子 execution，取叶子的 status
+                       （叶子可能是 running/done/failed/又一个 recovery_blocked…）
+```
+
+各消费者 SHALL 按下表派生，SHALL NOT 把「父仍是 recovery_blocked」直接当「仍阻塞待人工」：
+
+| 消费者 | 口径 |
+|---|---|
+| dead-letter / 人工待办 | 只列 `unresolved blocked`（有 child 即移出待办）;SHALL NOT 把 `resumed blocked` 仍列为待恢复 |
+| Runtime/RunRow 人工「确认已清理后重试」按钮 | `unresolved blocked` 才可点;`resumed blocked` 后按钮禁用/改为「查看恢复 child」跳转 |
+| progress / 任务完成度 | 沿链取 `effective chain state`——叶子 `done` 才算该任务线完成，父 `recovery_blocked` 不使整条链判失败/判阻塞 |
+| 告警 | 只对 `unresolved blocked` 持续超阈值告警;`resumed blocked` 解除该父的阻塞告警（转而观察 child） |
+| 失败率统计 | `recovery_blocked` 本身不计业务失败率（同 orphaned 口径）;链最终叶子的业务终态才参与统计口径 |
+
+可选：为查询效率增设 `resolved_at`/`resolved_by` 冗余列，但 SHALL 与 child insert **在同一 `resume_blocked_execution()` 事务内写入**，SHALL NOT 作为独立可漂移的真相源——权威判定仍是 `EXISTS(child WHERE superseded_from=父)`。
+
+#### Scenario: dead-letter 只列 unresolved、有 child 即移出
+- **WHEN** 一个 `recovery_blocked` execution 先无 child（unresolved），随后经 `resume_blocked_execution()` 建了 recovery child（resumed）
+- **THEN** dead-letter/人工待办在建 child 前列出它、建 child 后即移出;判定走 `EXISTS(child WHERE superseded_from=父)`，SHALL NOT 因父仍是 `recovery_blocked` 而永久留在待办
+
+#### Scenario: 人工按钮按派生态启停
+- **WHEN** 用户在 Runtime 查看一个已 resumed 的 `recovery_blocked` 父
+- **THEN** 「确认已清理后重试」按钮禁用（避免再建 child，`UNIQUE(superseded_from)` 也会挡），改为「查看恢复 child」跳转;只有 `unresolved blocked` 的父按钮可点
+
+#### Scenario: progress 沿链取叶子态
+- **WHEN** 某任务线经历 running→recovery_blocked→(child) running→done，progress 聚合其完成度
+- **THEN** 沿 `superseded_from` 链取 `effective chain state`=叶子 `done`，该任务线判为完成;父的 `recovery_blocked` 终态不使整条链判阻塞或判失败
+
+#### Scenario: 告警只对 unresolved 持续报
+- **WHEN** 一个 `recovery_blocked` 父长时间无人恢复（unresolved），随后被恢复（resumed）
+- **THEN** 告警在 unresolved 期间持续（超阈值升级），resumed 后解除该父的阻塞告警、转而观察 child 链;SHALL NOT 对已 resumed 的父继续报阻塞
 
 ### Requirement: 反向代理平滑切换（自动无损重连）
 

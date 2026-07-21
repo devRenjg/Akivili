@@ -1,6 +1,6 @@
 # Design — per-agent CLI session + 增量回灌
 
-> 目标：把「每次执行全量回灌历史」换成「每个 (conversation, agent) 维护一条 CLI session、再执行时 resume 续接 + 只喂增量」（`conversation_id` 为空走 (task, agent) 兜底，第六轮 P1-1）。省 token、上下文连贯，并为 [platform-graceful-restart] M2.5「温和重启+resume」提供 resume 地基。**claude 与 codex 均为必选**（codex 是重度使用的 backend）。本文不含代码改动。
+> 目标：把「每次执行全量回灌历史」换成「每个 (conversation, agent) 维护一条 CLI session、再执行时 resume 续接 + 只喂增量」（`conversation_id IS NULL` 的 task 不可执行，NULL 组索引仅防存量脏数据并发，第十二轮 P0-A）。省 token、上下文连贯，并为 [platform-graceful-restart] M2.5「温和重启+resume」提供 resume 地基。**claude 与 codex 均为必选**（codex 是重度使用的 backend）。本文不含代码改动。
 
 ## 设计哲学
 
@@ -22,11 +22,11 @@
 
 ## 关键设计决策
 
-### 决策 1：粒度 = per-(conversation_id, agent_slug)，且同 (conversation, agent) 串行（conversation_id 为空走 task 兜底）
+### 决策 1：粒度 = per-(conversation_id, agent_slug)，且同 (conversation, agent) 串行（NULL task 不可执行）
 
-- 粒度取 **(conversation_id, agent_slug)**——同一 conversation 里每个成员各持独立 session，互不干扰;`conversation_id` 为空的历史/系统 run 退化到 `(task_id, agent_slug)` 兜底串行（第六轮 P1-1）。
+- 粒度取 **(conversation_id, agent_slug)**——同一 conversation 里每个成员各持独立 session，互不干扰;**`conversation_id IS NULL` 的 task 一律不可执行**（Review 第十二轮 P0-A），第二组 `(task_id, agent_slug) WHERE conversation_id IS NULL` 索引只作**存量脏数据并发防御**、SHALL NOT 理解为「NULL run 走 task 兜底后即可执行」（旧「NULL 退化到 task 兜底串行、固定 full replay」口径已于第十二轮删除）。
 - 新表 `agent_sessions(id, conversation_id, agent_slug, session_id, committed_msg_id, provider_id, backend, workdir, updated_at)`，唯一键 `(conversation_id, agent_slug)`。`committed_msg_id` = 上次**成功**执行确认喂到的水位（见决策 3）。本次执行的快照终点 `planned_through_msg_id` 落在 `task_runs` 行（每 run 一行、天然是历史）。
-- **同 (conversation, agent) 单 active + 折叠（Review P0-3/P0-B；第五轮 P1-5 粒度改 conversation）**：目标 = 同一成员在同一 conversation 上**至多一个 active run**（active = queued/claimed/running），重复触发**折叠**进下一轮（合并触发意图，不丢），而非并行起第二条、也不是当前 `return None` 丢弃。**DB 级唯一性**：粒度 SHALL 与 session owner 键 `(conversation_id, agent_slug)` 对齐——`run_queue` 现状无 conversation_id 列，迁移先 `ALTER ADD COLUMN conversation_id`（从 tasks 回填）再建 partial unique index `ON run_queue(conversation_id, agent_slug) WHERE status IN ('queued','claimed','running')`，从 DB 层杜绝两个并发 POST 各插一条 active（应用层查重有 TOCTOU 竞态，Review P0-B）;**`conversation_id` 为空的历史/系统 run 走第二组互补索引 `UNIQUE(task_id, agent_slug) WHERE conversation_id IS NULL AND status active` 的 task 级串行兜底、SHALL NOT「不进入约束」**（第六轮 P1-1 两组互补 index、第八轮 P1-F 收口）;此类 NULL run 固定 full replay、不建/复用 agent_sessions（第七轮 P1-2）。**为何不用 `(task_id, agent_slug)` 作主粒度**：现状 `tasks.conversation_id` 可空无唯一约束，一个 conversation 可挂多 task，task 粒度会让同 conversation 两 task 争抢同一 session owner;已用 `UNIQUE(tasks.conversation_id) WHERE NOT NULL` 固化 1:1（第七轮 P0-3）。折叠规则见决策 1b。
+- **同 (conversation, agent) 单 active + 折叠（Review P0-3/P0-B；第五轮 P1-5 粒度改 conversation）**：目标 = 同一成员在同一 conversation 上**至多一个 active run**（active = queued/claimed/running），重复触发**折叠**进下一轮（合并触发意图，不丢），而非并行起第二条、也不是当前 `return None` 丢弃。**DB 级唯一性**：粒度 SHALL 与 session owner 键 `(conversation_id, agent_slug)` 对齐——`run_queue` 现状无 conversation_id 列，迁移先 `ALTER ADD COLUMN conversation_id`（从 tasks 回填）再建 partial unique index `ON run_queue(conversation_id, agent_slug) WHERE status IN ('queued','claimed','running')`，从 DB 层杜绝两个并发 POST 各插一条 active（应用层查重有 TOCTOU 竞态，Review P0-B）;**`conversation_id IS NULL` 的行走第二组互补索引 `UNIQUE(task_id, agent_slug) WHERE conversation_id IS NULL AND status active` 作存量脏数据并发防御、SHALL NOT「不进入约束」**（第六轮 P1-1 两组互补 index、第八轮 P1-F 收口）;但**此类 NULL task 一律不可执行**（Review 第十二轮 P0-A 三层硬门：dispatch 拒绝 / scheduler 排除 / claim CAS `AND conversation_id IS NOT NULL`），既不建/复用 agent_sessions、也 SHALL NOT「固定 full replay 执行」——恢复唯一路径是人工迁移到新独立 conversation（旧「NULL run 固定 full replay」可执行口径已删）。**为何不用 `(task_id, agent_slug)` 作主粒度**：现状 `tasks.conversation_id` 可空无唯一约束，一个 conversation 可挂多 task，task 粒度会让同 conversation 两 task 争抢同一 session owner;已用 `UNIQUE(tasks.conversation_id) WHERE NOT NULL` 固化 1:1（第七轮 P0-3）。折叠规则见决策 1b。
 
 ### 决策 1b：重复触发折叠模型（Review P0-3，取代「查重丢弃」与「伪 index」）
 
@@ -123,7 +123,7 @@
 
 ## 落地技术细节
 
-- **T1 建表**：`agent_sessions`，唯一键 `(conversation_id, agent_slug)`；`database.py` 建表 + 迁移（存量无行，首次执行自然走全量分支）。加 **(conversation, agent) active 唯一约束（NULL 走 (task, agent) 兜底，第六轮 P1-1 两组互补 index）**（决策 1 串行）+ **task:conversation 1:1 约束 `UNIQUE(tasks.conversation_id) WHERE NOT NULL`（第七轮 P0-3）**。
+- **T1 建表**：`agent_sessions`，唯一键 `(conversation_id, agent_slug)`；`database.py` 建表 + 迁移（存量无行，首次执行自然走全量分支）。加 **(conversation, agent) active 唯一约束（NULL 组索引仅作存量脏数据并发防御、非可执行兜底，第六轮 P1-1 两组互补 index + 第十二轮 P0-A）**（决策 1 串行）+ **task:conversation 1:1 约束 `UNIQUE(tasks.conversation_id) WHERE NOT NULL`（第七轮 P0-3）** + **NULL task 不可执行三层硬门（dispatch 拒绝 / scheduler 排除 / claim CAS `AND conversation_id IS NOT NULL`，第十二轮 P0-A）**。
 - **T2 claude 抓取**：`claude_code.py::_parse_line` 提 session_id；`ExecEvent` 增字段承载；`runner.py` 流中途 pin + 收尾覆盖存（COALESCE）。
 - **T3 增量取历史**：`runner.py` 执行前查 `agent_sessions`，决定「全量首建 / 增量 + resume」；增量 SQL 参数化 `id > committed_msg_id AND id <= planned_through_msg_id AND author != 本agent`；`planned_through_msg_id`（落 task_runs）= prompt-build 时 `MAX(messages.id)`；`committed_msg_id`（session）只在成功收尾推进。
 - **T4 claude resume**：命中 session 时 `args += ["--resume", sid]`；`resolveSessionID` 落地判定；未落地 → 清 sid + 本次降级全量。
@@ -135,7 +135,7 @@
 
 | 里程碑 | 交付 | 价值 | 验证 |
 |--------|------|------|------|
-| **S1** claude session 建立 | 建表 + 折叠模型 + 抓 session_id（pin + COALESCE 覆盖）；首次全量 | session 被正确建立/存储/可查 | 探针:首次执行后 `agent_sessions` 有正确 session_id + committed_msg_id；同 (conversation, agent)（NULL 走 task 兜底）不并行起两条（折叠不丢） |
+| **S1** claude session 建立 | 建表 + 折叠模型 + 抓 session_id（pin + COALESCE 覆盖）；首次全量 | session 被正确建立/存储/可查 | 探针:首次执行后 `agent_sessions` 有正确 session_id + committed_msg_id；同 (conversation, agent) 不并行起两条（折叠不丢）；NULL task 三层硬门拒绝执行（dispatch/scheduler/claim 各拒） |
 | **S2** claude resume + 增量回灌 | `--resume` + committed/planned 两阶段水位增量（排除自产）；mismatch 落地判定（失败才判） | **省 token + 上下文连贯 + 并发不漏话 + 崩溃不漏（at-least-once）** | 探针:二次执行带 resume、prompt 只含增量、并发场景 B 在 A 跑期间的发言下次不漏、prompt 构建后崩溃 committed 不提前推进；token 对比下降 |
 | **S3** 降级链 + poisoned 丢 session | 首次/resume 失败/provider/workdir 回退全量；poisoned 丢 session | **不劣于现状 + 不重放坏状态** | 探针:模拟 "no conversation found"/换 provider/poisoned 失败，均正确回退/丢弃、不报错 |
 | **S4** codex app-server 集成（必选） | `codex exec`→`app-server` + `thread/resume`（回退 `thread/start`）+ `turn/start`；threadId 存库 | **codex 同享 resume（重度使用必选）** | 探针:codex 二次执行 thread/resume 续接、协议错误回退 thread/start、降级链生效 |
