@@ -17,6 +17,15 @@
   - 新增结构规则（AND-not-OR / orphaned-not-queued / null-run-no-session）。
   - 附带脚本自身单元测试：`python3 spec_consistency_probe.py --self-test`。
 
+第十轮加固点：
+  - 结构规则支持 scope='segment'：在句段（按 。；;!？| 切分）内匹配，覆盖长任务行里
+    「orphaned … execution 回 queued」这类跨大段文字的旧口径;`回` 用 (?<!不) 排除
+    「不回 queued」正确否定;白名单在句段内判定。
+  - 新增三元一致性规则：gate 已释放/CLI 已起 时 source 必为 running，写 claimed→orphaned
+    即违规;protocol_incompatible 已起 CLI 分支不得回 queued。
+  - --self-test 增补真实长任务行、正确三分支长行、gate/source 三元、不可读文件（读取
+    失败分支）共 14 例。
+
 用法：
     python3 spec_consistency_probe.py             # 扫描默认三份 change
     python3 spec_consistency_probe.py <root> ...  # 扫描指定文件/目录
@@ -72,18 +81,39 @@ FORBIDDEN = [
 ]
 
 # ── 结构规则（跨文档强约束，命中即违规，无白名单） ───────────────────────────
-# 每条：pattern=违规写法正则；reason=原因。这些是「必须成立/必须不出现」的硬约束。
+# 每条：pattern=违规写法正则；reason=原因；scope='line'(默认整行) 或 'segment'(句段)。
+# scope='segment'（第十轮）：在句段内匹配——句段按分隔符 。；;!？ 与 markdown 表格
+# 竖线 | 切分，使「orphaned … 回 queued」这类长任务行里同一句段内的旧口径也能被
+# 捕获，而不被 20 字符窗口漏掉;同时避免跨句段误报（相邻两句各自合法却被连读）。
+# 这些是「必须成立/必须不出现」的硬约束。
 STRUCTURAL = [
     # 交棒/reclaim child 前置若写成「确认停 或 fencing」OR 口径即违规（须 AND）。
     dict(pattern=r"(已确认停|确认停止|旧执行已确认停)\s*或\s*(已被\s*)?fencing",
-         reason="交棒/reclaim child 前置必须是 AND（fencing AND 进程树确认退出），不得用 OR"),
+         reason="交棒/reclaim child 前置必须是 AND（fencing AND 进程树确认退出），不得用 OR",
+         scope="line"),
     dict(pattern=r"或先(完成|做)\s*(generation\s*)?fencing",
-         reason="child 前置不得写「或先完成 generation fencing」OR 口径（仅 fencing 挡不住残留 CLI 副作用）"),
-    # orphaned 不得直接映射/回到 queued（会导致新 Worker 重领 → 双执行）。
-    dict(pattern=r"orphaned[^\n]{0,20}(回|→|->|映射到?|落)\s*`?queued`?",
-         reason="orphaned（未确认死亡）不得回 queued，须 recovery_blocked(process_not_confirmed_dead)"),
-    dict(pattern=r"`?orphaned`?\s*(与|和)\s*`?abandoned`?[^\n]{0,20}(都|均)[^\n]{0,10}(映射|回|落)[^\n]{0,6}`?queued`?",
-         reason="orphaned 与 abandoned 不得都映射为 queued（前者进程未确认退出，不安全）"),
+         reason="child 前置不得写「或先完成 generation fencing」OR 口径（仅 fencing 挡不住残留 CLI 副作用）",
+         scope="line"),
+    # orphaned 不得直接映射/回到 queued（会导致新 Worker 重领 → 双执行）。句段级匹配。
+    # `回` 前用 (?<!不) 排除「不回 queued」这类正确否定表述;`不得回/SHALL NOT 回` 由白名单兜底。
+    dict(pattern=r"orphaned[^。；;!？|]*?((?<!不)回|→|->|映射到?|落)\s*`?queued`?",
+         reason="orphaned（未确认死亡）不得回 queued，须 recovery_blocked(process_not_confirmed_dead)",
+         scope="segment"),
+    dict(pattern=r"`?orphaned`?\s*(与|和)\s*`?abandoned`?[^。；;!？|]*?(都|均)[^。；;!？|]*?(映射|(?<!不)回|落)[^。；;!？|]*?`?queued`?",
+         reason="orphaned 与 abandoned 不得都映射为 queued（前者进程未确认退出，不安全）",
+         scope="segment"),
+    # protocol_incompatible 已起 CLI 分支不得回 queued（句段级覆盖长任务行）。
+    dict(pattern=r"protocol[_\s]?incompatible[^。；;!？|]*?(已起|CLI 已启动|gate 已释放)[^。；;!？|]*?((?<!不)回|→|->)\s*`?queued`?",
+         reason="protocol_incompatible 已起 CLI/gate 已释放分支不得回 queued（应 orphaned+recovery_blocked，防双执行）",
+         scope="segment"),
+    # 三元一致性：gate 已释放/CLI 已起的分支若把 source 写成 claimed→orphaned 即违规
+    # （gate 释放在 CAS 转 running 之后，source 必为 running），第十轮 P1-1。
+    dict(pattern=r"(gate 已释放|CLI 已起|CLI 已启动)[^。；;!？|]*?`?claimed`?\s*(→|->)\s*`?orphaned`?",
+         reason="gate 已释放/CLI 已起时 source 必为 running（running→orphaned），不得写 claimed→orphaned",
+         scope="segment"),
+    dict(pattern=r"`?claimed`?\s*(→|->)\s*`?orphaned`?[^。；;!？|]*?(gate 已释放|CLI 已起|CLI 已启动)",
+         reason="gate 已释放/CLI 已起时 source 必为 running（running→orphaned），不得写 claimed→orphaned",
+         scope="segment"),
 ]
 
 # 结构规则的豁免片段（说明「不得如此」的合法语境）——比通用整行放行更克制。
@@ -125,11 +155,23 @@ def resolve_targets(argv):
     return files, missing
 
 
+# 句段分隔符（第十轮 scope='segment'）：中文/英文句读 + markdown 表格竖线。
+# 不切顿号/括号——否则会把「orphaned（已起）… execution 回 queued」的主谓拆散而漏检;
+# 正确否定「不回 queued」由模式内 (?<!不) lookbehind 排除，白名单再兜底。
+_SEGMENT_SPLIT = re.compile(r"[。；;!？|]")
+
+
+def _segments(line):
+    """把一行切成句段，供 scope='segment' 规则在段内匹配、避免跨句误报。"""
+    return [seg for seg in _SEGMENT_SPLIT.split(line) if seg.strip()]
+
+
 def scan_line(line):
     """返回该行命中的 (kind, reason) 违规列表。
 
     kind='forbidden' 走每条规则的专属片段白名单;kind='structural' 走结构白名单。
     第九轮：白名单改为「具体片段匹配」，SHALL NOT 整行出现任一通用标记词就放行。
+    第十轮：structural 规则支持 scope='segment'——在句段内匹配长任务行，段内命白名单才放行。
     """
     # meta 自述行（描述 probe/清理清单本身）整行豁免——这类行必然罗列旧口径。
     if any(marker in line for marker in META_CONTEXT_MARKERS):
@@ -141,10 +183,21 @@ def scan_line(line):
                 continue
             hits.append(("forbidden", rule["reason"]))
     for rule in STRUCTURAL:
-        if re.search(rule["pattern"], line):
-            if any(snip in line for snip in STRUCTURAL_ALLOW):
-                continue
-            hits.append(("structural", rule["reason"]))
+        scope = rule.get("scope", "line")
+        if scope == "segment":
+            # 逐句段匹配：某句段命中 pattern 且该**句段内**无白名单片段才算违规。
+            hit = False
+            for seg in _segments(line):
+                if re.search(rule["pattern"], seg) and not any(snip in seg for snip in STRUCTURAL_ALLOW):
+                    hit = True
+                    break
+            if hit:
+                hits.append(("structural", rule["reason"]))
+        else:
+            if re.search(rule["pattern"], line):
+                if any(snip in line for snip in STRUCTURAL_ALLOW):
+                    continue
+                hits.append(("structural", rule["reason"]))
     return hits
 
 
@@ -250,6 +303,38 @@ def _self_test():
     # 9. resolve_targets 对缺失返回 missing 而非静默跳过
     _, missing = resolve_targets(["/nonexistent/path/xyz"])
     check("resolve_targets 报告缺失路径", len(missing) == 1)
+
+    # 10. 真实长任务行：orphaned…（大量中间文字）…execution 回 queued → 句段级仍命中
+    long_line = (
+        "- [ ] 1.6b finish_execution：protocol_incompatible claimed→attempt 落 "
+        "abandoned（未起 CLI）/orphaned（已起）、execution 回 queued 等兼容 Worker、"
+        "owner 退休、pending 保留，仅反复不兼容且预算耗尽才 recovery_blocked"
+    )
+    check("长任务行 orphaned→queued 被句段级捕获",
+          any(k == "structural" for _, k, _, _ in scan_text(long_line)))
+
+    # 11. 长行三分支正确写法（gate 已释放→running→orphaned→recovery_blocked 不回队）→ 放行
+    good_long = (
+        "claimed·gate 未释放→abandoned+queued；gate 已释放/CLI 已起时 attempt 已 running，"
+        "走 running→orphaned+recovery_blocked，SHALL NOT 回 queued（防双执行）"
+    )
+    check("正确三分支长行放行", not any(k == "structural" for _, k, _, _ in scan_text(good_long)))
+
+    # 12. 三元一致性：gate 已释放却写 claimed→orphaned → 命中
+    check("gate 已释放写 claimed→orphaned 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text("gate 已释放时 claimed→orphaned 落 recovery_blocked")))
+
+    # 13. 不可读文件 → main 返回 1（第十轮：覆盖读取失败分支，非仅缺失路径）
+    import tempfile
+    tmpdir = tempfile.mkdtemp()
+    bad = Path(tmpdir) / "bad.md"
+    bad.write_bytes(b"\xff\xfe\x00\x00 invalid utf-8 \xc0\xc1")
+    check("不可读文件 exit 1", main([str(bad)]) == 1)
+    try:
+        bad.unlink()
+        Path(tmpdir).rmdir()
+    except OSError:
+        pass
 
     passed = sum(1 for _, ok in cases if ok)
     print("🧪 self-test")
