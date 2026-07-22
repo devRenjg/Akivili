@@ -50,7 +50,7 @@
 
 一切平滑重启/resume 都建立在一个**持久化执行状态机**上。先定义状态、转换与不变量，再谈剥离与续跑。
 
-**🔴 execution : attempt = 一对多（Review P0-1，用户拍板模型 A）**：一个 `run_queue` 行 = **稳定 execution**（ID 不变，前端订阅/展示的锚点）；每次 claim（含 lease 回收、瞬时失败重试）在其下创建一个新的 **attempt** = 一条 `task_runs` 行，`UNIQUE(run_queue_id, attempt_no)`（**不是** `run_queue_id` 唯一）。这样「claim 建 task_run」与「lease 过期/瞬时失败把同一 run_queue 回 queued 再领」不再撞唯一键——每次领取递增 `attempt_no`，旧 attempt 落 `abandoned`（claimed 未起 CLI 就丢）/`failed`（起 CLI 前失败 = `failure_stage=prestart`，第六轮 P1-2 方案 B）等非定局终态。`run_queue` 的终态由**最终定局 attempt**（`final_attempt_id`，第六轮 P1-3：final 而非 winning——失败/被杀 execution 也有 final attempt）决定。SSE 绑**稳定 execution_id**，同一 execution 的多个 attempt 事件进同一条事件流（见决策 9）。平滑重启产生的 recovery child 仍是**新的 execution**（新 run_queue 行），用 `superseded_from` 关联父 execution——与「同一 execution 内多 attempt」是两个层级：attempt = 同一 execution 的重试尝试，recovery child = 交棒/中断后另起的续跑 execution。
+**🔴 execution : attempt = 一对多（Review P0-1，用户拍板模型 A）**：一个 `run_queue` 行 = **稳定 execution**（ID 不变，前端订阅/展示的锚点）；每次 claim（含 lease 回收、瞬时失败重试）在其下创建一个新的 **attempt** = 一条 `task_runs` 行，`UNIQUE(run_queue_id, attempt_no)`（**不是** `run_queue_id` 唯一）。这样「claim 建 task_run」与「lease 过期/瞬时失败把同一 run_queue 回 queued 再领」不再撞唯一键——每次领取递增 `attempt_no`，旧 attempt 落 `abandoned`（此处特指 `abandon_reason=lease_reclaim`·claimed 未起 CLI 就丢 = 非定局;`abandoned` 另有 `null_conversation_migration` 定局子类见状态词汇表，第十六轮 P1-A）/`failed`（起 CLI 前失败 = `failure_stage=prestart`，第六轮 P1-2 方案 B）等非定局终态。`run_queue` 的终态由**最终定局 attempt**（`final_attempt_id`，第六轮 P1-3：final 而非 winning——失败/被杀 execution 也有 final attempt）决定。SSE 绑**稳定 execution_id**，同一 execution 的多个 attempt 事件进同一条事件流（见决策 9）。平滑重启产生的 recovery child 仍是**新的 execution**（新 run_queue 行），用 `superseded_from` 关联父 execution——与「同一 execution 内多 attempt」是两个层级：attempt = 同一 execution 的重试尝试，recovery child = 交棒/中断后另起的续跑 execution。
 
 **状态机**（execution = `run_queue` 行；下挂多个 attempt = `task_runs` 行）。**两层成功态不同名**：execution 成功=`done`，attempt 成功=`succeeded`（Review 第四轮 P0-1，单一真相源见 spec「双层状态词汇表」Requirement）：
 
@@ -66,12 +66,14 @@ attempt 层（task_runs.status）：
 claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功 = execution 的定局 attempt)
                              ├─→ failed             (含 failure_stage=prestart|running，第六轮 P1-2 方案 B)
                              ├─→ killed
-                             ├─→ abandoned          (非定局；无残留进程——claimed lease 回收·CLI 未起，或 running·已确认完整进程树退出，第十五轮 P1-3 扩义)
+                             ├─→ abandoned          (无残留进程的非成功中止；正交 abandon_stage(prelaunch|running)+abandon_reason(lease_reclaim|null_conversation_migration)；定局性由 final_attempt_id 引用决定非 status，第十六轮 P1-A)
                              ├─→ orphaned           (running 中未确认死亡的孤儿；进程可能存活，非 abandoned，第八轮 P1-B)
                              └─→ superseded
   失败正交字段：failure_stage(prestart|running) + failure_class(infra|config|business) + retryable(bool)
-  abandoned vs orphaned：abandoned=无残留进程（claimed·CLI 从未起 / running·已确认完整进程树退出，第十五轮 P1-3）；
+  abandoned vs orphaned：abandoned=无残留进程（abandon_reason=lease_reclaim·CLI 从未起 / null_conversation_migration·running 已确认退出，第十五/十六轮）；
                          orphaned=进程树未确认退出（可能存活）、驱动 execution=recovery_blocked(process_not_confirmed_dead)、不得回队。
+  ⚠ abandoned 定局性由 final_attempt_id 是否引用决定（第十六轮 P1-A）：lease_reclaim=非定局·execution 回 queued·不被 final 引用；
+    null_conversation_migration=定局·被 final 引用·driven execution=recovery_blocked(null_conversation_migration)·不回队。消费者 SHALL NOT 仅凭 status=abandoned 判定局性/回队性。
   ⚠ 回队性是 execution 处置属性、不是 attempt 属性：abandoned 只表「无残留进程」，SHALL NOT 隐含「一定回队」——
     普通 claim lease 回收的 abandoned 走同 execution 回队重试；NULL migration 已确认退出的 abandoned 其 execution=
     recovery_blocked(null_conversation_migration) 不回队、等人工迁移（第十五轮 P1-3，两者 attempt 同为 abandoned、execution 处置不同）
