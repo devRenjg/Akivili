@@ -536,11 +536,11 @@ execution 终态与其事件同事务（本 change SSE Requirement）、session 
 
 **只有 normal success / pending success / history_backlog success / full_replay child success 路径 SHALL 推进 `committed_msg_id`;retryable failure / kill / supersede / poisoned failure / recovery_blocked 各类路径 SHALL NOT 推进 committed**——失败/被杀/交棒/阻塞不代表这批原始消息已被成功消费，推进会使恢复后这批消息被误判已消费而丢失。
 
-**`recovery_blocked` SHALL 带结构化 `blocked_reason`（Review 第七轮 P1-1）**，至少区分：`process_not_confirmed_dead`（无法确认旧进程已停）/ `recovery_budget_exhausted`（恢复预算耗尽）/ `poisoned_session`（session 不可用且已按 poisoned policy 处理）/ `protocol_incompatible`（协议版本不兼容 fail-closed）。人工出口据 `blocked_reason` 给不同处理建议。
+**`recovery_blocked` SHALL 带结构化 `blocked_reason`（Review 第七轮 P1-1）**，至少区分：`process_not_confirmed_dead`（无法确认旧进程已停）/ `recovery_budget_exhausted`（恢复预算耗尽）/ `poisoned_session`（session 不可用且已按 poisoned policy 处理）/ `protocol_incompatible`（协议版本不兼容 fail-closed）/ `null_conversation_migration`（第十四轮 P1-2：activate 前存量 `conversation_id IS NULL` 的 running 行经 fencing+杀树后落此终态，等待人工迁移到新 conversation，见 [agent-session-resume]「activate 前存量 NULL 在途行三态迁移状态机」）。人工出口据 `blocked_reason` 给不同处理建议。**`null_conversation_migration` 的恢复出口与前四种不同**：它 SHALL NOT 走 `resume_blocked_execution()` 建 `superseded_from=父` 的 recovery child（父 `conversation_id IS NULL`、child 为新 conversation 会违反下方 recovery chain scope 一致），而走 [agent-session-resume] 迁移出口创建**普通 successor**（新 conversation、独立 migration lineage、不挂 `superseded_from`），NULL 父保持 `recovery_blocked` 终态不变、任务完成度由 task 级 active 聚合。
 
 **🔴 recovery_blocked 的人工恢复 SHALL 走独立事务 `resume_blocked_execution()`、父终态永久不变（Review 第十轮 P1-3 + 第十一轮 P0-A/P0-B/P1-A 收口）**：人工在 Runtime 点击「确认已清理后重试」（或可靠 reclaim 确认后自动触发）时，系统 SHALL 调用**独立事务 `resume_blocked_execution(parent_id, recovery_request)`**——它复用统一 DB transaction、事件插入与 successor helper，但**职责只限**：① 校验 `blocked_reason` 分原因前置（见下方恢复矩阵）;② 检查进程树/协议/预算前置;③ 原子插入**恰好一个** recovery child execution（`queued`，`superseded_from=父` + `recovery_mode`——有安全 session→`session_resume`/无或失效→`full_replay`）;④ 写统一的 `recovery_resumed{source:manual}` + child `queued` 事件（child 流、遵全局 id 顺序;事件名统一为 `recovery_resumed`、无 `manual_recovery` 第二名，第十三轮 P1-C）。**父 execution 保持 `recovery_blocked` 永久不变、父定局 attempt（如 `orphaned`）指针永久不变、SHALL NOT 发第二个 terminal/superseded 事件**（终态不可逆，见「终态无出边」约束）。**SHALL NOT 复用 `finish_execution()`**（Review 第十一轮 P1-A）——定局动作（attempt/execution 终态、owner retire、terminal event、committed 推进）在首次 `finish_execution()` 落 `recovery_blocked` 时已完成，`resume_blocked_execution()` **不再** retire owner、**不再**发父 terminal、**不改** `final_attempt_id`、**不推进** committed，避免重复定局。**`superseded_from` 语义 = 「统一 recovery predecessor」，SHALL NOT 新增 `recovered_from` 第二套父子键**（自动交棒的 superseded 父与人工恢复的 recovery_blocked 父共用同一恢复链模型，consistency probe/消费者只认一套）。**🔴 幂等 = 数据库硬约束 `UNIQUE(superseded_from)`（Review 第十一轮 P0-B，删除「或 token」可选性）**：SHALL 建 `CREATE UNIQUE INDEX uq_run_queue_recovery_parent ON run_queue(superseded_from) WHERE superseded_from IS NOT NULL`，保证**一个父 execution 至多一个 recovery child**——人工重复点击、人工点击与后台 reclaim 用**不同 `manual_recovery_token`** 并发时，第二次 INSERT 因 `UNIQUE(superseded_from)` 冲突失败即视为已恢复、不再建 child。`manual_recovery_token` **仅作第二层 API 请求幂等键**（挡同一次 HTTP 重试），**SHALL NOT** 承担父子基数约束——`UNIQUE(recovery_chain_id, manual_recovery_token)` 挡不住「同父不同 token」并发各建一个 child，故父子唯一性 SHALL NOT 依赖它。人工恢复前置 SHALL 与自动 recovery child 一致：据 `blocked_reason` 满足对应前置（如 `process_not_confirmed_dead` 须人工确认「完整进程树已清理」）才允许，SHALL NOT 让人工入口跳过前置确认。
 
-**🔴 四种 `blocked_reason` 的分原因人工恢复矩阵（Review 第十一轮 P1-B）**：不同 `blocked_reason` 的恢复前置、session 处置、预算/协议处置各不相同，SHALL NOT 套用同一个「确认已清理后重试」按钮与前置。`resume_blocked_execution()` SHALL 按 `blocked_reason` 分派校验，任一前置不满足 SHALL 拒绝创建 child（不产生注定再次 blocked 的 child）：
+**🔴 四种 `blocked_reason` 的分原因人工恢复矩阵（Review 第十一轮 P1-B）**：不同 `blocked_reason` 的恢复前置、session 处置、预算/协议处置各不相同，SHALL NOT 套用同一个「确认已清理后重试」按钮与前置。下表四种 reason（`process_not_confirmed_dead`/`recovery_budget_exhausted`/`poisoned_session`/`protocol_incompatible`）SHALL 经 `resume_blocked_execution()` 建 `superseded_from=父` 的 recovery child;**第五种 `null_conversation_migration` 例外——它不走 `resume_blocked_execution()`（父 conversation 为 NULL、建 `superseded_from` child 会违反 recovery chain scope 一致），而走 [agent-session-resume] 迁移出口建新 conversation 的普通 successor，见上文 blocked_reason 枚举说明与该 change 三态迁移状态机（第十四轮 P1-2）**。`resume_blocked_execution()` SHALL 按 `blocked_reason` 分派校验，任一前置不满足 SHALL 拒绝创建 child（不产生注定再次 blocked 的 child）：
 
 | blocked_reason | 人工恢复前置 | session 处置 | 预算/协议处置 |
 |---|---|---|---|
@@ -779,6 +779,34 @@ effective chain state= 沿 superseded_from 链一路走到叶子 execution，取
 4. **recovery_attempt 单调**：`child.recovery_attempt = parent.recovery_attempt + 1`，且与 recovery budget 使用**同一真相源**;超 budget SHALL NOT 建 child。
 5. **安全遍历**：任何递归 CTE / 应用遍历 SHALL 记录 visited set、设置**最大深度**，检测到环或损坏链时 **fail-closed 并报警**，SHALL NOT 无限递归;progress/Runtime 遇损坏链 SHALL bounded fail-closed（给出「链损坏、需人工」而非卡死或错误完成）。
 6. **拒绝错链构造**：人工/迁移构造的自环、两节点环、跨 task parent、跨 conversation/agent parent SHALL 全部被拒绝（建 child 时校验 2/3/4，遍历时校验 5）。
+
+**🔴 recovery chain 根语义与持久化 schema（第十四轮 P1-3，编码前须定死可直接建表迁移）**：结构规则之上 SHALL 固化根初始化、持久化 schema 与最低硬约束层级，SHALL NOT 让实现者自行选择：
+
+```text
+普通根 execution（非 recovery child，正常 dispatch/普通 successor 创建）：
+  recovery_chain_id = 自身 execution id（run_queue.id）
+  recovery_attempt  = 0
+recovery child：
+  recovery_chain_id = parent.recovery_chain_id
+  recovery_attempt  = parent.recovery_attempt + 1
+  superseded_from   = parent execution id
+```
+
+- **`recovery_requests` 表（人工恢复请求真相源，承接 spec 上文「`manual_recovery_token` 持久化」要求）**：`{parent_execution_id, request_token, payload_hash, child_execution_id, actor, created_at}`，`UNIQUE(parent_execution_id, request_token)`（第二层 API 请求幂等键）。它 SHALL 与 recovery child insert 同 `resume_blocked_execution()` 事务写入，SHALL NOT 独立提交（否则「有 request 无 child」孤立行）。父子基数仍由 `UNIQUE(superseded_from)` 保证，`recovery_requests` 不承担父子基数。
+- **`recovery_budgets` 表（恢复预算真相源，chain 维度）**：`{recovery_chain_id (PK), budget_limit, budget_current, version, last_reset_by, last_reset_at, last_reset_reason}`。`recovery_attempt` 与 `budget_current` SHALL 同此真相源推进——建 recovery child 时同事务 CAS `budget_current` 递减（或按 `recovery_attempt` 比对 `budget_limit`），超限 SHALL NOT 建 child、落 `recovery_blocked(recovery_budget_exhausted)`。人工增/重置预算（`recovery_budget_exhausted` 恢复）SHALL 更新 `budget_limit/version/last_reset_*` 并与 child insert 同 `resume_blocked_execution()` 事务提交（承接分原因恢复矩阵）。
+- **最低硬约束层级（用户第十四轮拍板：应用层 + 迁移探针等价校验，不重建表加原生 FK）**：SQLite 无法对已有 `run_queue` 表 `ALTER` 加外键，故 **parent 存在性（规则 1）、scope 一致（规则 3）、recovery_attempt 单调（规则 4）SHALL 由中心化 child-insert 事务 + 迁移/CI 探针做 FK 等价校验**（不悬空、不跨 scope、attempt 连续），SHALL NOT 依赖「先查后插」应用层竞态判断（校验与 insert 须同一 SQL/事务原子完成）。**仅自环（规则 2）可用列级 `CHECK(id != superseded_from)`**（加列时即可带 CHECK，无需重建表）。所有 recovery child 创建 SHALL 经统一 helper（`resume_blocked_execution()` / reclaim 建 child），SHALL NOT 散落多处各写一遍校验。
+
+#### Scenario: 普通根 execution 与 recovery child 的 chain 基值
+- **WHEN** 正常 dispatch 创建一个普通根 execution，随后它被 supersede 生成 recovery child，child 再被 supersede 生成孙 child
+- **THEN** 根 `recovery_chain_id=自身 id`、`recovery_attempt=0`;child `recovery_chain_id=根 chain_id`、`recovery_attempt=1`;孙 `recovery_attempt=2`，三者 `recovery_chain_id` 相同、`budget_current` 与 attempt 同源递减;普通 successor（非 recovery child）开启自己的新 recovery chain（`recovery_chain_id=自身 id`、`recovery_attempt=0`）
+
+#### Scenario: recovery_requests 与 child insert 同事务
+- **WHEN** `resume_blocked_execution()` 建 recovery child，在写 `recovery_requests` 行与 insert child 之间任一点注入故障
+- **THEN** 整体回滚，不留「有 request 无 child」或「有 child 无 request」半提交;`UNIQUE(parent_execution_id, request_token)` 保证同请求重试幂等、父子基数仍由 `UNIQUE(superseded_from)` 保证
+
+#### Scenario: 悬空 parent 被 FK 等价校验拒绝
+- **WHEN** 尝试建一个 `superseded_from` 指向不存在 parent execution 的 recovery child
+- **THEN** 中心化 child-insert 事务的 FK 等价校验（应用层 + 迁移探针）拒绝该 child，SHALL NOT 悬空;校验与 insert 同一事务原子完成，SHALL NOT 走「先查后插」竞态
 
 #### Scenario: 自环与两节点环被拒绝
 - **WHEN** 尝试构造 `child.superseded_from = child.id`（自环）或 A.superseded_from=B 且 B.superseded_from=A（两节点环）
