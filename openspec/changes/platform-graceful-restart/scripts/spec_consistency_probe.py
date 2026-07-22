@@ -199,6 +199,21 @@ STRUCTURAL = [
          reason="父 terminal 后事件流已封闭，SHALL NOT 向父流追加 manual_recovery（走 child 流首事件/审计表，第十二轮 P0-B）",
          scope="segment",
          allow=["SHALL NOT", "不得", "不追加", "而非", "封闭", "child 流", "child 事件流", "独立审计"]),
+    # 第十五轮 P1-1 新增结构规则 ③：自动 supersede/reclaim 写序里写了「父 superseded → child queued」
+    # 却漏掉 child recovery_resumed(source=reclaim)。收紧：同一句段内出现「superseded」+「child/子」+
+    # 「queued」相邻描述写序（→/->/箭头连接）但**整段不含 recovery_resumed** 才判违规;
+    # 正确写序（含 recovery_resumed）与「不含/无 recovery_resumed 的否定说明」由 allow / 负向前视排除。
+    dict(pattern=r"superseded[^。；;!？|]*?(→|->)[^。；;!？|]*?(child|子)[^。；;!？|]*?queued(?![^。；;!？|]*recovery_resumed)(?<!recovery_resumed)",
+         reason="自动 supersede/reclaim 建 child 的写序 SHALL 含 child recovery_resumed(source=reclaim)，在父 superseded 与 child queued 之间（第十五轮 P1-1）",
+         scope="segment",
+         allow=["SHALL NOT", "不得", "而非", "recovery_resumed", "无 per-execution", "独立序列", "重置游标",
+                "全局 id", "全局 Last-Event-ID", "较大", "无损", "断线", "重连"]),
+    # 第十五轮 P1-1 新增结构规则 ④：SSE event payload 用了 recovery_source（应为 source）。
+    # recovery_source 只应出现在 HTTP 响应体;出现「SSE/event/事件 + payload/字段 + recovery_source」判违规。
+    dict(pattern=r"(SSE|event|事件)[^。；;!？|]{0,12}(payload|字段|载荷)[^。；;!？|]{0,12}recovery_source",
+         reason="SSE event payload 字段用 source（manual|reclaim），recovery_source 仅 HTTP 响应体字段（第十五轮 P1-1）",
+         scope="segment",
+         allow=["SHALL NOT", "不得", "而非", "非 recovery_source", "仅 HTTP", "HTTP 响应"]),
 ]
 
 # 显式历史标记（第十二轮 P1-D 引入，第十三轮 P1-E 收紧作用域）：需引用已废旧模型时，
@@ -573,6 +588,26 @@ def _self_test():
     check("P1-E 历史块后现行错误仍被拦",
           any(k == "structural" for _, k, _, _ in scan_text(
               "HISTORICAL_INVALID:「旧模型」 当前 orphaned 回 queued 继续跑")))
+    # 32. 第十五轮 P1-1：自动 supersede 写序漏 recovery_resumed → 命中
+    check("P1-1 自动写序漏 recovery_resumed 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "自动 supersede：父 superseded → child queued → commit")))
+    # 33. 正确写序含 recovery_resumed(reclaim) → 放行
+    check("P1-1 含 recovery_resumed 写序放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "自动 supersede：父 superseded → child recovery_resumed(source=reclaim) → child queued → commit")))
+    # 34. superseded→child queued 但用「全局游标续订」描述（无写序语义）→ 放行
+    check("P1-1 superseded 全局游标续订放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "收到父 superseded 后订阅 child、携带全局 Last-Event-ID 无损取到 child queued")))
+    # 35. 第十五轮 P1-1：SSE event payload 用 recovery_source → 命中
+    check("P1-1 SSE payload recovery_source 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "SSE event payload 带 recovery_source 区分来源")))
+    # 36. recovery_source 只在 HTTP 响应 → 放行
+    check("P1-1 recovery_source 仅 HTTP 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "recovery_source 仅 HTTP 响应体字段、SSE event payload 用 source 而非 recovery_source")))
 
     passed = sum(1 for _, ok in cases if ok)
     print("🧪 self-test")
