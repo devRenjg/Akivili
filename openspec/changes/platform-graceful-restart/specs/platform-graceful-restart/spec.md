@@ -44,7 +44,7 @@
 | `succeeded` | 该 attempt 成功收尾（= 该 execution 的定局 attempt，驱动 execution 落 `done`）；**SHALL NOT 命名 `done`** | 是 |
 | `failed` | 该 attempt 执行失败（**发生阶段/归因/可重试性由正交字段 `failure_stage`+`failure_class`+`retryable` 表达**，见下） | 是 |
 | `killed` | 该 attempt 被用户 kill | 是 |
-| `abandoned` | **无残留进程的非成功中止（Review 第十六轮 P1-A 扩义 + 第十七轮 P0 收窄）**——正交字段 `abandon_stage(prelaunch\|running)` + `abandon_reason(lease_reclaim\|null_conversation_migration\|protocol_incompatible)` 区分：`prelaunch/lease_reclaim`=claimed lease 回收、CLI 未起（**非定局**、execution 回 `queued`）;`prelaunch/null_conversation_migration`=**claimed NULL、CLI 未起无残留进程**（**可作 final**、execution `recovery_blocked(null_conversation_migration)`、不回队;**第十七轮 P0：running NULL 不再落 abandoned——running NULL 隔离恒 `orphaned`，进程确认与否由正交 `process_cleanup_state` 表达**）;`protocol_incompatible`=协议不兼容中止（可作 final）。**定局性 SHALL 由 `final_attempt_id` 是否引用它决定、SHALL NOT 仅凭 `status=abandoned` 判非定局或回队性** | 是 |
+| `abandoned` | **无残留进程的非成功中止（Review 第十六轮 P1-A 扩义 + 第十七轮 P0 收窄）**——正交字段 `abandon_stage(prelaunch\|running)` + `abandon_reason(lease_reclaim\|null_conversation_migration\|protocol_incompatible)` 区分：`prelaunch/lease_reclaim`=claimed lease 回收、CLI 未起（**非定局**、execution 回 `queued`）;`prelaunch/null_conversation_migration`=**claimed NULL、CLI 未起无残留进程**（**可作 final**、execution `recovery_blocked(null_conversation_migration)`、不回队;**第十七轮 P0：running NULL 不再落 abandoned——running NULL 隔离恒 `orphaned`，进程确认与否由正交 `process_cleanup_state` 表达**）;`protocol_incompatible`=协议不兼容中止，**按预算拆（第十八轮）**：未耗尽预算=非定局·final=NULL·回 `queued`;预算耗尽=定局·final 指向·`recovery_blocked(protocol_incompatible)`。**定局性 SHALL 由 `final_attempt_id` 是否引用它决定、SHALL NOT 仅凭 `status=abandoned` 判非定局或回队性** | 是 |
 | `orphaned` | **进程树未确认退出的孤儿（Review 第八轮 P1-B）**——reclaim 发现残留 `running` attempt 但无法证明其 CLI 已停;与 `abandoned` 语义分开，因 `orphaned`=进程**未确认退出**（可能存活）、`abandoned`=**无残留进程**（未起 CLI 或已确认退出）。**其 execution `blocked_reason` 按来源子类分（第十七轮 P0/P1-B）**：unsafe orphan/protocol mismatch → `process_not_confirmed_dead`;**activate 前 running NULL 隔离 → `null_conversation_migration`，attempt 恒 `orphaned` 首次即永久终态、进程确认与否走正交 `process_cleanup_state(unconfirmed\|confirmed)`，两阶段均 SHALL NOT 把它改写为 `abandoned`** | 是 |
 | `superseded` | 该 attempt 随 execution 交棒中断 | 是 |
 
@@ -59,7 +59,7 @@ retryable     = true | false                    -- 是否重排
 
 由 `retryable + recovery_count` 决定是否重排（`retryable=true` 且未达恢复上限 → **同 execution 回 queued、下次 claim 建 attempt#N+1**，第七轮 P0-1：普通瞬时重试走同 execution 新 attempt、SHALL NOT 走 recovery child;否则 execution 落 `failed`/`recovery_blocked`）;由 `failure_class` 决定计基础设施失败率还是业务失败率（`infrastructure`/`configuration` 不计业务失败率，`business` 计）;`failure_stage` 只记发生阶段、不隐含结果或可重试性。**这样「决定 execution failed 的定局 attempt」永远是 `status=failed`**，与「定局 attempt=`failed` ⇒ execution=`failed`」的层间映射自洽，消费者只认一个失败终态名。
 
-**层间映射 SHALL 恒定**：execution 终态由**定局 attempt** 决定——定局 attempt=`succeeded` ⇒ execution=`done`;定局 attempt=`failed`（且恢复耗尽/不可重试，含 `failure_stage=prestart` 的不可重试准备失败）⇒ execution=`failed`;`orphaned`（进程树未确认退出的孤儿 attempt，第八轮 P1-B）驱动 execution=`recovery_blocked` 且 `final_attempt_id` 指向它——**其 `blocked_reason` 按 orphaned 来源子类分（第十七轮 P1-B）**：unsafe orphan / protocol mismatch 等 CLI 已起残留 → `process_not_confirmed_dead`;**activate 前 running NULL 隔离（第十七轮 P0）→ `null_conversation_migration`（attempt 恒 `orphaned`、进程确认与否由正交 `process_cleanup_state(unconfirmed|confirmed)` 表达、SHALL NOT 用 attempt 状态从 orphaned 改写为 abandoned）**。**`abandoned` 的定局性按正交字段分（第十六轮 P1-A）**：`abandon_reason=lease_reclaim`（prelaunch）= **非定局**，execution 回 `queued`、不被 `final_attempt_id` 引用;`abandon_reason=null_conversation_migration`（**claimed·CLI 未起无残留进程**，第十七轮 P0 收窄——running NULL 不再落 abandoned）= **定局**，驱动 execution=`recovery_blocked(null_conversation_migration)` 且被 `final_attempt_id` 引用;`abandon_reason=protocol_incompatible`（第十七轮 P1-B）= **定局**，驱动 execution=`recovery_blocked(protocol_incompatible)` 且被 `final_attempt_id` 引用。`superseded` 恒为非定局（随 execution 交棒中断）。**定局性 SHALL 由「是否被 `final_attempt_id` 引用」决定，SHALL NOT 仅凭 `status` 一刀切判 `abandoned` 非定局**。所有 execution 自然完成 CAS SHALL 明确写成 `SET status='done' WHERE status='running' AND worker_generation=? AND worker_instance_id=?`，SHALL NOT 写 `SET status='succeeded'`。
+**层间映射 SHALL 恒定**：execution 终态由**定局 attempt** 决定——定局 attempt=`succeeded` ⇒ execution=`done`;定局 attempt=`failed`（且恢复耗尽/不可重试，含 `failure_stage=prestart` 的不可重试准备失败）⇒ execution=`failed`;`orphaned`（进程树未确认退出的孤儿 attempt，第八轮 P1-B）驱动 execution=`recovery_blocked` 且 `final_attempt_id` 指向它——**其 `blocked_reason` 按 orphaned 来源子类分（第十七轮 P1-B）**：unsafe orphan / protocol mismatch 等 CLI 已起残留 → `process_not_confirmed_dead`;**activate 前 running NULL 隔离（第十七轮 P0）→ `null_conversation_migration`（attempt 恒 `orphaned`、进程确认与否由正交 `process_cleanup_state(unconfirmed|confirmed)` 表达、SHALL NOT 用 attempt 状态从 orphaned 改写为 abandoned）**。**`abandoned` 的定局性按正交字段分（第十六轮 P1-A）**：`abandon_reason=lease_reclaim`（prelaunch）= **非定局**，execution 回 `queued`、不被 `final_attempt_id` 引用;`abandon_reason=null_conversation_migration`（**claimed·CLI 未起无残留进程**，第十七轮 P0 收窄——running NULL 不再落 abandoned）= **定局**，驱动 execution=`recovery_blocked(null_conversation_migration)` 且被 `final_attempt_id` 引用;`abandon_reason=protocol_incompatible`（第十七轮 P1-B + 第十八轮按预算拆定局性）**定局性 SHALL 按恢复预算是否耗尽分两支、SHALL NOT 一律判定局**：**未耗尽预算**（gate 未释放、CLI 未起、可等兼容 Worker 重领）= **非定局**，`final_attempt_id=NULL`、execution 回 `queued`（与 `lease_reclaim` 同源——无残留进程的可回队中止）;**反复不兼容且预算耗尽** = **定局**，被 `final_attempt_id` 引用、驱动 execution=`recovery_blocked(protocol_incompatible)`（与 spec 下文「protocol_incompatible 在 claimed 阶段 gate 未释放可安全回队」scenario 自洽）。`superseded` 恒为非定局（随 execution 交棒中断）。**定局性 SHALL 由「是否被 `final_attempt_id` 引用」决定，SHALL NOT 仅凭 `status` 一刀切判 `abandoned` 非定局**。所有 execution 自然完成 CAS SHALL 明确写成 `SET status='done' WHERE status='running' AND worker_generation=? AND worker_instance_id=?`，SHALL NOT 写 `SET status='succeeded'`。
 
 **attempt 状态消费者矩阵 SHALL 与 execution 消费者矩阵并列落地**（Review 第四轮 P1-2）——除 execution 层消费者外，attempt 层各终态 SHALL 明确以下消费口径：
 
@@ -70,7 +70,7 @@ retryable     = true | false                    -- 是否重排
 | `killed` | 否（用户主动） | 已终止 | 不触发续跑/流转 |
 | `abandoned`·`lease_reclaim`（prelaunch） | 否（非定局、claimed lease 回收、未起 CLI） | 折叠隐藏或标「已放弃」，SHALL NOT 显示为失败 | 不触发;execution 回 `queued` 重领 |
 | `abandoned`·`null_conversation_migration`（**claimed·CLI 未起无残留进程**，第十六轮 P1-A + 第十七轮 P0 收窄） | 否（基础设施/迁移中止、非业务失败） | 标「迁移待处理」（关联 execution=`recovery_blocked(null_conversation_migration)`）;`final_attempt_id` 指向它 | 不触发自动流转;execution `recovery_blocked` 不回队、等人工迁移出口 |
-| `abandoned`·`protocol_incompatible`（第十七轮 P1-B） | 否（协议不兼容中止、非业务失败） | 标「协议不兼容·待处理」（关联 execution=`recovery_blocked(protocol_incompatible)`）;`final_attempt_id` 指向它 | 不触发自动流转;等人工恢复出口 |
+| `abandoned`·`protocol_incompatible`（第十七轮 P1-B + 第十八轮按预算拆） | 否（协议不兼容中止、非业务失败） | **未耗尽预算**：折叠/标「等兼容 Worker」（非定局、final=NULL、execution 回 `queued`）;**预算耗尽**：标「协议不兼容·待处理」（定局、关联 execution=`recovery_blocked(protocol_incompatible)`、`final_attempt_id` 指向它） | 未耗尽预算→回队等兼容 Worker 重领;预算耗尽→不触发自动流转、等人工恢复出口 |
 | `orphaned`（第八轮 P1-B）——含 unsafe orphan/protocol mismatch（`process_not_confirmed_dead`）与 **running NULL 隔离（`null_conversation_migration`，第十七轮 P0）** | 否（基础设施中断、非业务失败，不计业务失败率） | 标「孤儿·待确认清理」;`process_not_confirmed_dead` 关联 execution=`recovery_blocked(process_not_confirmed_dead)`;running NULL 关联 execution=`recovery_blocked(null_conversation_migration)` + `process_cleanup_state`（`unconfirmed`=待确认清理、`confirmed`=派生展示「已清理·待迁移」）;`final_attempt_id` 指向该 orphaned attempt（**两子类 attempt 均恒 orphaned 不改写**） | 不触发自动流转;`process_not_confirmed_dead` 人工确认清理后恢复 recovery child;running NULL 经 `confirm_null_process_cleanup()` 翻 `confirmed` 后走 migration 出口建普通 successor |
 | `superseded` | 否 | 折叠（execution 已 superseded、由 recovery child 承接） | 不触发（避免误判 done/reviewing） |
 
@@ -563,7 +563,7 @@ execution 终态与其事件同事务（本 change SSE Requirement）、session 
 每种 reason 的 external pending intent SHALL 都不丢，**kill 仍是唯一取消 pending 的路径**。该矩阵 SHALL 同步进 spec、tasks 与 Runtime 产品动作（前端据 `blocked_reason` 给不同确认表单/前置提示），每种 reason SHALL 有独立 API/事务测试，避免「UI 都显示确认清理」但后台缺真正恢复条件。
 
 **🔴 分原因的真实写操作 SHALL 全部纳入 `resume_blocked_execution()` 单一原子事务（Review 第十二轮 P1-B）**：各 `blocked_reason` 除「校验前置」外还各有**副作用写入**，SHALL NOT 让它们在建 child 之外单独提交（否则「预算已加但 child 没建」「session 已清但恢复失败」半提交）。事务内固定步骤：校验前置 → 写 reason 对应副作用 → 定 `recovery_mode` → 转移/保留 external pending → 插唯一 child（`superseded_from=父`） → 写统一的 `recovery_resumed`+child `queued` 事件（child 流、无 `manual_recovery` 第二名，第十三轮 P1-C） → 单次提交，任一步失败整体回滚。各 reason 的副作用写入：
-- `recovery_budget_exhausted`：按**唯一 `grant_delta > 0`** 语义给该 recovery chain 补预算（`budget_limit += grant_delta`、`budget_remaining += grant_delta`、`version += 1` + 写审计 `last_reset_by/at/reason`，见下方「人工增/重置预算」的 grant_delta 定义），child 带新 budget（SHALL NOT 原值重启后立刻再 blocked）;SHALL NOT 用「写新预算值/覆盖 remaining」旧口径（绝对覆盖须走独立 admin override API）;
+- `recovery_budget_exhausted`：按**唯一 `grant_delta > 0`** 语义给该 recovery chain 补预算（`budget_limit += grant_delta`、`budget_remaining += grant_delta`、`version += 1` + 写审计 `last_reset_by/at/reason`，见下方「人工补预算」的 grant_delta 定义），child 带补足后预算（SHALL NOT 原值重启后立刻再 blocked）;SHALL NOT 用「写新预算值/覆盖 remaining」旧口径（绝对覆盖须走独立 admin override API）;
 - `poisoned_session`：**清除 poisoned session pointer**（禁 resume 旧 session）、强制 `recovery_mode=full_replay`;
 - 所有 reason：把 external pending intent 的归属/水位**转移到 child**（不丢用户新指令）;
 - 所有 reason：写恢复审计（`recovery_resumed`）。
@@ -676,9 +676,9 @@ execution 终态与其事件同事务（本 change SSE Requirement）、session 
 - **WHEN** 对 `recovery_budget_exhausted` 恢复（按 `grant_delta > 0` 补预算+审计）、对 `poisoned_session` 恢复（清 poisoned pointer + 强制 full_replay），在插入 child 前后任一写入点注入故障
 - **THEN** 预算 `grant_delta` 写入/审计/清 session/转移 pending/插 child/写事件全在 `resume_blocked_execution()` 单次提交内，任一失败整体回滚，不出现「预算已加但 child 没建」「session 已清但恢复失败」半提交;成功则 child 带新预算（`budget_remaining += grant_delta`，不原值立刻再 blocked）、poisoned 走 full_replay
 
-#### Scenario: 唯一冲突读回已存在 child 不重复 apply 副作用（第十二轮 P1-B）
+#### Scenario: 唯一冲突按 payload 分流、不重复 apply 副作用（第十二轮 P1-B + 第十七轮 P1-D）
 - **WHEN** 并发/重试触发第二次 `resume_blocked_execution()`，`UNIQUE(superseded_from)` 冲突
-- **THEN** 读回并返回已存在 child、`idempotent_replay=true`，SHALL NOT 再次加预算/再次清 session/再次转移 pending/再写审计——副作用只在首次成功建 child 的事务里发生一次
+- **THEN** SHALL 先比对本请求 `payload_hash` 与赢家 child 的 `canonical_request_id`——**payload 一致**（同意图并发/重放）读回并返回已存在 child、`idempotent_replay=true`;**payload 不同**（不同恢复意图，如不同 grant_delta/recovery_mode）返回 **409 `already_resolved`**（附赢家 `child_execution_id`/`canonical_request_id`）;两种情况都 SHALL NOT 再次加预算/再次清 session/再次转移 pending/再写审计——副作用只在首次成功建 child 的事务里发生一次，SHALL NOT 把不同意图静默映射到赢家 child
 
 #### Scenario: 人工恢复不得跳过 blocked_reason 前置确认
 - **WHEN** 某 `recovery_blocked(process_not_confirmed_dead)` execution 的旧进程树尚未确认清理，人工尝试恢复
@@ -780,7 +780,7 @@ effective chain state= 沿 superseded_from 链一路走到叶子 execution，取
 | 告警 | 只对 `unresolved blocked` 持续超阈值告警;`resumed blocked` 解除该父的阻塞告警（转而观察 child） |
 | 失败率统计 | `recovery_blocked` 本身不计业务失败率（同 orphaned 口径）;链最终叶子的业务终态才参与统计口径 |
 
-可选：为查询效率增设 `resolved_at`/`resolved_by` 冗余列，但 SHALL 与 child insert **在同一 `resume_blocked_execution()` 事务内写入**，SHALL NOT 作为独立可漂移的真相源——权威判定仍是 `EXISTS(child WHERE superseded_from=父)`。
+可选：为查询效率增设 `resolved_at`/`resolved_by`/`resolution_kind` 冗余列，但 SHALL 与承接 child/successor insert **在同一事务内写入**（recovery 类同 `resume_blocked_execution()` 事务、**migration 类同 migration 事务**，第十八轮），SHALL NOT 作为独立可漂移的真相源。**权威判定 SHALL 按 `resolution_kind` 分因果键（第十七轮 P1-A + 第十八轮 cache 一致性）**：recovery 类 = `EXISTS(child WHERE superseded_from=父)`;**migration 类 = `EXISTS(successor WHERE migration_from_execution_id=父)`**——冗余 cache SHALL NOT 只按 `superseded_from` 判定（否则 migration 已建 successor 但 cache 仍显未 resolved、NULL migration 父永久卡待办）。cache 与其对应 migration/recovery 事务在同一提交内写，二者 SHALL NOT 漂移。
 
 #### Scenario: dead-letter 只列 unresolved、有 child 即移出
 - **WHEN** 一个 `recovery_blocked` execution 先无 child（unresolved），随后经 `resume_blocked_execution()` 建了 recovery child（resumed）
@@ -812,21 +812,25 @@ effective chain state= 沿 superseded_from 链一路走到叶子 execution，取
 
 ### Requirement: task 级完成度聚合的确定性口径（第十七轮 P2-A）
 
-「任务整体完成度由 task 级 active execution 聚合判定」SHALL 有**确定性规则**，SHALL NOT 让「是否有 active execution / 最新 execution 终态」在多 execution 并存时产生歧义（否则 recovery child、普通 successor、migration successor、并存 pending 会让不同消费者得出不同完成度）。规则：
+「任务整体完成度由 task 级 execution 聚合判定」SHALL 有**确定性规则 + 语义正确的优先级聚合**，SHALL NOT 让「是否有 active execution / 最新 execution 终态」在多 execution 并存时产生歧义、**也 SHALL NOT 用「取单个最新终态 execution」掩盖较早仍 unresolved 的 lineage**（否则较晚完成的一条 agent/lineage 会遮蔽较早未闭合的 recovery/migration blocker）。规则：
 
-1. **active 定义**：一个 execution 是 active ⟺ `status IN (queued, claimed, running)`。task 有任一 active execution ⟹ task 仍在执行中（progress 不判完成/失败）。
-2. **「最新 execution」确定性排序**：无 active 时，task 完成度取**最新终态 execution**——排序键 SHALL 为 `(created_at DESC, id DESC)` 的**确定性全序**（`id` 全局单调、tie-break 唯一），SHALL NOT 用「随便取一条终态」或非确定聚合。
-3. **lineage 归并**：recovery child（`superseded_from`）与 migration successor（`migration_from_execution_id`）作为**新的独立 execution** 参与该排序，其前驱（`superseded`/`recovery_blocked` 父）SHALL NOT 再单独计入完成度（前驱已被承接）——即完成度看的是**每条 lineage 的叶子 execution 的终态**，多条并行 lineage 取最新叶子。
-4. **migration/recovery 终态不使 task 判失败**：叶子为 `recovery_blocked` 且 unresolved ⟹ task 归「阻塞待人工」而非「失败」;叶子 `done` ⟹ 完成;叶子 `failed`（业务失败终局）⟹ 失败。
-5. **确定性 SHALL 跨消费者一致**：progress 聚合、Runtime 总览、任务自动流转、告警 SHALL 全部用同一排序与归并口径，SHALL NOT 各自实现。
+1. **先构造所有因果叶子集合（SHALL NOT 只取一条）**：一个 task 可并行拥有多条独立因果线——每条 lineage 沿其因果键走到**叶子 execution**：recovery lineage 沿 `superseded_from`、migration lineage 沿 `migration_from_execution_id`、history backlog 沿 `history_backlog_from_execution_id`、external pending 承接的普通 successor 各成一条。聚合 SHALL 覆盖**全部叶子**，每条 lineage 的前驱（已被承接的 `superseded`/`recovery_blocked`/被迁移父）SHALL NOT 再单独计入（前驱已由叶子承接）。**SHALL NOT 跨不同 agent / 独立 intent 直接取一个「最新」值**——不同 agent 或独立 intent 是并列因果线，各自贡献一个叶子。
+2. **active 定义**：一个叶子 execution 是 active ⟺ `status IN (queued, claimed, running)`。
+3. **统一优先级聚合（非取最新）**：task 完成度 SHALL 按**固定优先级**从全部叶子归并，高优先级存在即覆盖低优先级——`active（任一叶子在执行）> unresolved blocked（任一叶子 recovery_blocked 且未被承接）> 失败/取消（任一叶子业务 failed/killed 终局）> 全部完成（所有叶子 done）`。即：只要有 active 叶子⟹「执行中」;无 active 但有 unresolved blocked 叶子⟹「阻塞待人工」（**SHALL NOT 被另一条已 done 的叶子掩盖**）;无 active、无 unresolved，但有业务失败叶子⟹「失败」;所有叶子 done⟹「完成」。
+4. **同优先级内的确定性 tie-break**：需要在同优先级叶子里选代表（如展示「哪条 blocker」）时，SHALL 用 `(created_at DESC, id DESC)` 全序（`id` 全局单调、tie-break 唯一），但该确定性排序**仅用于同优先级内选代表、SHALL NOT 用于跨优先级压制**。
+5. **确定性 + 优先级 SHALL 跨消费者一致**：progress 聚合、Runtime 总览、任务自动流转、告警 SHALL 全部用同一「全叶子集合 + 优先级归并」口径，SHALL NOT 各自实现、SHALL NOT 有的消费者取最新有的取优先级。
 
-#### Scenario: 多 execution 并存时完成度取确定性最新叶子
-- **WHEN** 一个 task 同时存在多条 lineage（如一条 recovery chain 叶子 `done`、一条因历史 backlog 建的普通 successor 仍 `running`），或有多条终态 execution
-- **THEN** 有任一 active（此处 `running` successor）⟹ task 判「执行中」不判完成;全部终态后按 `(created_at DESC, id DESC)` 全序取最新叶子终态判完成度;SHALL NOT 因消费者各自取不同 execution 而得出矛盾完成度
+#### Scenario: 较早 unresolved lineage 不被较晚 done lineage 掩盖
+- **WHEN** 一个 task 有两条独立 lineage：agent-A 的 recovery lineage 叶子 `recovery_blocked` 且 unresolved（较早，created_at 小）、agent-B 的 lineage 叶子 `done`（较晚，created_at 大）
+- **THEN** 聚合覆盖两条叶子，按优先级 `unresolved blocked > 全部完成` 判 task「阻塞待人工」;**SHALL NOT 因 `(created_at DESC,id DESC)` 取到较晚的 agent-B `done` 而误判 task 完成、掩盖 agent-A 的 unresolved blocker**
+
+#### Scenario: 多 lineage 有 active 叶子时判执行中
+- **WHEN** 一个 task 同时存在一条 recovery chain 叶子 `done` 与一条 history backlog successor 仍 `running`
+- **THEN** 有 active 叶子（running）⟹ 按最高优先级判「执行中」不判完成;全部终态后再按 unresolved>失败>完成 归并
 
 #### Scenario: migration successor 参与 task 聚合、NULL 父不重复计入
 - **WHEN** 一个 `recovery_blocked(null_conversation_migration)` 父经迁移建了普通 successor，successor 后续 `done`
-- **THEN** task 完成度取该 migration successor 叶子的 `done`、判完成;NULL 父作为已承接前驱 SHALL NOT 再单独计入使 task 判阻塞;排序/归并与 recovery child 同一口径
+- **THEN** migration lineage 叶子=该 successor `done`、NULL 父作为已承接前驱不单独计入;若无其他 unresolved/active 叶子则 task 判完成;排序/归并与 recovery lineage 同一口径
 
 ### Requirement: recovery chain 结构完整性与安全遍历
 
@@ -851,7 +855,7 @@ recovery child：
   superseded_from   = parent execution id
 ```
 
-- **`recovery_requests` 表（人工恢复请求真相源，承接 spec 上文「`manual_recovery_token` 持久化」要求）**：`{parent_execution_id, request_token, payload_hash, child_execution_id, actor, created_at}`，`UNIQUE(parent_execution_id, request_token)`（第二层 API 请求幂等键）。**winner/loser 两分支（第十六轮 P1-E，与上文「不同 token 并发输家」一致、不再矛盾）**：**winner request**（首次成功建 child）SHALL 与 recovery child insert 同 `resume_blocked_execution()` 事务写入（不独立提交，否则「有 request 无 child」孤立行）;**loser request**（不同 token 命中已存在 child）在失败的 child-insert 事务回滚后、SHALL 在**独立事务**里只写 `{本 token, payload_hash → existing child}` 映射、不重复副作用（SHALL NOT 在失败事务里补偿写）。父子基数仍由 `UNIQUE(superseded_from)` 保证，`recovery_requests` 不承担父子基数。
+- **`recovery_requests` 表（人工恢复请求真相源，承接 spec 上文「`manual_recovery_token` 持久化」要求）**：`{parent_execution_id, request_token, payload_hash, canonical_request_id, outcome, child_execution_id, actor, created_at}`，`UNIQUE(parent_execution_id, request_token)`（第二层 API 请求幂等键）。**字段语义（第十七轮 P1-D）**：`payload_hash`=本请求原始 payload 指纹;`canonical_request_id`=**规范化业务 payload 指纹**（赢家事务写入、供输家比对是否同意图）;`outcome ∈ {winner, idempotent_replay, rejected_already_resolved}`。**三分支（第十六轮 P1-E + 第十七轮 P1-D，与上文「不同 token 并发输家」一致、不再矛盾）**：**winner request**（首次成功建 child）SHALL 与 recovery child insert 同 `resume_blocked_execution()` 事务写入 `{outcome=winner, canonical_request_id→child}`（不独立提交，否则「有 request 无 child」孤立行）;**loser·payload 一致**（不同 token、`payload_hash` 匹配赢家 `canonical_request_id`）在失败的 child-insert 事务回滚后、SHALL 在**独立事务**里写 `{本 token, payload_hash, outcome=idempotent_replay → existing child}` 映射、不重复副作用（SHALL NOT 在失败事务里补偿写）、返回 `idempotent_replay=true`;**loser·payload 不同**（不同 token、payload 不匹配赢家）独立事务只写 `{本 token, payload_hash, outcome=rejected_already_resolved}` 审计、返回 409 `already_resolved`（附赢家 child/canonical_request_id）、SHALL NOT 静默映射不同意图到赢家 child。**自动 reclaim 获胜时同样 SHALL 写 `canonical_request_id`（规范化 reclaim operation 指纹），否则人工输家无从比对赢家意图**。父子基数仍由 `UNIQUE(superseded_from)` 保证，`recovery_requests` 不承担父子基数。
 - **`recovery_budgets` 表（恢复预算唯一真相源，chain 维度）**：`{recovery_chain_id (PK), budget_limit, budget_remaining, version, last_reset_by, last_reset_at, last_reset_reason}`。**预算 SHALL 只用 `budget_remaining` 单一真相源（第十五轮 P1-5B：字段名从 `budget_current` 改为 `budget_remaining` 消歧「已消费 vs 剩余」），SHALL NOT 与「按 `recovery_attempt` 比对 `budget_limit`」两套口径并存**（否则 remaining 计数与 lineage depth 两个真相源会漂移）。语义固定：
   ```text
   根 execution 同事务创建 recovery_budgets：budget_remaining = budget_limit，version = 1
@@ -860,7 +864,7 @@ recovery child：
   budget_remaining = 0 时 SHALL NOT 建 child、落 recovery_blocked(recovery_budget_exhausted)
   recovery_attempt：只表示不可回退的 lineage 深度（parent+1），人工补预算时 SHALL NOT 重置 attempt
   ```
-  **人工增/重置预算（`recovery_budget_exhausted` 恢复）SHALL 只保留 `grant_delta`（第十六轮 P1-E#3，删「追加 delta 或覆盖 remaining 二选一」——二选一会产生两套 API/审计行为）**：普通 resume 仅支持 `grant_delta > 0`（`budget_limit += grant_delta`、`budget_remaining += grant_delta`、`version += 1`、写审计 `last_reset_by/at/reason`），与 child insert 同 `resume_blocked_execution()` 事务提交;child 带新预算、SHALL NOT 原值立刻再 blocked。**若必须绝对覆盖 remaining，SHALL 另设独立 admin override API**（带 `expected_version` CAS + before/after 审计），SHALL NOT 与普通恢复混用同一 API/审计路径。
+  **人工补预算（`recovery_budget_exhausted` 恢复）SHALL 只有唯一语义 `grant_delta`（第十六轮 P1-E#3 + 第十八轮全文归一，删「增加或重置」「追加 delta 或覆盖 remaining 二选一」——二选一会产生两套 API/审计行为）**：普通 resume 仅支持 `grant_delta > 0`（`budget_limit += grant_delta`、`budget_remaining += grant_delta`、`version += 1`、写审计 `last_reset_by/at/reason`），与 child insert 同 `resume_blocked_execution()` 事务提交;child 带补足后预算、SHALL NOT 原值立刻再 blocked。**若必须绝对覆盖 `budget_remaining`，SHALL 另设独立 admin override API**（带 `expected_version` CAS + before/after 审计），SHALL NOT 与普通恢复混用同一 API/审计路径。**全文（spec/design/tasks/API 请求体/前端文案）SHALL NOT 出现「写新预算值」「增加或重置预算」等旧措辞**（仅可在 SHALL-NOT 否定语境或历史标记内引用）。
 - **最低硬约束层级（用户第十四轮拍板：应用层 + 迁移探针等价校验，不重建表加原生 FK）**：SQLite 无法对已有 `run_queue` 表 `ALTER` 加外键，故 **parent 存在性（规则 1）、scope 一致（规则 3）、recovery_attempt 单调（规则 4）SHALL 由中心化 child-insert 事务 + 迁移/CI 探针做 FK 等价校验**（不悬空、不跨 scope、attempt 连续），SHALL NOT 依赖「先查后插」应用层竞态判断（校验与 insert 须同一 SQL/事务原子完成）。**仅自环（规则 2）可用列级 `CHECK(id != superseded_from)`**（加列时即可带 CHECK，无需重建表）。所有 recovery child 创建 SHALL 经统一 helper（`resume_blocked_execution()` / reclaim 建 child），SHALL NOT 散落多处各写一遍校验。
 - **🔴 FK 等价 SHALL 覆盖创建后的删除与修改（第十五轮 P1-5C，不只 child insert）**：应用层 FK 等价若只在建 child 时校验，后续 cleanup/人工修复仍可破坏链完整性。故 SHALL 补：① execution 创建后其 `task_id/conversation_id/agent_slug/recovery_chain_id/recovery_attempt/superseded_from` 字段**永久不可变**（与 conversation 快照不可变一致）;② 删除仍被 child 引用（`EXISTS(superseded_from=该 execution)`）的 parent SHALL 被拒绝，或整条 chain 原子归档;③ cleanup 任务 SHALL NOT 单独删除 chain 中间节点;④ 删除 `recovery_budgets`/`recovery_requests` 行导致链失预算/审计真相源 SHALL 被拒绝;⑤ 周期性/迁移后 integrity probe SHALL 扫描 dangling parent、scope drift、attempt drift、孤立 budget/request;⑥ delete/update 竞态 SHALL 有与 insert 同等级的事务测试。
 
@@ -930,6 +934,13 @@ task_runs.run_queue_id         -- attempt 反向归属其 execution
 expand 期 SHALL 按上表用旧 `task_run_id` + execution 现状态回填两指针（存量终态行→`final_attempt_id`=旧值、`current_attempt_id`=NULL;存量在跑行→`current_attempt_id`=旧值、`final_attempt_id`=NULL;存量 queued 行→两者 NULL）;新消费者切换到读 `final_attempt_id`（终态产出）/`current_attempt_id`（在跑 attempt）后，contract 阶段 SHALL 删除旧 `run_queue.task_run_id` 列。选方案③而非「动态重定义旧列」因其**显式区分「当前尝试」与「最终定局尝试」**、最不易误读。SHALL NOT 保留「旧列语义不变 + 多 attempt」的模糊并存态——否则旧消费者可能读到第一次失败的 attempt 而忽略最终定局 attempt。
 
 **回滚边界 SHALL 收窄为「兼容读取版」而非任意旧版本**（Review 第四轮 P1-3）：expand/activate/contract 的回滚保证是「activate（开新状态写入 flag）后可回滚到**已支持读取新状态的 compatibility release**」，SHALL NOT 声称可回滚到完全不认识 `claimed/superseded/recovery_blocked` 的 pre-expand 二进制。系统 SHALL 明确：① activate 后允许回滚到的**最老 protocol_version / compatibility floor**;② 若必须回滚到 pre-expand 旧版本，SHALL 先关新状态写入 flag、停写并排空在跑 execution、把所有新状态存量处理为旧版本可识别的终态，再启动旧版本;③ `mixed_version_probe` 中的「旧 API」SHALL 指兼容读取版，SHALL NOT 指完全未升级的旧 API。`worker_state.protocol_version` 与 DB schema 不匹配时 SHALL fail-closed 不接管（承接原有约定）。
+
+**🔴 `terminal_source_status` 的可执行迁移与 CHECK（第十八轮，补第十七轮 P1-C 只有概念列无迁移）**：`final_attempt_id=NULL` 唯一例外条件引用 `run_queue.terminal_source_status`，故该列 SHALL 有完整的**列定义 + CHECK 表达式 + 历史回填 + 不可变 + expand/activate/rollback**方案，SHALL NOT 停留在概念列：
+- **列定义**：`run_queue.terminal_source_status TEXT`（可空——仅进入终态时写入;非终态行为 NULL），取值域 `∈ {queued, claimed, running}`（进终态那一刻的 source status 快照）。
+- **CHECK 等价（SQLite 无法 ALTER 加表级 CHECK，SHALL 由中心化终态事务 + 迁移/CI 探针做等价校验）**：① 终态行 SHALL 有非空 `terminal_source_status`;② `final_attempt_id=NULL` 当且仅当 `status=recovery_blocked AND blocked_reason=null_conversation_migration AND terminal_source_status=queued`（唯一例外）;③ `terminal_source_status=claimed/running` 的 null-migration 终态 SHALL `final_attempt_id` 非空（claimed/running 必有 attempt）;④ 非终态行 `terminal_source_status` SHALL 为 NULL。
+- **写入时机与不可变**：`terminal_source_status` SHALL 在 `finish_execution()` / `quarantine_null_execution()` 落终态的**同一事务内**写入（值=CAS source status），写入后**永久不可变**（与 conversation 快照、recovery lineage 字段同不可变约束，delete/update 守卫覆盖它）。
+- **expand/activate/rollback**：expand 加可空列（默认 NULL、旧版本忽略）→ **历史终态回填**：对存量终态行按其 `final_attempt_id`/来源推断回填（有 attempt 的终态回填其 claim 时 source=claimed/running;queued-NULL 隔离终态回填 queued;推断不了的标记待人工核）→ activate 开新写入 flag（新终态强制写 `terminal_source_status`）→ observe（探针校验 CHECK 等价）→ contract。回滚遵兼容读取版边界（activate 后回滚到能读该列的 compatibility release）。
+- 探针 `terminal_source_status_check_probe`（四条 CHECK 等价：终态非空/final=NULL 唯一例外/claimed·running 必有 final/非终态为 NULL）、`terminal_source_status_backfill_probe`（历史终态回填正确、推断不了标记待人工）、`terminal_source_status_immutable_probe`（写入后 update 被守卫拒绝）。
 
 #### Scenario: 混合版本不误判（真可回滚）
 - **WHEN** 新 Worker 已开始写 `claimed/superseded`，但旧 API 实例（尚未升级或已回滚）仍在线读取 run_queue

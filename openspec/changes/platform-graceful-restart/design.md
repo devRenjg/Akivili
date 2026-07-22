@@ -74,7 +74,8 @@ claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功
                          orphaned=进程树未确认退出（可能存活），blocked_reason 分子类：unsafe/protocol mismatch → recovery_blocked(process_not_confirmed_dead)；
                          running NULL 隔离 → recovery_blocked(null_conversation_migration)+process_cleanup_state(unconfirmed|confirmed)（第十七轮 P0：attempt 恒 orphaned 不改写、进程确认与否走正交字段）；均不得回队。
   ⚠ abandoned 定局性由 final_attempt_id 是否引用决定（第十六轮 P1-A）：lease_reclaim=非定局·execution 回 queued·不被 final 引用；
-    null_conversation_migration(claimed)/protocol_incompatible=定局·被 final 引用·driven execution=recovery_blocked(对应 reason)·不回队。消费者 SHALL NOT 仅凭 status=abandoned 判定局性/回队性。
+    null_conversation_migration(claimed)=定局·被 final 引用·driven execution=recovery_blocked(null_conversation_migration)·不回队；
+    protocol_incompatible **按预算拆（第十八轮）**：未耗尽预算=非定局·final=NULL·回 queued(与 lease_reclaim 同源)，预算耗尽=定局·被 final 引用·recovery_blocked(protocol_incompatible)。消费者 SHALL NOT 仅凭 status=abandoned 判定局性/回队性。
   ⚠ 回队性是 execution 处置属性、不是 attempt 属性：abandoned 只表「无残留进程」，SHALL NOT 隐含「一定回队」——
     普通 claim lease 回收的 abandoned 走同 execution 回队重试；claimed NULL migration 的 abandoned 其 execution=recovery_blocked(null_conversation_migration) 不回队、等人工迁移。
   ⚠ 第十七轮 P0：running NULL 隔离的 attempt 恒 orphaned（不再随「已确认退出」改写为 abandoned），两阶段清理由 process_cleanup_state + confirm_null_process_cleanup() CAS 表达、attempt 终态不可逆。
