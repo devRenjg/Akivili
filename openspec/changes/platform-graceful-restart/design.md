@@ -203,7 +203,7 @@ claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功
 
 ### 决策 9：SSE 续传完整契约——统一事件序列游标（Review P0-7/P0-E）
 
-SSE 不止「带最大 log id 重连」，需完整契约。**核心修正：Last-Event-ID SHALL NOT 用 `run_logs.id`**——控制事件（`queued/run_claimed/run_started/retry_scheduled/superseded/terminal`）不写在 `run_logs` 里，用 log id 当游标会导致这些控制事件在重连后**漏投或错序**（例如断线期间刚好发生 superseded，重连按 log id 续传收不到跳转事件，前端卡在死 run）。
+SSE 不止「带最大 log id 重连」，需完整契约。**核心修正：Last-Event-ID SHALL NOT 用 `run_logs.id`**——控制事件（`queued/run_claimed/run_started/retry_scheduled/superseded/recovery_resumed/terminal`）不写在 `run_logs` 里，用 log id 当游标会导致这些控制事件在重连后**漏投或错序**（例如断线期间刚好发生 superseded，重连按 log id 续传收不到跳转事件，前端卡在死 run）。`recovery_resumed` 是统一恢复控制事件（第十三轮 P1-C，`source=manual|reclaim` 区分来源，删 `manual_recovery` 第二名），写在 recovery child 事件流。
 
 - **新增 `execution_events` 统一事件表 + 全局 AUTOINCREMENT 游标（Review P0-3）**：`(id INTEGER PRIMARY KEY AUTOINCREMENT, execution_id, event_type, payload_json, created_at)`。**游标用全局自增 `id`**，不自己算 per-execution seq——`SELECT MAX(seq)+1` 在 API/Worker/日志线程/终态线程并发写时会竞争或撞唯一键。SSE 查询 `WHERE execution_id=? AND id > ? ORDER BY id`，`id: <全局id>` 做 Last-Event-ID。全局自增在 execution 内**有间隙没关系**（只要单调），实现最简、天然原子（SQLite AUTOINCREMENT 由引擎保证）。（备选：run_queue 加 `next_event_seq` 用 `UPDATE ... SET next_event_seq=next_event_seq+1 RETURNING` 原子分配 per-execution seq；本方案取更简的全局自增。）**所有** SSE 事件（含 log 与所有控制事件）都先落这张表再推。
 - **🔴 双写同事务（Review P0-3，避免半提交）**：状态/数据写入与其对应事件写入 SHALL 在**同一事务**提交，否则会出现「有日志无 log event」「已终态但 SSE 永远收不到 terminal」「recovery child 已建但父 execution 无 superseded 跳转」。必须同事务的组合：
