@@ -214,6 +214,42 @@ STRUCTURAL = [
          reason="SSE event payload 字段用 source（manual|reclaim），recovery_source 仅 HTTP 响应体字段（第十五轮 P1-1）",
          scope="segment",
          allow=["SHALL NOT", "不得", "而非", "非 recovery_source", "仅 HTTP", "HTTP 响应"]),
+    # ── 第十七轮新增结构规则（7 条，守护本轮 P0/P1/P2 修复不回归） ──
+    # R17-1（P0）：running NULL / null migration 确认退出后 attempt 恒 orphaned，SHALL NOT 改写为 abandoned。
+    dict(pattern=r"(running\s*NULL|null[_\s]?conversation[_\s]?migration|process_cleanup_state\s*=?\s*confirmed|已确认(完整)?(进程树)?退出)[^。；;!？|]*?attempt[^。；;!？|]{0,10}(落|→|->|改写?为|变(成|为))\s*`?abandoned`?",
+         reason="running NULL/null migration 确认退出后 attempt 恒 orphaned（第十七轮 P0 终态不可逆），SHALL NOT 改写为 abandoned",
+         scope="segment",
+         allow=["SHALL NOT", "恒 orphaned", "恒 `orphaned`", "不改写", "永久保持", "永久 orphaned", "claimed", "不再随"]),
+    # R17-2（P1-B）：orphaned 的 blocked_reason 按来源子类分，SHALL NOT 恒/一律映射 process_not_confirmed_dead。
+    dict(pattern=r"orphaned[^。；;!？|]*?(恒|一律|都|统一|均)[^。；;!？|]*?process_not_confirmed_dead",
+         reason="orphaned 的 blocked_reason 按来源子类分（unsafe→process_not_confirmed_dead / running NULL→null_conversation_migration），SHALL NOT 恒映射 process_not_confirmed_dead（第十七轮 P1-B）",
+         scope="segment",
+         allow=["SHALL NOT", "不得", "按来源子类", "子类", "两子类", "而非", "不假定"]),
+    # R17-3（P1-C）：final=NULL 唯一例外 SHALL 引用持久列 terminal_source_status，SHALL NOT 引用运行期 source_status。
+    dict(pattern=r"final[^。；;!？|]{0,16}NULL[^。；;!？|]*?(?<!terminal_)source_status\s*=?\s*queued",
+         reason="final=NULL 唯一例外 SHALL 引用持久不可变列 terminal_source_status，SHALL NOT 引用运行期 source_status（第十七轮 P1-C）",
+         scope="segment",
+         allow=["terminal_source_status", "SHALL NOT", "不可变", "非运行期", "固化"]),
+    # R17-4（P1-A）：null_conversation_migration 父的 resolved 派生认 migration_from_execution_id，非 superseded_from。
+    dict(pattern=r"null[_\s]?conversation[_\s]?migration[^。；;!？|]*?(resolved|resumed|已恢复|移出待办|派生)[^。；;!？|]*?superseded_from",
+         reason="null_conversation_migration 父的 resolved 派生认 migration_from_execution_id（非 superseded_from），否则永久 unresolved（第十七轮 P1-A）",
+         scope="segment",
+         allow=["migration_from", "SHALL NOT", "而非 superseded_from", "不挂 superseded_from", "不认 superseded_from", "同时认"]),
+    # R17-5（P1-D）：不同 token 输家 SHALL 按 payload 分流（一致映射 existing / 不同 payload 返 409），不得无条件映射到赢家。
+    dict(pattern=r"不同\s*token[^。；;!？|]*?(读回|返回|映射到?|→|->)[^。；;!？|]*?(existing|已存在|赢家)[^。；;!？|]*?(child|successor)",
+         reason="不同 token 输家 SHALL 按 payload 分流——一致才映射 existing child/successor、不同 payload 返 409 already_resolved（第十七轮 P1-D），SHALL NOT 无条件映射到赢家",
+         scope="segment",
+         allow=["payload 一致", "payload 不同", "409", "already_resolved", "SHALL NOT", "canonical_request_id", "分两种", "按 payload", "同意图"]),
+    # R17-6（P1-E）：人工补预算只保留 grant_delta，SHALL NOT 用「写新预算值/覆盖 remaining」旧口径。
+    dict(pattern=r"(新预算值|新预算)[^。；;!？|]{0,8}(写入|覆盖|设置|设为|填入)",
+         reason="人工补预算只保留 grant_delta（budget_remaining += grant_delta），SHALL NOT 用「写新预算值/覆盖 remaining」旧口径（绝对覆盖走独立 admin override，第十六轮 P1-E#3 / 第十七轮 P1-E）",
+         scope="segment",
+         allow=["grant_delta", "SHALL NOT", "admin override", "绝对覆盖", "独立 admin", "旧口径"]),
+    # R17-7（P2-B）：reclaim 交棒承接 superseded 父无 blocked_reason，SHALL NOT 假定 recovery_resumed 恒带 blocked_reason。
+    dict(pattern=r"(reclaim|superseded\s*父|交棒父)[^。；;!？|]*?(恒|必|一律|都|必带|必填)[^。；;!？|]*?blocked_reason",
+         reason="reclaim 交棒承接 superseded 父无 blocked_reason，recovery_resumed 的 blocked_reason 仅承接 recovery_blocked 父时必填（第十七轮 P2-B）",
+         scope="segment",
+         allow=["SHALL NOT", "缺省", "仅承接 recovery_blocked", "无 blocked_reason", "不假定", "为 null", "可选", "非必填"]),
 ]
 
 # 显式历史标记（第十二轮 P1-D 引入，第十三轮 P1-E 收紧作用域）：需引用已废旧模型时，
@@ -608,6 +644,64 @@ def _self_test():
     check("P1-1 recovery_source 仅 HTTP 放行",
           not any(k == "structural" for _, k, _, _ in scan_text(
               "recovery_source 仅 HTTP 响应体字段、SSE event payload 用 source 而非 recovery_source")))
+
+    # ── 第十七轮新增自测（7 条规则各正负样本） ──
+    # 37. R17-1（P0）：running NULL 确认退出后 attempt 落 abandoned → 命中
+    check("R17-1 running NULL 确认退出 attempt→abandoned 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "running NULL 已确认退出后 attempt 落 abandoned 并路由 migration")))
+    # 38. R17-1 正确口径：attempt 恒 orphaned 不改写 → 放行
+    check("R17-1 attempt 恒 orphaned 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "running NULL 已确认退出后 attempt 恒 orphaned 不改写，只翻 process_cleanup_state=confirmed")))
+    # 39. R17-2（P1-B）：orphaned 恒映射 process_not_confirmed_dead → 命中
+    check("R17-2 orphaned 恒 process_not_confirmed_dead 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "orphaned 一律 process_not_confirmed_dead 驱动 recovery_blocked")))
+    # 40. R17-2 正确口径：按子类分 → 放行
+    check("R17-2 orphaned 子类分放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "orphaned 的 blocked_reason 按来源子类分，SHALL NOT 恒映射 process_not_confirmed_dead")))
+    # 41. R17-3（P1-C）：final=NULL 例外引用运行期 source_status=queued → 命中
+    check("R17-3 final=NULL 引用 source_status 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "该终态 final_attempt_id=NULL 合法（例外：recovery_blocked AND null_conversation_migration AND source_status=queued）")))
+    # 42. R17-3 正确口径：引用 terminal_source_status → 放行
+    check("R17-3 terminal_source_status 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "final=NULL 例外引用固化不可变列 terminal_source_status=queued，非运行期 source_status")))
+    # 43. R17-4（P1-A）：null migration resolved 认 superseded_from → 命中
+    check("R17-4 null migration resolved 认 superseded_from 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "null_conversation_migration 父的 resolved 派生查 superseded_from 判断是否已恢复")))
+    # 44. R17-4 正确口径：认 migration_from → 放行
+    check("R17-4 null migration 认 migration_from 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "null_conversation_migration 父的 resolved 派生认 migration_from_execution_id 而非 superseded_from")))
+    # 45. R17-5（P1-D）：不同 token 无条件读回赢家 child → 命中
+    check("R17-5 不同 token 无条件映射赢家被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "不同 token 并发时读回已存在 child 返回 idempotent_replay")))
+    # 46. R17-5 正确口径：按 payload 分流 → 放行
+    check("R17-5 按 payload 分流放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "不同 token 输家按 payload 分两种：payload 一致读回 existing child、payload 不同返 409 already_resolved")))
+    # 47. R17-6（P1-E）：写新预算值/覆盖 → 命中
+    check("R17-6 写新预算值被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "把人工给的新预算值写入该 recovery chain 的预算记录")))
+    # 48. R17-6 正确口径：grant_delta → 放行
+    check("R17-6 grant_delta 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "按唯一 grant_delta>0 补预算（budget_remaining += grant_delta），绝对覆盖走独立 admin override")))
+    # 49. R17-7（P2-B）：reclaim 父恒带 blocked_reason → 命中
+    check("R17-7 reclaim 父恒带 blocked_reason 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "reclaim 交棒的 recovery_resumed 必带 blocked_reason 供消费者识别")))
+    # 50. R17-7 正确口径：superseded 父无 blocked_reason → 放行
+    check("R17-7 superseded 父无 blocked_reason 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "reclaim 交棒承接 superseded 父时无 blocked_reason（缺省/null），仅承接 recovery_blocked 父时必填")))
 
     passed = sum(1 for _, ok in cases if ok)
     print("🧪 self-test")

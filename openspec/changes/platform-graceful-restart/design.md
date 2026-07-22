@@ -66,17 +66,18 @@ attempt 层（task_runs.status）：
 claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功 = execution 的定局 attempt)
                              ├─→ failed             (含 failure_stage=prestart|running，第六轮 P1-2 方案 B)
                              ├─→ killed
-                             ├─→ abandoned          (无残留进程的非成功中止；正交 abandon_stage(prelaunch|running)+abandon_reason(lease_reclaim|null_conversation_migration)；定局性由 final_attempt_id 引用决定非 status，第十六轮 P1-A)
-                             ├─→ orphaned           (running 中未确认死亡的孤儿；进程可能存活，非 abandoned，第八轮 P1-B)
+                             ├─→ abandoned          (无残留进程的非成功中止；正交 abandon_stage(prelaunch|running)+abandon_reason(lease_reclaim|null_conversation_migration·claimed·CLI未起|protocol_incompatible)；定局性由 final_attempt_id 引用决定非 status，第十六轮 P1-A + 第十七轮 P0/P1-B)
+                             ├─→ orphaned           (进程树未确认退出的孤儿；进程可能存活，非 abandoned，第八轮 P1-B；blocked_reason 子类：unsafe/protocol mismatch=process_not_confirmed_dead / running NULL 隔离=null_conversation_migration，第十七轮 P0/P1-B)
                              └─→ superseded
   失败正交字段：failure_stage(prestart|running) + failure_class(infra|config|business) + retryable(bool)
-  abandoned vs orphaned：abandoned=无残留进程（abandon_reason=lease_reclaim·CLI 从未起 / null_conversation_migration·running 已确认退出，第十五/十六轮）；
-                         orphaned=进程树未确认退出（可能存活）、驱动 execution=recovery_blocked(process_not_confirmed_dead)、不得回队。
+  abandoned vs orphaned：abandoned=无残留进程（abandon_reason=lease_reclaim·CLI 从未起 / null_conversation_migration·claimed NULL·CLI 未起 / protocol_incompatible，第十五~十七轮）；
+                         orphaned=进程树未确认退出（可能存活），blocked_reason 分子类：unsafe/protocol mismatch → recovery_blocked(process_not_confirmed_dead)；
+                         running NULL 隔离 → recovery_blocked(null_conversation_migration)+process_cleanup_state(unconfirmed|confirmed)（第十七轮 P0：attempt 恒 orphaned 不改写、进程确认与否走正交字段）；均不得回队。
   ⚠ abandoned 定局性由 final_attempt_id 是否引用决定（第十六轮 P1-A）：lease_reclaim=非定局·execution 回 queued·不被 final 引用；
-    null_conversation_migration=定局·被 final 引用·driven execution=recovery_blocked(null_conversation_migration)·不回队。消费者 SHALL NOT 仅凭 status=abandoned 判定局性/回队性。
+    null_conversation_migration(claimed)/protocol_incompatible=定局·被 final 引用·driven execution=recovery_blocked(对应 reason)·不回队。消费者 SHALL NOT 仅凭 status=abandoned 判定局性/回队性。
   ⚠ 回队性是 execution 处置属性、不是 attempt 属性：abandoned 只表「无残留进程」，SHALL NOT 隐含「一定回队」——
-    普通 claim lease 回收的 abandoned 走同 execution 回队重试；NULL migration 已确认退出的 abandoned 其 execution=
-    recovery_blocked(null_conversation_migration) 不回队、等人工迁移（第十五轮 P1-3，两者 attempt 同为 abandoned、execution 处置不同）
+    普通 claim lease 回收的 abandoned 走同 execution 回队重试；claimed NULL migration 的 abandoned 其 execution=recovery_blocked(null_conversation_migration) 不回队、等人工迁移。
+  ⚠ 第十七轮 P0：running NULL 隔离的 attempt 恒 orphaned（不再随「已确认退出」改写为 abandoned），两阶段清理由 process_cleanup_state + confirm_null_process_cleanup() CAS 表达、attempt 终态不可逆。
 ```
 
 - **无 accepted 独立态（Review P0-A，用户拍板删）**：`POST /tasks/{id}/dispatch` 在**同一事务**内写用户消息 + 建 `queued` execution，**事务提交后才返回** `execution_id`（= run_queue_id）。不设「已 accepted 但未 queued」的悬空态，省一个 outbox/promoter + orphan sweeper。
@@ -85,7 +86,7 @@ claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功
 - **running**：CLI 已起、`pid + pid_create_time + worker_generation + worker_instance_id` 落该 attempt 行。`claimed→running` 亦用 CAS（校验 `claim_owner`/`claim_generation` 未变才转）。
 - **终态**：execution 终态 `done`/failed/killed/superseded/recovery_blocked（成功=`done`，非 `succeeded`），由定局 attempt 决定，均以 CAS 落定（自然完成 `SET status='done' WHERE status='running' AND worker_generation=? AND worker_instance_id=?`，或 reclaim 场景的 generation CAS）；定局 attempt 成功=`succeeded` 驱动 execution=`done`，非定局 attempt 落 `abandoned/superseded`（失败 attempt 一律 `failed` + `failure_stage`，第六轮 P1-2 方案 B）。`recovery_blocked` 为 dead-letter 终态，需人工介入，不自动再生成 recovery child。
 
-**状态消费者矩阵（Review P0-A：从阶段 6 前移到阶段 0/1；第九轮补 `orphaned`）**：引入 `claimed`/`superseded`/`orphaned` 后，所有只认 `queued`/`running` 的消费者（progress 聚合、Runtime 总览、任务自动流转、孤儿巡检、失败归因、前端 `RunRow.vue`/`Runtime.vue` 状态色）**必须同步识别新状态**，否则会把 `claimed` 误判为空闲、把 `superseded` 落入成功图标、把 `orphaned` 误当业务 failed 或 abandoned。`orphaned`（第八轮 P1-B）SHALL 全消费者对齐：不计业务失败率、Runtime 显示「孤儿·进程未确认退出」+ 旧 pid/generation + 人工「确认已清理后重试」入口、`final_attempt_id` 指向它、其 execution=`recovery_blocked(process_not_confirmed_dead)`、纳入孤儿巡检但不触发自动流转、SSE terminal/recovery payload 带 orphaned+blocked_reason。完整状态矩阵 + 允许转换表在阶段 1 引入状态时同步落地，不留到阶段 6。
+**状态消费者矩阵（Review P0-A：从阶段 6 前移到阶段 0/1；第九轮补 `orphaned`）**：引入 `claimed`/`superseded`/`orphaned` 后，所有只认 `queued`/`running` 的消费者（progress 聚合、Runtime 总览、任务自动流转、孤儿巡检、失败归因、前端 `RunRow.vue`/`Runtime.vue` 状态色）**必须同步识别新状态**，否则会把 `claimed` 误判为空闲、把 `superseded` 落入成功图标、把 `orphaned` 误当业务 failed 或 abandoned。`orphaned`（第八轮 P1-B）SHALL 全消费者对齐：不计业务失败率、Runtime 显示「孤儿·进程未确认退出」+ 旧 pid/generation + 人工「确认已清理后重试」入口、`final_attempt_id` 指向它、纳入孤儿巡检但不触发自动流转、SSE terminal/recovery payload 带 orphaned+blocked_reason。**orphaned 的 execution `blocked_reason` 按来源子类分（第十七轮 P0/P1-B，消费者 SHALL NOT 假定 orphaned 恒 `process_not_confirmed_dead`）**：unsafe orphan / protocol mismatch（CLI 已起残留）→ `recovery_blocked(process_not_confirmed_dead)`、人工确认清理后建 recovery child；**running NULL 隔离 → `recovery_blocked(null_conversation_migration)` + `process_cleanup_state(unconfirmed|confirmed)`（attempt 恒 orphaned 不改写），`unconfirmed` 显示「孤儿·待确认清理」、`confirmed` 派生展示「已清理·待迁移」，恢复出口是 migration 普通 successor 而非 recovery child**。完整状态矩阵 + 允许转换表在阶段 1 引入状态时同步落地，不留到阶段 6。
 
 **7 条不变量**（实现必须逐条满足）：
 
@@ -219,7 +220,7 @@ SSE 不止「带最大 log id 重连」，需完整契约。**核心修正：Las
   - 终态转换 + `terminal` event
   - `superseded` + recovery child 入队 + `superseded` event + child `recovery_resumed{source=reclaim}` event + child `queued` event（第十五轮 P1-1：自动 supersede/reclaim 建的 child 与人工恢复共用统一 `recovery_resumed`，只是 source=reclaim）
 - **`run_logs` 加 `meta_json` 列**：承载 log 事件需要的结构化附加信息（channel/tool/tool_input/tool_output 等），使 log 事件可从 run_logs + meta 完整重建，`execution_events` 的 log 行只需引用 run_log id。
-- 事件类型：`queued / run_claimed{task_run_id, attempt_no}（领取、CLI 未起，第九轮） / run_started{task_run_id, attempt_no}（CLI 启动） / retry_scheduled{attempt_id, attempt_no, failure_stage, failure_class, retryable, next_retry_at} / log{run_log_id,channel,content,tool,tool_input,tool_output,meta} / superseded{successor_execution_id} / recovery_resumed{source, actor?, recovery_parent_id, child_execution_id, blocked_reason, request_token?}（第十三轮 P1-C，人工/自动恢复统一控制事件、写在 recovery child 事件流、无 `manual_recovery` 第二名） / terminal{status} / heartbeat`（heartbeat 不落表、不占游标）。**此枚举 SHALL 与 spec 控制事件 Requirement、tasks 1.6/1.6a/1.6c、前端消费者保持完全一致的唯一真相源，只含 `recovery_resumed`（第十四轮 P1-1）。**
+- 事件类型：`queued / run_claimed{task_run_id, attempt_no}（领取、CLI 未起，第九轮） / run_started{task_run_id, attempt_no}（CLI 启动） / retry_scheduled{attempt_id, attempt_no, failure_stage, failure_class, retryable, next_retry_at} / log{run_log_id,channel,content,tool,tool_input,tool_output,meta} / superseded{successor_execution_id} / recovery_resumed{source, recovery_reason(handover|orphan_reclaim|manual_blocked_resume), actor?, recovery_parent_id, child_execution_id, blocked_reason?, request_token?}（第十三轮 P1-C + 第十七轮 P2-B，人工/自动恢复统一控制事件、写在 recovery child 事件流、无 `manual_recovery` 第二名;`recovery_reason` 必填、`blocked_reason` 仅承接 recovery_blocked 父时必填、reclaim 交棒 superseded 父时缺省） / terminal{status} / heartbeat`（heartbeat 不落表、不占游标）。**此枚举 SHALL 与 spec 控制事件 Requirement、tasks 1.6/1.6a/1.6c、前端消费者保持完全一致的唯一真相源，只含 `recovery_resumed`（第十四轮 P1-1）。**
 - **重连**：客户端带 `Last-Event-ID: <id>` → 服务端 `SELECT ... FROM execution_events WHERE execution_id=? AND id > ? ORDER BY id` 回放，控制事件与 log 事件**统一有序、不重不漏**。
 - **superseded 跳转 + 全局游标续订（Review 第四轮 P0-5：删除「独立 id 序列」表述）**：run 被交棒中断 → 同事务按固定插入顺序「建 recovery child execution → 写父 `superseded{successor_execution_id}` event → 写 child 的 `recovery_resumed{source=reclaim}` event → 写 child 的 `queued` event → 提交」（第十四轮 P1-1：自动 reclaim/交棒建的 recovery child SHALL 同人工恢复一样发统一 `recovery_resumed`，只是 `source=reclaim` 不带人工 actor），使 child 事件（recovery_resumed、queued）的全局 id **必然大于**父 superseded event id → 前端收到父 superseded 后订阅 successor，**继续携带当前全局 `Last-Event-ID`**（`execution_events.id` 全局单调，不存在 per-execution 独立序列，不重置游标），服务端 `WHERE execution_id=child AND id > last_global_id ORDER BY id` 即无损取到 child recovery_resumed/queued 及后续。断线期间发生的 superseded 因落在 execution_events，重连必能收到。**两种 child 订阅口径 SHALL 区分**：经父 `superseded` 跳转的自动续订走本条「携带当前全局 Last-Event-ID + child 事件全局 id 必然更大」协议;人工 `POST /resume` 发现的 child 走「从 child 自身起点回放、不携带父游标」协议（见 resume Requirement），两口径不并存、不混用同一探针。
 - queue 尚未建 attempt 时订阅 → 先收 `queued` 占位（同样是 execution_events 的一条）。
