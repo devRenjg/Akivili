@@ -250,6 +250,27 @@ STRUCTURAL = [
          reason="reclaim 交棒承接 superseded 父无 blocked_reason，recovery_resumed 的 blocked_reason 仅承接 recovery_blocked 父时必填（第十七轮 P2-B）",
          scope="segment",
          allow=["SHALL NOT", "缺省", "仅承接 recovery_blocked", "无 blocked_reason", "不假定", "为 null", "可选", "非必填"]),
+    # ── 第十八轮新增结构规则（4 条，守护本轮 P1 修复不回归） ──
+    # R18-1（req 幂等）：UNIQUE(superseded_from) 冲突后无条件读回已存在 child（不分 payload）即违规——须按 payload 分流。
+    dict(pattern=r"(UNIQUE\s*\(\s*superseded_from\s*\)|唯一冲突)[^。；;!？|]*?(读回|返回|映射到?)[^。；;!？|]*?(已存在|existing)\s*child(?![^。；;!？|]*payload)",
+         reason="UNIQUE(superseded_from) 冲突后 SHALL 按 payload 分流（一致→existing child/idempotent_replay、不同→409 already_resolved），SHALL NOT 无条件读回已存在 child（第十八轮 P1-req）",
+         scope="segment",
+         allow=["payload 一致", "payload 不同", "比对", "canonical_request_id", "409", "already_resolved", "SHALL NOT", "分两种", "分流", "分三"]),
+    # R18-2（task 聚合）：无 active 取「单个/最新」终态 execution 判完成度即违规——须按全叶子优先级聚合。
+    dict(pattern=r"(无\s*active|task\s*完成度|任务整体完成度)[^。；;!？|]*?(取|按)[^。；;!？|]*?(最新|单个|一条)[^。；;!？|]*?(终态\s*)?execution",
+         reason="task 完成度 SHALL 构造全部因果叶子按优先级(active>unresolved>失败>完成)聚合，SHALL NOT 取单个最新终态 execution(会掩盖较早 unresolved lineage)（第十八轮 P1-agg）",
+         scope="segment",
+         allow=["SHALL NOT", "全部叶子", "全叶子", "优先级", "所有因果叶子", "不掩盖", "同优先级内", "选代表", "tie-break"]),
+    # R18-3（protocol 定局性）：protocol_incompatible abandoned 恒/一律定局即违规——须按预算拆。
+    dict(pattern=r"protocol[_\s]?incompatible[^。；;!？|]*?(恒|一律|均|都|始终)[^。；;!？|]*?(定局|final)",
+         reason="protocol_incompatible abandoned 定局性 SHALL 按预算拆(未耗尽=非定局回queued/耗尽=定局recovery_blocked)，SHALL NOT 一律判定局（第十八轮 P1-proto）",
+         scope="segment",
+         allow=["SHALL NOT", "按预算拆", "未耗尽", "预算耗尽", "非定局", "分两支"]),
+    # R18-4（grant_delta）：出现「增加或重置预算 / 写新预算值」肯定式即违规——只保留 grant_delta。
+    dict(pattern=r"(增加或重置|写\s*新预算值|覆盖\s*budget_remaining|重置某级预算)",
+         reason="人工补预算只保留 grant_delta 唯一语义，SHALL NOT 用「增加或重置/写新预算值/覆盖 budget_remaining」旧措辞（绝对覆盖走独立 admin override，第十八轮 P1-budget）",
+         scope="segment",
+         allow=["SHALL NOT", "grant_delta", "admin override", "删", "旧措辞", "旧口径", "而非"]),
 ]
 
 # 显式历史标记（第十二轮 P1-D 引入，第十三轮 P1-E 收紧作用域）：需引用已废旧模型时，
@@ -702,6 +723,40 @@ def _self_test():
     check("R17-7 superseded 父无 blocked_reason 放行",
           not any(k == "structural" for _, k, _, _ in scan_text(
               "reclaim 交棒承接 superseded 父时无 blocked_reason（缺省/null），仅承接 recovery_blocked 父时必填")))
+
+    # ── 第十八轮新增自测（4 条规则各正负样本） ──
+    # 51. R18-1：UNIQUE(superseded_from) 冲突无条件读回已存在 child → 命中
+    check("R18-1 无条件读回已存在 child 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "UNIQUE(superseded_from) 冲突后读回并返回已存在 child、idempotent_replay=true")))
+    # 52. R18-1 正确口径：按 payload 分流 → 放行
+    check("R18-1 按 payload 分流放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "UNIQUE(superseded_from) 冲突后先比对 payload，payload 一致读回已存在 child、payload 不同返 409 already_resolved")))
+    # 53. R18-2：无 active 取单个最新终态 execution → 命中
+    check("R18-2 取单个最新终态 execution 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "无 active 时 task 完成度取最新终态 execution 按 created_at DESC")))
+    # 54. R18-2 正确口径：全叶子优先级聚合 → 放行
+    check("R18-2 全叶子优先级聚合放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "task 完成度构造所有因果叶子按优先级 active>unresolved>失败>完成 聚合，SHALL NOT 取单个最新")))
+    # 55. R18-3：protocol_incompatible 恒定局 → 命中
+    check("R18-3 protocol_incompatible 恒定局被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "abandon_reason=protocol_incompatible 一律定局、被 final 引用")))
+    # 56. R18-3 正确口径：按预算拆 → 放行
+    check("R18-3 protocol 按预算拆放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "protocol_incompatible 按预算拆：未耗尽预算非定局回 queued、预算耗尽定局 recovery_blocked")))
+    # 57. R18-4：增加或重置预算 / 写新预算值 → 命中
+    check("R18-4 增加或重置预算被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "人工增加或重置预算写入该 recovery chain")))
+    # 58. R18-4 正确口径：只 grant_delta → 放行
+    check("R18-4 grant_delta 唯一放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "人工补预算只保留 grant_delta 唯一语义，SHALL NOT 用增加或重置旧措辞")))
 
     passed = sum(1 for _, ok in cases if ok)
     print("🧪 self-test")
