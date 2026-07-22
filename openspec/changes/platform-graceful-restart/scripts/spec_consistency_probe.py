@@ -44,7 +44,16 @@
   - 新增两条结构规则：① NULL task 可执行/固定 full replay（第十二轮 P0-A 已删）;
     ② 父 terminal 后向父事件流追加 manual_recovery（第十二轮 P0-B 已禁）。
   - --self-test 增补 Review 的 5 条绕过负样本 + HISTORICAL_INVALID 标记正负样本 +
-    两条新规则正负样本，共 32 例。
+    两条新规则正负样本。
+
+第十三轮加固点（P1-E：HISTORICAL_INVALID marker 严格作用域）：
+  - 旧实现只判「marker 是否出现在句段中」→ 出现即整段豁免，可被嵌入现行错误规范绕过
+    （marker 无引号直跟现行错误 / marker 非段首 / HTML 注释包 marker + 段内现行错误）。
+  - 收紧为：marker 必须在句段起始（允许前导空白与 markdown 列表/引用/强调符号），
+    后跟受引号（「」『』""''）包裹的历史原文;**只有引号内内容豁免**，引号外现行文字
+    重新进入扫描;引用块内含现行规范性措辞（SHALL/MUST/当前实现/现行/要求/必须）则
+    判定为「包装现行错误」不豁免。
+  - --self-test 增补 P1-E 正负样本，共 40 例。
 
 用法：
     python3 spec_consistency_probe.py             # 扫描默认三份 change
@@ -192,9 +201,48 @@ STRUCTURAL = [
          allow=["SHALL NOT", "不得", "不追加", "而非", "封闭", "child 流", "child 事件流", "独立审计"]),
 ]
 
-# 显式历史标记（第十二轮 P1-D）：需成段引用已废旧模型时，该段以此前缀标注，结构规则
-# 对带标记段豁免。这是**唯一**的成段豁免，且必须显式书写，取代旧的 sentiment 白名单。
+# 显式历史标记（第十二轮 P1-D 引入，第十三轮 P1-E 收紧作用域）：需引用已废旧模型时，
+# 用 `HISTORICAL_INVALID:` 前缀 + 紧随的**受引号包裹的历史原文**标注，只有引号内的历史
+# 原文对结构规则豁免;引号外的现行文字**重新进入扫描**，SHALL NOT 整段/整行豁免。
+#
+# 第十三轮 P1-E 之前的实现只判「marker 是否出现在句段中」→ 出现即整段豁免，可被绕过：
+#   HISTORICAL_INVALID: 当前规范要求父 recovery_blocked→superseded。   ← 无引号、含现行措辞，旧实现放行
+# 收紧后：
+#   ① marker 必须在句段**行首/块首**（前面只允许空白或 markdown 列表/引用符号）。
+#   ② marker 后必须紧跟受引号（「」『』"" ''）包裹的历史原文;只有引号**内**内容豁免。
+#   ③ 豁免块（marker + 引号原文）内 SHALL NOT 含现行规范性措辞（SHALL/MUST/当前实现/
+#      现行/要求/必须）——含则视为「拿历史标记包装现行错误」，不豁免。
+#   ④ 引号之外（同段其余现行文字）照常扫描。
 HISTORICAL_INVALID_MARKER = "HISTORICAL_INVALID:"
+
+# marker 必须出现在句段开头（允许前导空白 + markdown 列表/引用/强调符号），
+# 后跟受引号包裹的历史原文。引号内内容是唯一豁免范围。
+_HISTORICAL_INVALID_RE = re.compile(
+    r"^[\s>*\-`（(]*" + re.escape(HISTORICAL_INVALID_MARKER)
+    + r"\s*[「『\"'“‘]([^」』\"'”’]*)[」』\"'”’]"
+)
+# 豁免块内不得出现的现行规范性措辞（出现则不豁免——防历史标记包装现行错误）。
+_CURRENT_NORMATIVE_MARKERS = ["SHALL", "MUST", "当前实现", "现行", "要求", "必须", "当前必须", "当前规范"]
+
+
+def _historical_exempt_segment(seg):
+    """判断某句段是否为「合法的独立历史引用」——仅此情形对结构规则豁免。
+
+    返回 (exempt, remainder)：
+      exempt=True 表示该段以合法 HISTORICAL_INVALID:「历史原文」开头、且引用块无现行措辞;
+      remainder = 去掉引用块后的**剩余现行文字**，仍需照常扫描（第十三轮 P1-E）。
+      exempt=False 时 remainder 为原段（marker 不合法即完全不豁免、整段照常扫描）。
+    """
+    m = _HISTORICAL_INVALID_RE.match(seg.strip())
+    if not m:
+        return (False, seg)
+    quoted = m.group(1)
+    # 引用块内含现行规范性措辞 → 判定为拿历史标记包装现行错误，不豁免。
+    if any(mk in quoted for mk in _CURRENT_NORMATIVE_MARKERS):
+        return (False, seg)
+    # 合法历史引用：只豁免引号内原文，返回引号之后的剩余现行文字继续扫描。
+    remainder = seg.strip()[m.end():]
+    return (True, remainder)
 
 # 行级 meta 语境标记：命中的行是「描述本 probe 自身/清理清单」的元文档，会成段
 # 罗列旧口径作为清理目标，整行豁免（仅限这类自述行，不是通用整行放行）。
@@ -263,24 +311,26 @@ def scan_line(line):
         rule_allow = rule.get("allow", [])
         if scope == "segment":
             # 逐句段匹配：某句段命中 pattern，且该**句段内**既无本规则专属 allow 片段、
-            # 也无显式 HISTORICAL_INVALID 标记，才算违规（第十二轮：删全局 sentiment 白名单）。
+            # 也非合法独立历史引用块，才算违规（第十二轮删全局 sentiment 白名单;
+            # 第十三轮 P1-E：HISTORICAL_INVALID 只豁免引号内历史原文、剩余现行文字仍扫描）。
             hit = False
             for seg in _segments(line):
-                if not re.search(rule["pattern"], seg):
+                exempt, remainder = _historical_exempt_segment(seg)
+                # 合法历史引用块：引号内豁免，只对剩余现行文字判违规。
+                scan_target = remainder if exempt else seg
+                if not re.search(rule["pattern"], scan_target):
                     continue
-                if HISTORICAL_INVALID_MARKER in seg:
-                    continue
-                if any(snip in seg for snip in rule_allow):
+                if any(snip in scan_target for snip in rule_allow):
                     continue
                 hit = True
                 break
             if hit:
                 hits.append(("structural", rule["reason"]))
         else:
-            if re.search(rule["pattern"], line):
-                if HISTORICAL_INVALID_MARKER in line:
-                    continue
-                if any(snip in line for snip in rule_allow):
+            exempt, remainder = _historical_exempt_segment(line)
+            scan_target = remainder if exempt else line
+            if re.search(rule["pattern"], scan_target):
+                if any(snip in scan_target for snip in rule_allow):
                     continue
                 hits.append(("structural", rule["reason"]))
     return hits
@@ -455,8 +505,13 @@ def _self_test():
               any(k == "structural" for _, k, _, _ in scan_text(bc)))
 
     # 19. HISTORICAL_INVALID 显式标记段：成段引用旧模型 → 放行（唯一成段豁免）
-    check("HISTORICAL_INVALID 标记段放行",
+    # 第十三轮 P1-E 收紧：marker 必须在句段起始才豁免;段首 marker + 引号原文 → 放行。
+    check("HISTORICAL_INVALID 段首标记块放行",
           not any(k == "structural" for _, k, _, _ in scan_text(
+              "删旧口径；HISTORICAL_INVALID:「orphaned 一律回 queued」")))
+    # 19b. P1-E：marker 非句段起始（前有现行文字）→ 不再豁免，段内违规仍被拦
+    check("HISTORICAL_INVALID 非段首不豁免被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
               "SHALL NOT 保留旧 HISTORICAL_INVALID:「orphaned 一律回 queued」的口径")))
     # 20. 无标记的同类旧口径 → 仍被拦（marker 必须显式书写）
     check("无 HISTORICAL_INVALID 标记的旧口径仍被拦",
@@ -488,6 +543,36 @@ def _self_test():
     check("manual_recovery 走 child 流放行",
           not any(k == "structural" for _, k, _, _ in scan_text(
               "manual_recovery 作为 child 事件流首个控制事件，SHALL NOT 追加到已封闭的父流。")))
+
+    # ── 第十三轮 P1-E：HISTORICAL_INVALID marker 严格作用域，反嵌入绕过 ──
+    # 25. marker 后无引号、直接跟现行错误规范 → 不豁免、命中
+    check("P1-E marker 无引号跟现行错误被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "HISTORICAL_INVALID: 当前规范要求父 recovery_blocked→superseded。")))
+    # 26. marker 非句段起始（前有现行文字）+ 引号后现行错误 → 不豁免、命中
+    check("P1-E marker 非段首+引号后现行错误被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "说明 HISTORICAL_INVALID:「旧口径」后，当前实现父 recovery_blocked→superseded。")))
+    # 27. HTML 注释包装 marker + 段内现行错误 → 现行部分仍命中
+    check("P1-E 注释包装 marker 现行错误仍被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "<!-- HISTORICAL_INVALID: orphaned 回 queued --> 当前必须 orphaned 回 queued。")))
+    # 28. 合法独立历史引用块（段首 marker + 引号原文，无现行措辞）→ 放行
+    check("P1-E 合法独立历史块放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "删除旧口径；HISTORICAL_INVALID:「claimed→abandoned/orphaned 一律回 queued」")))
+    # 29. 合法历史块引号内含违规词（recovery_blocked→superseded）→ 仍放行（引号内豁免）
+    check("P1-E 历史块引号内违规词放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "纠正自相矛盾；HISTORICAL_INVALID:「复用 finish_execution + 父 recovery_blocked→superseded」")))
+    # 30. marker + 引号内含现行规范性措辞（SHALL）→ 判定为包装现行错误、不豁免命中
+    check("P1-E 历史块引号内含 SHALL 不豁免被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "HISTORICAL_INVALID:「orphaned 回 queued SHALL 保留」")))
+    # 31. 合法历史块之后同段追加现行错误 → 现行部分仍被扫描命中
+    check("P1-E 历史块后现行错误仍被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "HISTORICAL_INVALID:「旧模型」 当前 orphaned 回 queued 继续跑")))
 
     passed = sum(1 for _, ok in cases if ok)
     print("🧪 self-test")

@@ -34,7 +34,7 @@ CREATE UNIQUE INDEX ... ON tasks(conversation_id) WHERE conversation_id IS NOT N
 - **外部 pending intent：即便 poisoned，清 session 后仍 SHALL 建一个 `full_replay` 普通 successor 承接**（poisoned 可禁自动重试，但不能丢用户在执行期间新下的指令）。
 - 用户 kill 是唯一明确取消 pending intent 的路径。
 
-**🔴 可执行 task 必须拥有非 NULL conversation，NULL/quarantined task 一律不可执行（Review 第七轮 P1-2 + 第十一轮 P1-C 收口）**：根因是数据模型——`messages` 表 `conversation_id NOT NULL`、**无通用 `task_id` 列**（`run_id` 只覆盖 run 产出的 assistant 消息，人工 user 消息 `run_id` 常为 NULL），且 `agent_sessions` 唯一键只有 `(conversation_id, agent_slug)`、无 task_id。因此「NULL task 从本 task 读取/写入消息」**既无可靠查询条件、结果消息也无法合法落库**（写入必须带 conversation_id），第十轮设想的「以本 task 归属消息 full replay」与「`history_source_conversation_id` + 消息切分」缺数据结构支撑、SHALL NOT 作为可执行口径。故 SHALL 明确：① **新业务 run 强制 `conversation_id` 非空**（正常创建路径已满足，见 task:conversation 1:1）;② **所有可执行 task 必须拥有非 NULL conversation**——`conversation_id IS NULL` 的 task（含无会话归属的系统/历史 task 与迁移隔离的 quarantined task）**一律不进入 claim/dispatch、不可自动执行**，此约束 SHALL 落为**三层硬门**（Review 第十二轮 P0-A，任一层单独即可挡住，三层纵深防御）：**(1) dispatch 拒绝**——`POST /tasks/{id}/dispatch` 创建可执行 run 前 SHALL 校验目标 task `conversation_id IS NOT NULL`，为空则拒绝入队并返回结构化人工迁移原因，SHALL NOT 入队一个 NULL run;**(2) scheduler 排除**——调度器/auto-dispatch 扫描候选 task 时 SHALL 在查询谓词内 `AND conversation_id IS NOT NULL`，NULL task 不进入候选集;**(3) claim CAS 排除**——原子 claim 的 CAS 谓词 SHALL 含 `AND conversation_id IS NOT NULL`，即便脏数据绕过前两层入了队，也无法被 claim 成 running;③ 人工恢复一个 NULL/quarantined task 时，SHALL **创建独立 conversation** 并在**可审计的消息切分**后迁移对应消息（切分无法可靠判定时保持 quarantine、**不允许「猜测迁移」**），迁移后该 task 有真 conversation、进入 1:1 约束、正常 full replay/resume;④ **存量 `conversation_id IS NULL` 的 queued/claimed/running 行 SHALL 在 activate 前统一 quarantine/人工迁移**，SHALL NOT 让其在硬门上线后停留在可执行状态;⑤ 若未来确需支持永久 NULL task，SHALL 新增明确的消息 scope（如 `message_scope_type + message_scope_id` 或可空 `task_id`）并定义 user/assistant/system/tool 全部读写 SQL，SHALL NOT 只加一个 `history_source_conversation_id` 指针。当前**不引入**永久 NULL task 模型，统一走「可执行必有真 conversation」。
+**🔴 可执行 task 必须拥有非 NULL conversation，NULL/quarantined task 一律不可执行（Review 第七轮 P1-2 + 第十一轮 P1-C 收口）**：根因是数据模型——`messages` 表 `conversation_id NOT NULL`、**无通用 `task_id` 列**（`run_id` 只覆盖 run 产出的 assistant 消息，人工 user 消息 `run_id` 常为 NULL），且 `agent_sessions` 唯一键只有 `(conversation_id, agent_slug)`、无 task_id。因此「NULL task 从本 task 读取/写入消息」**既无可靠查询条件、结果消息也无法合法落库**（写入必须带 conversation_id），第十轮设想的「以本 task 归属消息 full replay」与「`history_source_conversation_id` + 消息切分」缺数据结构支撑、SHALL NOT 作为可执行口径。故 SHALL 明确：① **新业务 run 强制 `conversation_id` 非空**（正常创建路径已满足，见 task:conversation 1:1）;② **所有可执行 task 必须拥有非 NULL conversation**——`conversation_id IS NULL` 的 task（含无会话归属的系统/历史 task 与迁移隔离的 quarantined task）**一律不进入 claim/dispatch、不可自动执行**，此约束 SHALL 落为**三层硬门**（Review 第十二轮 P0-A，任一层单独即可挡住，三层纵深防御）：**(1) dispatch 拒绝**——`POST /tasks/{id}/dispatch` 创建可执行 run 前 SHALL 校验目标 task `conversation_id IS NOT NULL`，为空则拒绝入队并返回结构化人工迁移原因，SHALL NOT 入队一个 NULL run;**(2) scheduler 排除**——调度器/auto-dispatch 扫描候选 task 时 SHALL 在查询谓词内 `AND conversation_id IS NOT NULL`，NULL task 不进入候选集;**(3) claim CAS 排除**——原子 claim 的 CAS 谓词 SHALL 含 `AND conversation_id IS NOT NULL`，即便脏数据绕过前两层入了队，也无法被 claim 成 running;③ 人工恢复一个 NULL/quarantined task 时，SHALL **创建独立 conversation** 并在**可审计的消息切分**后迁移对应消息（切分无法可靠判定时保持 quarantine、**不允许「猜测迁移」**），迁移后该 task 有真 conversation、进入 1:1 约束、正常 full replay/resume;④ **存量 `conversation_id IS NULL` 的 queued/claimed/running 行 SHALL 在 activate 前按状态分别收尾（Review 第十三轮 P1-A：三态不能用同一个「隔离」动作，见下方「activate 前存量 NULL 在途行三态迁移状态机」Requirement）、并经 `active NULL count=0` gate 才放行**，SHALL NOT 让其在硬门上线后停留在可执行状态、SHALL NOT 只更新 task/conversation 或让 scheduler 忽略而放任旧 Worker 继续执行（幽灵运行）;⑤ 若未来确需支持永久 NULL task，SHALL 新增明确的消息 scope（如 `message_scope_type + message_scope_id` 或可空 `task_id`）并定义 user/assistant/system/tool 全部读写 SQL，SHALL NOT 只加一个 `history_source_conversation_id` 指针。当前**不引入**永久 NULL task 模型，统一走「可执行必有真 conversation」。
 
 #### Scenario: 首次执行建立 session
 - **WHEN** 某 Agent 在某 task 首次被触发执行（`agent_sessions` 无该 (conversation, agent) 行）
@@ -76,9 +76,45 @@ CREATE UNIQUE INDEX ... ON tasks(conversation_id) WHERE conversation_id IS NOT N
 - **WHEN** 分别在 dispatch、scheduler、claim 三个入口尝试执行一个 `conversation_id IS NULL` 的 task（含构造脏数据直接插入 queued 行的情形）
 - **THEN** ① dispatch 校验拒绝入队并返回结构化人工迁移原因;② scheduler 查询谓词 `AND conversation_id IS NOT NULL` 使其不进候选集;③ claim CAS 谓词 `AND conversation_id IS NOT NULL` 使脏数据绕过前两层也无法被 claim 成 running;三层任一单独即可挡住，纵深防御下 NULL task 零执行
 
-#### Scenario: 存量 NULL 行 activate 前统一隔离（Review 第十二轮 P0-A）
-- **WHEN** 硬门 activate 前，库中存在 `conversation_id IS NULL` 的 queued/claimed/running 行
-- **THEN** 迁移 SHALL 先把这些行 quarantine 或人工迁移到新 conversation，使 activate 后不存在停留在可执行状态的 NULL 行;SHALL NOT 让硬门只拦新入队而放过存量在途 NULL run
+### Requirement: activate 前存量 NULL 在途行三态迁移状态机
+
+activate 三层硬门前，库中可能已有 `conversation_id IS NULL` 的在途行。三层硬门只挡**新领取/新入队**，不会停止**既有进程**;故 `queued`/`claimed`/`running` 三态 SHALL NOT 用同一个笼统「隔离」动作收尾（Review 第十三轮 P1-A）——否则 `running` NULL 的旧 CLI 仍在跑、仍会写消息/持 session owner，形成迁移后的幽灵运行。SHALL 按状态分别落到合法收尾态，并以 `active NULL count=0` 作为 activate gate：
+
+```text
+1. 先部署 compatibility release，关闭 NULL 新入队。
+2. 停止旧版本 Worker 的新 claim/launch。
+3. queued  NULL → 移出候选集 + 标记 quarantine（保留原始 intent 供人工迁移，不丢）。
+4. claimed NULL → attempt 落 `abandoned` + retire session owner（epoch+1）+ 清 run_queue.current_attempt_id + execution 标记 quarantine（CLI 从未起、无残留进程）。
+5. running NULL → 先 generation/attempt fencing → kill/containment 确认完整进程树退出
+                 → attempt 落 `orphaned`（进程未确认退出口径）/迁移专用终态
+                 → execution 落人工隔离态（保留 pid/create_time/generation/instance/containment 待人工）;
+                 进程树未确认清理时 SHALL 保持人工隔离、SHALL NOT 假装迁移完成。
+6. 校验 active NULL count（queued/claimed/running 且 conversation_id IS NULL）= 0。
+7. count 非 0 → activate/readiness fail-closed，不开新状态写入与三层硬门。
+8. 通过后才开启新状态写入和三层硬门。
+```
+
+quarantine 的实际字段/状态 SHALL 明确（如复用 `quarantined_from_conversation_id` lineage 列 + execution 隔离态），`pending`/`session` 指针处置 SHALL 定义（queued 保 pending intent、claimed/running retire owner），从人工迁移后的新 conversation 恢复走「可执行 task 必须拥有非 NULL conversation」Requirement 的人工出口。SHALL NOT 只写产品概念而不定字段。**收尾后旧 NULL 行 SHALL NOT 再被任何 Worker claim/finalize/写平台**（三层硬门 + fencing 双保险）。
+
+#### Scenario: queued NULL 行 activate 前移出候选并保 intent
+- **WHEN** activate 前存在 `conversation_id IS NULL` 的 `queued` 行
+- **THEN** 移出候选集 + 标记 quarantine，保留原始 intent 供人工迁移;因 CLI 从未起、无残留进程，无需 fencing/kill;SHALL NOT 丢失该 intent
+
+#### Scenario: claimed NULL 行 activate 前 abandon 并 retire owner
+- **WHEN** activate 前存在 `conversation_id IS NULL` 的 `claimed` 行（已建 attempt、持 claim lease、CLI 未起）
+- **THEN** attempt 落 `abandoned`、retire session owner（epoch+1）、清 `run_queue.current_attempt_id`、execution 标记 quarantine;SHALL NOT 只标记业务隔离而留 attempt/owner 悬挂
+
+#### Scenario: running NULL 行 activate 前须 fencing+杀树确认才隔离
+- **WHEN** activate 前存在 `conversation_id IS NULL` 的 `running` 行，其 CLI 仍在执行（持续写 sentinel 文件）
+- **THEN** SHALL 先 generation/attempt fencing → kill/containment 确认完整进程树退出 → attempt 落 `orphaned`/迁移专用终态 + execution 人工隔离;进程树未确认清理前 activate SHALL fail-closed（不假装迁移完成、不放任幽灵运行）
+
+#### Scenario: active NULL count 非零则 activate fail-closed
+- **WHEN** 三态收尾进行中，仍有 `conversation_id IS NULL` 且状态 active（queued/claimed/running）的行
+- **THEN** `active NULL count>0` 使 activate/readiness fail-closed，不开启新状态写入与三层硬门;仅 count=0 时才放行
+
+#### Scenario: 清零后旧 NULL 行不可被 claim/finalize/写平台
+- **WHEN** active NULL count=0 通过、activate 完成后，注入一条残留 NULL 行的迟到 claim/finalize/平台写
+- **THEN** 三层硬门（claim CAS `AND conversation_id IS NOT NULL`）+ generation/attempt fencing 双双拒绝，旧 NULL 行不被任何 Worker claim/finalize/写平台
 
 #### Scenario: quarantined task 人工迁移到新 conversation 后正常执行
 - **WHEN** 人工把 quarantined task 迁移到一个新独立 conversation，并在可审计消息切分后把归属本 task 的消息迁入
