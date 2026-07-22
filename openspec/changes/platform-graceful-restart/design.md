@@ -66,12 +66,15 @@ attempt 层（task_runs.status）：
 claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功 = execution 的定局 attempt)
                              ├─→ failed             (含 failure_stage=prestart|running，第六轮 P1-2 方案 B)
                              ├─→ killed
-                             ├─→ abandoned          (非定局；claimed lease 回收后旧 attempt 落此态，CLI 未起)
+                             ├─→ abandoned          (非定局；无残留进程——claimed lease 回收·CLI 未起，或 running·已确认完整进程树退出，第十五轮 P1-3 扩义)
                              ├─→ orphaned           (running 中未确认死亡的孤儿；进程可能存活，非 abandoned，第八轮 P1-B)
                              └─→ superseded
   失败正交字段：failure_stage(prestart|running) + failure_class(infra|config|business) + retryable(bool)
-  abandoned vs orphaned：abandoned=claimed lease 回收、CLI 从未起、无残留进程、可安全回队；
-                         orphaned=running 中进程树未确认退出、驱动 execution=recovery_blocked、不得回队
+  abandoned vs orphaned：abandoned=无残留进程（claimed·CLI 从未起 / running·已确认完整进程树退出，第十五轮 P1-3）；
+                         orphaned=进程树未确认退出（可能存活）、驱动 execution=recovery_blocked(process_not_confirmed_dead)、不得回队。
+  ⚠ 回队性是 execution 处置属性、不是 attempt 属性：abandoned 只表「无残留进程」，SHALL NOT 隐含「一定回队」——
+    普通 claim lease 回收的 abandoned 走同 execution 回队重试；NULL migration 已确认退出的 abandoned 其 execution=
+    recovery_blocked(null_conversation_migration) 不回队、等人工迁移（第十五轮 P1-3，两者 attempt 同为 abandoned、execution 处置不同）
 ```
 
 - **无 accepted 独立态（Review P0-A，用户拍板删）**：`POST /tasks/{id}/dispatch` 在**同一事务**内写用户消息 + 建 `queued` execution，**事务提交后才返回** `execution_id`（= run_queue_id）。不设「已 accepted 但未 queued」的悬空态，省一个 outbox/promoter + orphan sweeper。
@@ -212,7 +215,7 @@ SSE 不止「带最大 log id 重连」，需完整契约。**核心修正：Las
   - `queued→claimed` 状态转换 + `run_claimed` event（领取、CLI 未起，第九轮）
   - `claimed→running` 状态转换 + `run_started` event（CLI 启动，唯一发 run_started）
   - 终态转换 + `terminal` event
-  - `superseded` + recovery child 入队 + `superseded` event
+  - `superseded` + recovery child 入队 + `superseded` event + child `recovery_resumed{source=reclaim}` event + child `queued` event（第十五轮 P1-1：自动 supersede/reclaim 建的 child 与人工恢复共用统一 `recovery_resumed`，只是 source=reclaim）
 - **`run_logs` 加 `meta_json` 列**：承载 log 事件需要的结构化附加信息（channel/tool/tool_input/tool_output 等），使 log 事件可从 run_logs + meta 完整重建，`execution_events` 的 log 行只需引用 run_log id。
 - 事件类型：`queued / run_claimed{task_run_id, attempt_no}（领取、CLI 未起，第九轮） / run_started{task_run_id, attempt_no}（CLI 启动） / retry_scheduled{attempt_id, attempt_no, failure_stage, failure_class, retryable, next_retry_at} / log{run_log_id,channel,content,tool,tool_input,tool_output,meta} / superseded{successor_execution_id} / recovery_resumed{source, actor?, recovery_parent_id, child_execution_id, blocked_reason, request_token?}（第十三轮 P1-C，人工/自动恢复统一控制事件、写在 recovery child 事件流、无 `manual_recovery` 第二名） / terminal{status} / heartbeat`（heartbeat 不落表、不占游标）。**此枚举 SHALL 与 spec 控制事件 Requirement、tasks 1.6/1.6a/1.6c、前端消费者保持完全一致的唯一真相源，只含 `recovery_resumed`（第十四轮 P1-1）。**
 - **重连**：客户端带 `Last-Event-ID: <id>` → 服务端 `SELECT ... FROM execution_events WHERE execution_id=? AND id > ? ORDER BY id` 回放，控制事件与 log 事件**统一有序、不重不漏**。
