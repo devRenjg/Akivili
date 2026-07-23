@@ -55,6 +55,17 @@
     判定为「包装现行错误」不豁免。
   - --self-test 增补 P1-E 正负样本，共 40 例。
 
+第十九轮加固点（P1-6：修 6 条 false-negative + 2 条 P0 守卫）：
+  - R18-1 verb 组补「命中/直接 replay」、child 限定补「已有」;比较字段随 P1-2 改
+    canonical_payload_hash，allow 删裸「SHALL NOT」只绑分流分支短语。
+  - R18-2 allow 删裸「SHALL NOT」——否则同句针对别的主语的 SHALL NOT 会放过
+    「按最新 execution 终态」真违规;只绑全叶子/优先级否定短语。
+  - R18-4 扩匹配「增加/重置」斜杠形、独立「新预算值」「新 budget」「不同新预算值」。
+  - 新增 R19-P0-1：running NULL/null migration 确认退出/清理→abandoned 肯定式
+    （不要求 attempt 关键词，补 R17-1 漏检）;R19-P0-2：recovery_blocked 父
+    「重新排队/回 queued/回队」肯定式（现有 orphaned→queued 规则不覆盖该主语句型）。
+  - --self-test 增补 reviewer 6 条 false-negative 负样本 + 两条 P0 规则正负样本。
+
 用法：
     python3 spec_consistency_probe.py             # 扫描默认三份 change
     python3 spec_consistency_probe.py <root> ...  # 扫描指定文件/目录
@@ -237,9 +248,11 @@ STRUCTURAL = [
          allow=["migration_from", "SHALL NOT", "而非 superseded_from", "不挂 superseded_from", "不认 superseded_from", "同时认"]),
     # R17-5（P1-D）：不同 token 输家 SHALL 按 payload 分流（一致映射 existing / 不同 payload 返 409），不得无条件映射到赢家。
     dict(pattern=r"不同\s*token[^。；;!？|]*?(读回|返回|映射到?|→|->)[^。；;!？|]*?(existing|已存在|赢家)[^。；;!？|]*?(child|successor)",
-         reason="不同 token 输家 SHALL 按 payload 分流——一致才映射 existing child/successor、不同 payload 返 409 already_resolved（第十七轮 P1-D），SHALL NOT 无条件映射到赢家",
+         reason="不同 token 输家 SHALL 按 canonical_payload_hash 分流——一致才映射 existing child/successor、不一致返 409 already_resolved（第十七轮 P1-D / 第十九轮 P1-2），SHALL NOT 无条件映射到赢家",
          scope="segment",
-         allow=["payload 一致", "payload 不同", "409", "already_resolved", "SHALL NOT", "canonical_request_id", "分两种", "按 payload", "同意图"]),
+         # allow 绑定「按 payload 分流」的具体否定/分支短语。SHALL NOT 收 idempotent_replay——它在违规与
+         # 正确两形都出现无法区分;也 SHALL NOT 只凭出现 SHALL NOT 就整段放行（第十九轮 P1-6）
+         allow=["payload 一致", "payload 不同", "canonical_payload_hash", "409", "already_resolved", "分两种", "按 payload", "同意图"]),
     # R17-6（P1-E）：人工补预算只保留 grant_delta，SHALL NOT 用「写新预算值/覆盖 remaining」旧口径。
     dict(pattern=r"(新预算值|新预算)[^。；;!？|]{0,8}(写入|覆盖|设置|设为|填入)",
          reason="人工补预算只保留 grant_delta（budget_remaining += grant_delta），SHALL NOT 用「写新预算值/覆盖 remaining」旧口径（绝对覆盖走独立 admin override，第十六轮 P1-E#3 / 第十七轮 P1-E）",
@@ -252,25 +265,55 @@ STRUCTURAL = [
          allow=["SHALL NOT", "缺省", "仅承接 recovery_blocked", "无 blocked_reason", "不假定", "为 null", "可选", "非必填"]),
     # ── 第十八轮新增结构规则（4 条，守护本轮 P1 修复不回归） ──
     # R18-1（req 幂等）：UNIQUE(superseded_from) 冲突后无条件读回已存在 child（不分 payload）即违规——须按 payload 分流。
-    dict(pattern=r"(UNIQUE\s*\(\s*superseded_from\s*\)|唯一冲突)[^。；;!？|]*?(读回|返回|映射到?)[^。；;!？|]*?(已存在|existing)\s*child(?![^。；;!？|]*payload)",
-         reason="UNIQUE(superseded_from) 冲突后 SHALL 按 payload 分流（一致→existing child/idempotent_replay、不同→409 already_resolved），SHALL NOT 无条件读回已存在 child（第十八轮 P1-req）",
+    # 第十九轮 P1-6：verb 组补「命中/直接 replay/idempotent_replay」，child 限定补「已有」——
+    # 覆盖 reviewer 负样本「不同 token 命中已有 child 直接 replay」这类 R18-1 原正则漏检句型。
+    dict(pattern=r"(UNIQUE\s*\(\s*superseded_from\s*\)|唯一冲突)[^。；;!？|]*?(读回|返回|映射到?|命中|直接\s*replay)[^。；;!？|]*?(已存在|已有|existing)\s*child(?![^。；;!？|]*payload)",
+         reason="UNIQUE(superseded_from) 冲突后 SHALL 按 canonical_payload_hash 分流（一致→existing child/idempotent_replay、不一致→409 already_resolved），SHALL NOT 无条件读回/命中已有 child（第十八轮 P1-req / 第十九轮 P1-2/P1-6）",
          scope="segment",
-         allow=["payload 一致", "payload 不同", "比对", "canonical_request_id", "409", "already_resolved", "SHALL NOT", "分两种", "分流", "分三"]),
+         # allow 绑定「按 payload 分流」的具体分支短语。SHALL NOT 收 idempotent_replay——它在违规
+         # （无条件 replay）与正确（分流后一致 replay）两形都出现、无法区分（第十九轮 P1-6）。
+         allow=["payload 一致", "payload 不同", "比对", "canonical_payload_hash", "409", "already_resolved", "分两种", "分流", "分三"]),
     # R18-2（task 聚合）：无 active 取「单个/最新」终态 execution 判完成度即违规——须按全叶子优先级聚合。
-    dict(pattern=r"(无\s*active|task\s*完成度|任务整体完成度)[^。；;!？|]*?(取|按)[^。；;!？|]*?(最新|单个|一条)[^。；;!？|]*?(终态\s*)?execution",
-         reason="task 完成度 SHALL 构造全部因果叶子按优先级(active>unresolved>失败>完成)聚合，SHALL NOT 取单个最新终态 execution(会掩盖较早 unresolved lineage)（第十八轮 P1-agg）",
+    # 第十九轮 P1-6：allow 删除裸「SHALL NOT」——否则同句里针对别的主语（如 superseded_from）的 SHALL NOT
+    # 会放过前半句「按最新 execution 终态」的真违规;allow 只绑定与本规则直接对应的全叶子/优先级否定短语。
+    dict(pattern=r"(无\s*active|task\s*完成度|任务整体完成度|完成度)[^。；;!？|]*?(取|按)[^。；;!？|]*?(最新|单个|一条)[^。；;!？|]*?(终态\s*)?execution",
+         reason="task 完成度 SHALL 构造全部因果叶子按优先级(active>unresolved>失败>完成)聚合，SHALL NOT 取单个最新终态 execution(会掩盖较早 unresolved lineage)（第十八轮 P1-agg / 第十九轮 P1-6 收紧 allow）",
          scope="segment",
-         allow=["SHALL NOT", "全部叶子", "全叶子", "优先级", "所有因果叶子", "不掩盖", "同优先级内", "选代表", "tie-break"]),
+         allow=["全部叶子", "全叶子", "全部因果叶子", "所有因果叶子", "优先级", "不掩盖", "同优先级内", "选代表", "tie-break", "SHALL NOT 取", "SHALL NOT 用「取", "非取最新"]),
     # R18-3（protocol 定局性）：protocol_incompatible abandoned 恒/一律定局即违规——须按预算拆。
     dict(pattern=r"protocol[_\s]?incompatible[^。；;!？|]*?(恒|一律|均|都|始终)[^。；;!？|]*?(定局|final)",
          reason="protocol_incompatible abandoned 定局性 SHALL 按预算拆(未耗尽=非定局回queued/耗尽=定局recovery_blocked)，SHALL NOT 一律判定局（第十八轮 P1-proto）",
          scope="segment",
          allow=["SHALL NOT", "按预算拆", "未耗尽", "预算耗尽", "非定局", "分两支"]),
-    # R18-4（grant_delta）：出现「增加或重置预算 / 写新预算值」肯定式即违规——只保留 grant_delta。
-    dict(pattern=r"(增加或重置|写\s*新预算值|覆盖\s*budget_remaining|重置某级预算)",
-         reason="人工补预算只保留 grant_delta 唯一语义，SHALL NOT 用「增加或重置/写新预算值/覆盖 budget_remaining」旧措辞（绝对覆盖走独立 admin override，第十八轮 P1-budget）",
+    # R18-4（grant_delta）：出现「增加或重置 / 增加/重置 / 写新预算值 / 新预算值 / 新 budget / 覆盖 remaining」
+    # 肯定式即违规——只保留 grant_delta。第十九轮 P1-6：扩匹配「增加/重置」（斜杠形）、独立「新预算值」、
+    # 「新 budget」「不同新预算值」等 R18-4 原正则漏掉的真实残余;allow 删裸「SHALL NOT」，只绑 grant_delta 口径短语。
+    # 注：`新 budget 行/表/记录`＝为新 chain 建新预算行（合法），非「写新预算值」旧措辞——用负向前视排除;
+    # `child 带新 budget`（旧模糊表述）仍需命中，故只排除紧跟 行/表/记录/_remaining 的用法。
+    dict(pattern=r"(增加或重置|增加/重置|重置/增加|写\s*新预算值|(?<!post-)(?<!补足后)新\s*预算值|不同\s*新预算值|(?<!观察到\s)(?<!post-grant\s)新\s*budget(?!_remaining)(?!\s*行)(?!\s*表)(?!\s*记录)|覆盖\s*budget_remaining|覆盖\s*remaining|重置某级预算|重置具体某级预算)",
+         reason="人工补预算只保留 grant_delta 唯一语义，SHALL NOT 用「增加或重置/增加/重置/写新预算值/新预算值/新 budget/覆盖 remaining」旧措辞（绝对覆盖走独立 admin override，第十八轮 P1-budget / 第十九轮 P1-6 扩匹配）",
          scope="segment",
-         allow=["SHALL NOT", "grant_delta", "admin override", "删", "旧措辞", "旧口径", "而非"]),
+         allow=["grant_delta", "admin override", "绝对覆盖", "已删", "删「", "旧措辞", "旧口径", "而非", "SHALL NOT 出现", "SHALL NOT 用"]),
+    # ── 第十九轮新增 P0 守卫规则（2 条，防两个 P0 复发——不再重复发生 P0） ──
+    # R19-P0-1：running NULL / null migration「确认退出/confirmed」→ abandoned 的肯定式（不要求出现 attempt
+    #   关键词，覆盖 R17-1 因缺 attempt 而漏检的 reviewer 负样本「running null_conversation_migration 已确认退出 -> abandoned」）。
+    #   running NULL 恒 orphaned、清理确认只翻 process_cleanup_state，SHALL NOT 落/改写为 abandoned。
+    # 动词前用 (?<!不)(?<!不再)(?<!未)(?<!SHALL NOT ) 排除正确否定「不落/不再落/未落 abandoned」;
+    # 改写为 abandoned 的「改写为」也用前视排除「不改写为」。allow 再兜底常见正确口径。
+    dict(pattern=r"(running\s*NULL|null[_\s]?conversation[_\s]?migration|process_cleanup_state\s*=?\s*confirmed|已确认(完整)?(进程树)?(退出|清理)|确认清理后?)[^。；;!？|]{0,24}((?<!不)(?<!不再)(?<!未)落|→|->|(?<!不)改写?为|变(成|为)|(?<!不)转为?|判定?为|计入)\s*`?abandoned`?",
+         reason="running NULL/null migration 确认退出/清理后 attempt 恒 orphaned（终态不可逆），SHALL NOT 落/改写为 abandoned——清理确认只翻 process_cleanup_state（第十九轮 P0-1）",
+         scope="segment",
+         allow=["SHALL NOT", "恒 orphaned", "恒 `orphaned`", "不改写", "不落 abandoned", "不再落 abandoned", "不再落 `abandoned`",
+                "永久 orphaned", "只翻 process_cleanup_state", "仅 claimed NULL", "claimed NULL", "claimed·CLI 未起",
+                "而非 abandoned", "不得改写", "不再落"]),
+    # R19-P0-2：recovery_blocked 父「重新排队/回 queued/回队/再入队」的肯定式（终态无出边、父永久不变，
+    #   只能原子建 queued recovery child）。覆盖 reviewer 负样本「recovery_blocked 确认清理后允许重新排队」——
+    #   现有 orphaned→queued 规则不覆盖以 recovery_blocked 为主语的「重新排队」句型。
+    dict(pattern=r"`?recovery_blocked`?[^。；;!？|]{0,40}((?<!不)重新\s*排队|(?<!不)再\s*入队|(?<!不)回\s*队|(?<!不)回\s*`?queued`?|(?<!不)重新\s*入队)",
+         reason="recovery_blocked 是终态无出边、父永久不变，SHALL NOT 重新排队/回 queued——只允许原子创建 queued recovery child（superseded_from=父）承接（第十九轮 P0-2）",
+         scope="segment",
+         allow=["SHALL NOT", "不得", "永久不变", "终态无出边", "只允许原子创建", "只建 child", "只原子建",
+                "承接续跑", "而非重新排队", "不重新排队", "不回 queued", "不回队"]),
 ]
 
 # 显式历史标记（第十二轮 P1-D 引入，第十三轮 P1-E 收紧作用域）：需引用已废旧模型时，
@@ -757,6 +800,38 @@ def _self_test():
     check("R18-4 grant_delta 唯一放行",
           not any(k == "structural" for _, k, _, _ in scan_text(
               "人工补预算只保留 grant_delta 唯一语义，SHALL NOT 用增加或重置旧措辞")))
+
+    # ── 第十九轮 P1-6：reviewer 实证的 6 条 false-negative 负样本，全部必须 CAUGHT ──
+    # 这些句子是 reviewer 直接调用 scan_text() 返回空列表（漏检）的真实残余口径;
+    # 扩匹配 R18-1/R18-2/R18-4 + 新增 R19-P0-1/P0-2 后，六条必须全部命中。
+    fn_samples = [
+        "recovery_budget_exhausted 需要明确增加/重置具体某级预算",              # R18-4 增加/重置 斜杠形
+        "task 完成度按最新 execution 终态，SHALL NOT 只沿 superseded_from",       # R18-2 裸 SHALL NOT 不再放行
+        "UNIQUE(superseded_from) 冲突后不同 token 命中已有 child 直接 replay",     # R18-1 命中/replay/已有 child
+        "running null_conversation_migration 已确认退出 -> abandoned",             # R19-P0-1 无 attempt 关键词
+        "recovery_blocked 确认清理后允许重新排队",                                 # R19-P0-2 重新排队肯定式
+        "不同 payload（如不同新预算值）并发恢复",                                  # R18-4 不同新预算值
+    ]
+    for i, s in enumerate(fn_samples, start=1):
+        check(f"P1-6 false-negative 负样本{i} 被拦",
+              any(k == "structural" for _, k, _, _ in scan_text(s)))
+
+    # 59. R19-P0-1 正确口径：running NULL 恒 orphaned 不改写 → 放行
+    check("R19-P0-1 running NULL 恒 orphaned 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "running NULL 确认清理后 attempt 恒 orphaned、不改写为 abandoned，只翻 process_cleanup_state=confirmed")))
+    # 60. R19-P0-1：仅 claimed NULL 落 abandoned 的正确窄口径 → 放行
+    check("R19-P0-1 仅 claimed NULL abandoned 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "仅 claimed NULL·CLI 未起无残留进程才落 abandoned，running NULL 恒 orphaned 不改写")))
+    # 61. R19-P0-2 正确口径：recovery_blocked 永久不变、只建 child → 放行
+    check("R19-P0-2 recovery_blocked 只建 child 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "父 recovery_blocked 永久不变，SHALL NOT 重新排队/回 queued，只允许原子创建 queued recovery child 承接")))
+    # 62. R19-P0-2：recovery_blocked 明确「不回 queued」→ 放行（(?<!不) + allow 双重排除）
+    check("R19-P0-2 recovery_blocked 不回 queued 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "recovery_blocked 终态无出边，父不回 queued、不重新排队")))
 
     passed = sum(1 for _, ok in cases if ok)
     print("🧪 self-test")
