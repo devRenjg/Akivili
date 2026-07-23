@@ -293,6 +293,7 @@ STRUCTURAL = [
     dict(pattern=r"(增加或重置|增加/重置|重置/增加|写\s*新预算值|(?<!post-)(?<!补足后)新\s*预算值|不同\s*新预算值|(?<!观察到\s)(?<!post-grant\s)新\s*budget(?!_remaining)(?!\s*行)(?!\s*表)(?!\s*记录)|覆盖\s*budget_remaining|覆盖\s*remaining|重置某级预算|重置具体某级预算)",
          reason="人工补预算只保留 grant_delta 唯一语义，SHALL NOT 用「增加或重置/增加/重置/写新预算值/新预算值/新 budget/覆盖 remaining」旧措辞（绝对覆盖走独立 admin override，第十八轮 P1-budget / 第十九轮 P1-6 扩匹配）",
          scope="segment",
+         window=True,  # 第二十轮 P1-6：allow 只认命中处**前** 24 字窗口，尾随「…并携带 grant_delta」等无关 allow 不再放行。
          allow=["grant_delta", "admin override", "绝对覆盖", "已删", "删「", "旧措辞", "旧口径", "而非", "SHALL NOT 出现", "SHALL NOT 用"]),
     # ── 第十九轮新增 P0 守卫规则（2 条，防两个 P0 复发——不再重复发生 P0） ──
     # R19-P0-1：running NULL / null migration「确认退出/confirmed」→ abandoned 的肯定式（不要求出现 attempt
@@ -303,17 +304,53 @@ STRUCTURAL = [
     dict(pattern=r"(running\s*NULL|null[_\s]?conversation[_\s]?migration|process_cleanup_state\s*=?\s*confirmed|已确认(完整)?(进程树)?(退出|清理)|确认清理后?)[^。；;!？|]{0,24}((?<!不)(?<!不再)(?<!未)落|→|->|(?<!不)改写?为|变(成|为)|(?<!不)转为?|判定?为|计入)\s*`?abandoned`?",
          reason="running NULL/null migration 确认退出/清理后 attempt 恒 orphaned（终态不可逆），SHALL NOT 落/改写为 abandoned——清理确认只翻 process_cleanup_state（第十九轮 P0-1）",
          scope="segment",
+         window=True,  # 第二十轮 P1-6：allow 只认命中处**前** 24 字窗口，尾随「，SHALL NOT 丢审计」等无关 allow 不再放行。
          allow=["SHALL NOT", "恒 orphaned", "恒 `orphaned`", "不改写", "不落 abandoned", "不再落 abandoned", "不再落 `abandoned`",
                 "永久 orphaned", "只翻 process_cleanup_state", "仅 claimed NULL", "claimed NULL", "claimed·CLI 未起",
-                "而非 abandoned", "不得改写", "不再落"]),
+                "而非 abandoned", "不得改写", "不再落", "无 running"]),
     # R19-P0-2：recovery_blocked 父「重新排队/回 queued/回队/再入队」的肯定式（终态无出边、父永久不变，
     #   只能原子建 queued recovery child）。覆盖 reviewer 负样本「recovery_blocked 确认清理后允许重新排队」——
     #   现有 orphaned→queued 规则不覆盖以 recovery_blocked 为主语的「重新排队」句型。
     dict(pattern=r"`?recovery_blocked`?[^。；;!？|]{0,40}((?<!不)重新\s*排队|(?<!不)再\s*入队|(?<!不)回\s*队|(?<!不)回\s*`?queued`?|(?<!不)重新\s*入队)",
          reason="recovery_blocked 是终态无出边、父永久不变，SHALL NOT 重新排队/回 queued——只允许原子创建 queued recovery child（superseded_from=父）承接（第十九轮 P0-2）",
          scope="segment",
+         window=True,  # 第二十轮 P1-6：allow 只认命中处**前** 24 字窗口，尾随「，SHALL NOT 丢 pending」不再放行。
          allow=["SHALL NOT", "不得", "永久不变", "终态无出边", "只允许原子创建", "只建 child", "只原子建",
                 "承接续跑", "而非重新排队", "不重新排队", "不回 queued", "不回队"]),
+    # ── 第二十轮新增跨真相源结构规则（4 条，守护本轮 P1-2/P1-3/P1-4 收口不回归） ──
+    # R20-1（P1-2 lineage 归一）：history_backlog_from_execution_id 作为**独立列/字段**存在即违规——
+    #   history backlog 承接已归一入 continuation_from_execution_id + continuation_kind=history_backlog，
+    #   不再单列。仅在明确说明「归一/不再单列/归入 continuation」语境放行。
+    dict(pattern=r"history_backlog_from_execution_id",
+         reason="history backlog 因果承接已归一入 continuation_from_execution_id + continuation_kind=history_backlog，SHALL NOT 再用独立列 history_backlog_from_execution_id（第二十轮 P1-2）",
+         scope="segment",
+         # 第二十轮 P1-6 自查：R20-1 是**死标识符**规则（同 FORBIDDEN 的 winning_attempt_id/
+         # committed_batch_end——字段名本身即信号），合法弃用说明常在**前一句段**，故保持整段 allow
+         # 不加 window（before-window 会漏掉跨句段的「替代旧 …」说明而误报真实 proposal 行）。
+         # 死标识符不会被「顺手」写出、误放行风险低，与既有 FORBIDDEN 字段规则同粒度。
+         allow=["归一", "不再单列", "归入 continuation", "continuation_from_execution_id", "改用", "已删", "旧字段", "不复用", "替代旧", "替代"]),
+    # R20-2（P1-2 聚合口径）：「task 级 active 聚合 / task 级 active execution 聚合」旧口径即违规——
+    #   完成度/优先级判定 SHALL 走全部因果叶子按优先级聚合，非 task 级单一 active 聚合。
+    dict(pattern=r"task\s*级\s*active(\s*execution)?\s*聚合",
+         reason="完成度/优先级 SHALL 构造全部因果叶子按优先级聚合，SHALL NOT 用「task 级 active 聚合」旧口径（会掩盖较早 unresolved lineage，第二十轮 P1-2）",
+         scope="segment",
+         window=True,  # 第二十轮 P1-6 自查：allow 只认命中处前窗口，防尾随「全叶子/而非」放行前半旧口径。
+         allow=["SHALL NOT 用「task", "而非 task 级", "非 task 级", "全叶子", "全部因果叶子", "改为全叶子", "已删"]),
+    # R20-3（P1-3 resolved 真相源唯一）：resolved「cache 必写 / 必须写 cache / cache 是真相源」旧口径即违规——
+    #   resolved 唯一权威=因果键 EXISTS 纯派生，recovery_operations/cache 均非真相源，cache 纯派生默认。
+    dict(pattern=r"(resolved\s*)?cache\s*(必写|必须写|恒写|是真相源|作(为)?真相源|当真相源)",
+         reason="resolved 唯一权威=因果键 EXISTS 纯派生，cache 是纯派生默认（可选加速），SHALL NOT 把 cache 当真相源/必写（第二十轮 P1-3）",
+         scope="segment",
+         window=True,  # 第二十轮 P1-6 自查：allow 只认命中处前窗口，防尾随「纯派生/可选」放行前半「cache 必写/当真相源」。
+         allow=["纯派生", "非真相源", "不是真相源", "可选", "SHALL NOT 必写", "而非必写", "默认纯派生", "已删"]),
+    # R20-4（P1-4 值域）：terminal_source_status='unknown' / =unknown 即违规——
+    #   值域恒为 {queued,claimed,running} 三值，推断不了入独立 quarantine 隔离表、列保持 NULL，不引入 unknown。
+    dict(pattern=r"terminal_source_status\s*(=|＝|:|为|∈[^。；;!？|]{0,12})[^。；;!？|]{0,6}unknown",
+         reason="terminal_source_status 值域恒为 {queued,claimed,running} 三值，推断不了入独立 terminal_source_backfill_quarantine 隔离表、列保持 NULL，SHALL NOT 引入 unknown 值（第二十轮 P1-4）",
+         scope="segment",
+         window=True,  # 第二十轮 P1-6 自查：allow 只认命中处前窗口，防尾随「SHALL NOT/quarantine/隔离表」放行前半「=unknown」。
+         allow=["不含 unknown", "无 unknown", "非 unknown", "不引入 unknown", "SHALL NOT 引入", "而非 unknown", "已删",
+                "值域恒", "值域三值", "三值"]),
 ]
 
 # 显式历史标记（第十二轮 P1-D 引入，第十三轮 P1-E 收紧作用域）：需引用已废旧模型时，
@@ -369,11 +406,17 @@ DEFAULT_CHANGES = [
     "platform-concurrency-scaling",
 ]
 
+# probe 伴生文档：这些 .md **本身就在编目/解释旧口径**（回归清单、门禁说明），
+# 不是 spec 正文，逐行扫描必然大面积误报。目录级 rglob 时按 basename 跳过它们;
+# 若显式作为参数传入单文件则仍扫描（便于针对性调试）。第二十轮 P1-6 引入。
+EXCLUDED_BASENAMES = {"REGRESSION_GATE.md"}
+
 
 def resolve_targets(argv):
     """解析待扫描的 .md 文件列表 + 缺失路径列表。
 
     返回 (files, missing)。第九轮加固：缺失路径不再静默跳过，交由调用方 exit 1。
+    第二十轮：目录扫描时跳过 EXCLUDED_BASENAMES（probe 伴生编目文档）。
     """
     if argv:
         roots = [Path(a) for a in argv]
@@ -390,7 +433,8 @@ def resolve_targets(argv):
         if root.is_file():
             files.append(root)
         else:
-            files.extend(sorted(root.rglob("*.md")))
+            files.extend(sorted(p for p in root.rglob("*.md")
+                                if p.name not in EXCLUDED_BASENAMES))
     return files, missing
 
 
@@ -405,6 +449,55 @@ def _segments(line):
     return [seg for seg in _SEGMENT_SPLIT.split(line) if seg.strip()]
 
 
+# 第二十轮 P1-6：allow 局部绑定窗口（**opt-in**，仅对易被绕过的规则开启）。
+# 根因：默认的 `any(snip in scan_target for snip in allow)` 把 allow 片段与**整个句段**
+# 比对——只要同句任意位置出现无关的 SHALL NOT / grant_delta，就整段放行，被 reviewer
+# 实证可绕过若干守卫（如「普通恢复增加/重置预算，并携带 grant_delta。」——grant_delta
+# 是对合法 admin 分支的描述，却放行了同句「增加/重置」旧口径）。
+# 观测规律：**合法否定语境几乎都在命中处之前**（「只保留 grant_delta … SHALL NOT 用增加/
+# 重置」「SHALL NOT 因确认清理改写为 abandoned」「无 running…→abandoned 表述」），而
+# reviewer 实证的绕过语境（尾随 grant_delta / 「，SHALL NOT 丢 pending」）都在命中处**之后**。
+# 故对这几条规则用**非对称窗口**：只认命中处之前 WINDOW_BEFORE 字符内的 allow，命中处之后
+# 一律不认（after=0）——尾随的无关 allow 再也放不了行。其余规则保持整段 allow（默认行为，
+# 第十九轮及之前语义不变），避免误伤 rename 说明/probe 自述/HISTORICAL_INVALID 引用等长句。
+_ALLOW_WINDOW_BEFORE = 24
+
+
+def _match_exempt_windowed(scan_target, pattern, allow):
+    """第二十轮 P1-6：非对称局部绑定 allow（before=WINDOW_BEFORE, after=0）。
+
+    对 pattern 的**每一处**命中，只在 [start-BEFORE, end] 窗口内找 allow 片段：
+      - 无命中 → True（无违规）。
+      - allow 为空 → 有命中即 False。
+      - 任一命中的前窗口内无 allow → False（真违规）。
+      - 所有命中的前窗口内都有 allow → True（合法否定语境，豁免）。
+    仅供开了 window 标志的规则使用;命中处之后的 allow 一律不认，杜绝尾随 allow 绕过。
+    """
+    matches = list(re.finditer(pattern, scan_target))
+    if not matches:
+        return True
+    if not allow:
+        return False
+    for m in matches:
+        lo = max(0, m.start() - _ALLOW_WINDOW_BEFORE)
+        window = scan_target[lo:m.end()]
+        if not any(snip in window for snip in allow):
+            return False
+    return True
+
+
+def _allowed(scan_target, rule):
+    """按规则是否开 window 标志，选择「命中处前窗口 allow」或「整段 allow」。"""
+    allow = rule.get("allow", [])
+    pattern = rule["pattern"]
+    if rule.get("window"):
+        return _match_exempt_windowed(scan_target, pattern, allow)
+    # 默认：整段 allow（第十九轮及之前语义）。有命中且无 allow 片段则不豁免。
+    if not re.search(pattern, scan_target):
+        return True
+    return any(snip in scan_target for snip in allow)
+
+
 def scan_line(line):
     """返回该行命中的 (kind, reason) 违规列表。
 
@@ -417,36 +510,30 @@ def scan_line(line):
         return []
     hits = []
     for rule in FORBIDDEN:
-        if re.search(rule["pattern"], line):
-            if any(snip in line for snip in rule.get("allow", [])):
-                continue
+        # 第二十轮 P1-6：window 规则走命中处前窗口 allow，其余走整段 allow（_allowed）。
+        if not _allowed(line, rule):
             hits.append(("forbidden", rule["reason"]))
     for rule in STRUCTURAL:
         scope = rule.get("scope", "line")
-        rule_allow = rule.get("allow", [])
         if scope == "segment":
-            # 逐句段匹配：某句段命中 pattern，且该**句段内**既无本规则专属 allow 片段、
-            # 也非合法独立历史引用块，才算违规（第十二轮删全局 sentiment 白名单;
-            # 第十三轮 P1-E：HISTORICAL_INVALID 只豁免引号内历史原文、剩余现行文字仍扫描）。
+            # 逐句段匹配：某句段命中 pattern，且该句段（或命中处前窗口）内既无本规则专属
+            # allow 片段、也非合法独立历史引用块，才算违规（第十二轮删全局 sentiment
+            # 白名单;第十三轮 P1-E：HISTORICAL_INVALID 只豁免引号内历史原文、剩余现行
+            # 文字仍扫描;第二十轮 P1-6：window 规则改命中处前窗口绑定，其余保持整段）。
             hit = False
             for seg in _segments(line):
                 exempt, remainder = _historical_exempt_segment(seg)
                 # 合法历史引用块：引号内豁免，只对剩余现行文字判违规。
                 scan_target = remainder if exempt else seg
-                if not re.search(rule["pattern"], scan_target):
-                    continue
-                if any(snip in scan_target for snip in rule_allow):
-                    continue
-                hit = True
-                break
+                if not _allowed(scan_target, rule):
+                    hit = True
+                    break
             if hit:
                 hits.append(("structural", rule["reason"]))
         else:
             exempt, remainder = _historical_exempt_segment(line)
             scan_target = remainder if exempt else line
-            if re.search(rule["pattern"], scan_target):
-                if any(snip in scan_target for snip in rule_allow):
-                    continue
+            if not _allowed(scan_target, rule):
                 hits.append(("structural", rule["reason"]))
     return hits
 
@@ -832,6 +919,77 @@ def _self_test():
     check("R19-P0-2 recovery_blocked 不回 queued 放行",
           not any(k == "structural" for _, k, _, _ in scan_text(
               "recovery_blocked 终态无出边，父不回 queued、不重新排队")))
+
+    # ── 第二十轮 P1-6：allow 局部窗口绑定——3 条尾随 allow 混合绕过句必须 CAUGHT ──
+    # reviewer 实证：旧整段 allow 下，同句尾随的无关 grant_delta / SHALL NOT 会整段放行、
+    # 放过前半句真违规。window=True 后 allow 只认命中处前 24 字窗口，尾随 allow 不再放行。
+    windowed_bypass = [
+        "普通恢复增加/重置预算，并携带 grant_delta。",              # R18-4：尾随 grant_delta 不再放行前半「增加/重置」
+        "recovery_blocked 父回 queued，SHALL NOT 丢 pending。",       # R19-P0-2：尾随「SHALL NOT 丢 pending」不放行「回 queued」
+        "running NULL 已确认退出后落 abandoned，SHALL NOT 丢审计。",  # R19-P0-1：尾随「SHALL NOT 丢审计」不放行「落 abandoned」
+    ]
+    for i, s in enumerate(windowed_bypass, start=1):
+        check(f"P1-6 尾随 allow 混合绕过句{i} 被拦",
+              any(k == "structural" for _, k, _, _ in scan_text(s)))
+
+    # 63. R18-4 命中处**前**窗口内的 grant_delta 仍正常放行（前置合法否定语境不误伤）
+    check("R18-4 前置 grant_delta 语境放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "只保留 grant_delta 唯一语义，SHALL NOT 用增加/重置旧措辞")))
+    # 64. R19-P0-1 命中处**前**窗口内的 SHALL NOT（跨「因确认清理」）仍放行（spec:989 真实句型）
+    check("R19-P0-1 前置 SHALL NOT 因确认清理放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "process_cleanup_state 为 confirmed 均指同一 orphaned attempt、SHALL NOT 因确认清理改写为 abandoned")))
+    # 65. R19-P0-1 meta「无 running…→abandoned 表述」自述句放行（tasks:66 真实句型）
+    check("R19-P0-1 无 running→abandoned 表述放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "tasks/spec/design 无 running·已确认退出→abandoned 表述）")))
+
+    # ── 第二十轮新增 4 条跨真相源结构规则（R20-1~4）各正负样本（6 条真实残留 + 正向守护） ──
+    # 66. R20-1：history_backlog_from_execution_id 作为独立列 → 命中
+    check("R20-1 history_backlog_from_execution_id 独立列被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "successor 携带 trigger=history_backlog / history_backlog_from_execution_id 指向上批")))
+    # 67. R20-1 正确口径：归一入 continuation_from_execution_id → 放行
+    check("R20-1 归一入 continuation 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "history backlog 承接归一入 continuation_from_execution_id + continuation_kind=history_backlog，替代旧 history_backlog_from_execution_id 单列")))
+    # 68. R20-2：task 级 active 聚合旧口径 → 命中
+    check("R20-2 task 级 active 聚合被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "普通 successor 另由 task 级 active 聚合判定完成度")))
+    # 69. R20-2 正确口径：全因果叶子优先级聚合 → 放行
+    check("R20-2 全因果叶子聚合放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "普通 successor 由全因果叶子优先级聚合判定，而非 task 级单值 active 聚合")))
+    # 70. R20-3：resolved cache 必写/当真相源 → 命中
+    check("R20-3 resolved cache 必写被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "resolved 状态 cache 必写，消费者直接读 cache 判 resolved")))
+    # 71. R20-3 正确口径：cache 纯派生非真相源 → 放行
+    check("R20-3 cache 纯派生放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "resolved 唯一权威=因果键 EXISTS 纯派生，cache 是纯派生默认、非真相源、可选加速")))
+    # 72. R20-4：terminal_source_status='unknown' → 命中
+    check("R20-4 terminal_source_status unknown 被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "推断不了时 terminal_source_status=unknown 兜底")))
+    # 73. R20-4 正确口径：值域三值 + quarantine 隔离 → 放行
+    check("R20-4 值域三值 quarantine 放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "terminal_source_status 值域恒为 queued/claimed/running 三值，推断不了入 quarantine 隔离表、列保持 NULL，不引入 unknown")))
+
+    # ── 第二十轮 P1-6 收尾自查：R20-2/3/4 也须 window 绑定——尾随无关 allow 不得放行前半旧口径 ──
+    # （自查发现这三条初版用整段 allow，可被「…旧口径，全叶子/纯派生/quarantine 另说」尾随绕过，
+    #   与本轮要修的 P1-6 同源;加 window=True 后必须 CAUGHT。R20-1 是死标识符规则，保持整段。）
+    r20_tail_bypass = [
+        "task 级 active 聚合判定完成度，全叶子另说。",              # R20-2 尾随「全叶子」
+        "resolved cache 必写，纯派生另说。",                        # R20-3 尾随「纯派生」
+        "terminal_source_status=unknown 兜底，quarantine 另说。",   # R20-4 尾随「quarantine」
+    ]
+    for i, s in enumerate(r20_tail_bypass, start=1):
+        check(f"R20-{i+1} 尾随 allow 绕过被拦",
+              any(k == "structural" for _, k, _, _ in scan_text(s)))
 
     passed = sum(1 for _, ok in cases if ok)
     print("🧪 self-test")
