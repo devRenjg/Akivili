@@ -4,9 +4,12 @@
 > 追溯：每条任务勾选时在提交信息引用任务号（如 `S1.2`）。回滚：回退到上一阶段最后一个 `V` 任务对应的提交即可。
 
 ## S0. 准备与基线锚点
-- [ ] S0.1 记录当前基线：`jianagency.db` 备份一份带日期副本；导出当前全表结构快照（`.schema`）到 `openspec/changes/2026-07-24-foundation-db-alignment/baseline_schema.sql` 作为 S2 固化的比对基准
-- [ ] S0.2 建立回归基准：跑一遍现有 QA suite，记录当前全绿项，作为后续每阶段「行为不变」的对照
-- [ ] S0.3 统计并登记 SQL 访问面清单（15 文件 / 398 调用点 / 11 旁路连接 / 41 datetime / 17 AUTOINCREMENT），作为 S1/S3 收敛的 checklist
+
+> 详细施工书见同目录 `s0-plan.md`（命令、产出、验收逐条钉死）。S0 全程零代码 / 零 schema / 零重启。
+
+- [ ] S0.1 记录当前基线：`jianagency.db` 复制为 `jianagency.db.bak_baseline-<YYYYMMDD>`（已核对匹配 gitignore `*.db.bak*`，不入仓）；用 `py -3.12` 遍历 `sqlite_master` 导出全表结构快照到 `openspec/changes/2026-07-24-foundation-db-alignment/baseline_schema.sql`（纳入追踪）作为 S2 固化的比对基准
+- [ ] S0.2 建立回归基准：入口已确认 = `TestReport/run_qa_suite.py`（主套件 31/31）+ 25 个隔离 probe（见 `TestReport/README.md`，全部临时 DB 隔离、不碰真实库）。跑一遍记录每脚本实测 `N/N` 到 change 目录 `baseline_regression.md`，作为后续每阶段「行为不回退」对照；`*` 标记的需真实 CLI 供应商（collab/codex smoke）不纳入基线
+- [ ] S0.3 统计并登记 SQL 访问面清单（15 文件 / 398 调用点 / 11 旁路连接 / 41 datetime / 17 AUTOINCREMENT）到 change 目录 `sql_surface_checklist.md`，每项带 `file:line`（执行时 Grep 复核刷新行号），作为 S1/S3 收敛的 checklist
 
 ## S1. 连接收口 + PRAGMA 调优（零行为变更）
 - [ ] S1.1 `get_connection()` 统一开启 `PRAGMA journal_mode=WAL`、`PRAGMA busy_timeout=<配置>`、`PRAGMA foreign_keys=ON`（busy_timeout 值走 `config.py`，不硬编码）
