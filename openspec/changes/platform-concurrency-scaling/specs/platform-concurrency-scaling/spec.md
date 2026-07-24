@@ -71,3 +71,32 @@ attempt owner           -- attempt 实际归属的 worker_instance_id
 #### Scenario: 多 Worker owner 模型不复用单行 worker_state
 - **WHEN** 进入阶段 2 多 Worker，两个不同 instance id 的 Worker 在同一 cluster epoch 下并行消费
 - **THEN** 各 Worker 通过 `worker_instances` 持有各自 instance 身份、可分别归属不同 attempt;SHALL NOT 用 PGR 单行 `worker_state.owner_instance_id` 承载多实例;同 slug 全局串行由 `agent_leases`（或等价原子容量）保证而非单进程 `_running`;阶段 2 未落地该模型时 readiness fail-closed
+
+### Requirement: 跨-change 单一实施 DAG 与 PostgreSQL-first 目标真相源（第二十一轮 P1-5）
+
+**🔴 三份 change（[platform-graceful-restart]/[agent-session-resume]/本 change）SHALL 共用唯一一条数据库实施 DAG，且以 PostgreSQL 约束为设计真相源、SQLite 仅作过渡兼容（第二十一轮 P1-5，用户拍板）。** 动机：PGR 阶段 1 原按 SQLite 语义固定（WAL/`AUTOINCREMENT`/SQLite partial index/无法 ALTER FK 的应用层等价校验），而本 change 又要求近期迁 PostgreSQL——若不先拍板目标 DB，successor uniqueness、event/message cursor、claim、FK、trigger、`SKIP LOCKED`、migration rollback 会各实现两套后返工;且第二十一轮两个 P0（自增 id ≠ 提交序、分列 unique 不保证并集唯一）正是「用 SQLite 单写假设掩盖 PG 并发」的直接后果。
+
+**目标真相源 = PostgreSQL**（SQLite 若保留仅作过渡兼容、非正式实现目标）。每项约束的目标 DB 真相源 SHALL 固定如下：
+
+```text
+约束项                        PostgreSQL 目标真相源（设计基准）                       SQLite 过渡兼容
+event/message cursor          per-execution/conversation 行锁分配 event_seq/         单写事务下全局自增 id
+                              message_seq（FOR UPDATE），提交顺序安全                 恰好单调、可过渡
+successor 并集唯一             execution_edges + UNIQUE(parent_execution_id)          同建边表，单写天然串行
+                              （第二十一轮 P0-2）
+claim 原子性                  SELECT ... FOR UPDATE SKIP LOCKED + 状态 CAS            单语句条件 UPDATE + busy_timeout
+FK / lineage 完整性           原生 FOREIGN KEY + 触发器                               应用层等价校验 + 迁移探针
+写时守卫                      BEFORE INSERT/UPDATE 触发器                             同触发器（SQLite 支持）或中心 repository
+row_version / 预算 CAS        单语句原子 UPDATE ... WHERE version=?                   同（SQLite 支持）
+migration rollback            事务 + savepoint                                       事务
+```
+
+**统一 DAG（单一顺序、无分叉，SHALL NOT 出现「先 SQLite 落 trigger 再迁 PG 重做」）**：① 先按 **PostgreSQL 约束**设计 execution/attempt/`worker_state`/`execution_events(execution_id,event_seq)`/`execution_edges`/`conversations.next_message_seq` 全部 schema 与约束语义（PGR 阶段 1 最小地基，但契约按 PG 定）;② 落 task/conversation/agent 粒度 active 唯一约束（与 PGR、ASR 同源）;③ 启用多 Worker 原子容量与 claim（PG `SKIP LOCKED`，SQLite 过渡用条件 UPDATE）;④ 每项约束 SHALL 标注上表的目标 DB 真相源，实现 SHALL 按 PG 语义落地、SQLite 实现 SHALL 是该语义的过渡子集，SHALL NOT 把「SQLite 恰好单写」写成永久契约。**本 change 与 PGR/ASR 的顺序、唯一索引、cursor、FK、trigger 迁移 SHALL 引用本 DAG，不另起一套。**
+
+#### Scenario: 单一 DAG 无双实现返工（第二十一轮 P1-5）
+- **WHEN** 实施者读 PGR/ASR/concurrency 三份 change 决定 event cursor 与 successor 唯一的落地
+- **THEN** 三份 change SHALL 指向本 Requirement 的同一目标真相源（per-execution/conversation 行锁序号、execution_edges UNIQUE），实现按 PostgreSQL 语义落地一次，SQLite 作过渡兼容子集，SHALL NOT 先按 SQLite 全局自增 id/分列 unique 实现再迁 PG 重做
+
+#### Scenario: 目标真相源冲突 fail-closed（第二十一轮 P1-5）
+- **WHEN** 某 change 的 cursor/uniqueness/claim 写法与本 DAG 目标 DB 真相源不一致（如仍用全局自增 id 作已提交水位、或仅分列 unique + NOT EXISTS）
+- **THEN** 该写法 SHALL 视为设计违规、进入 spec 一致性 probe 拦截（见 spec_consistency_probe R21 规则），SHALL NOT 因「SQLite 下恰好能跑」放行

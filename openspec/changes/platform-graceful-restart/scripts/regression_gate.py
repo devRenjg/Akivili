@@ -82,6 +82,10 @@ REGRESSION_ROUNDS = [
     ("20", "task 级 active 单值聚合旧口径（P1-2）", "R20-2 全因果叶子优先级聚合"),
     ("20", "resolved cache 当真相源/必写（P1-3）", "R20-3 因果键 EXISTS 唯一权威、cache 纯派生"),
     ("20", "terminal_source_status='unknown' 二选一（P1-4）", "R20-4 值域三值 + quarantine 隔离表"),
+    ("21", "全局自增 id/BIGSERIAL/MAX(messages.id) 充当已提交水位/续传游标（P0-1，PG late-commit 越位）", "R21-1a per-execution event_seq(run_queue 行锁)/conversation message_seq(conversations 行锁)"),
+    ("21", "断言「child 全局 id 必然大于父」跨 execution 可比假设（P0-1）", "R21-1b 父子各 per-execution event_seq 单调、不需跨 execution 可比"),
+    ("21", "successor 续订携带父全局 Last-Event-ID（P0-1，人工/自动两口径未归一）", "R21-1c 统一切 child execution_id、从 child event_seq 起点回放"),
+    ("21", "三分列 partial unique + 中心化 NOT EXISTS 保证并集唯一（P0-2，PG READ COMMITTED 跨列并发双 child）", "R21-2 execution_edges 边表 UNIQUE(parent_execution_id) 为并集唯一真相源"),
 ]
 
 # ── 历轮废弃字段/命名清单：probe 覆盖断言（_probe_coverage）据此校验每个字段仍有守卫 ──

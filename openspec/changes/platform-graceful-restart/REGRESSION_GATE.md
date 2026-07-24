@@ -37,11 +37,11 @@ python openspec/changes/platform-graceful-restart/scripts/regression_gate.py --l
 - **正样本**：旧口径句 → 必须被拦（`any(k=='structural'...)` 为真）。
 - **负样本**：对应的正确口径 → 必须放行（无命中）。
 
-当前 self-test **91 条**全绿。
+当前 self-test **106 条**全绿。
 
 ## 历轮问题 → 守卫映射
 
-完整清单见 `regression_gate.py --list`（33 条回归项 + 5 个废弃字段覆盖断言）。要点：
+完整清单见 `regression_gate.py --list`（37 条回归项 + 5 个废弃字段覆盖断言）。要点：
 
 | 轮次 | 代表性问题 | 守卫 |
 |------|-----------|------|
@@ -56,6 +56,7 @@ python openspec/changes/platform-graceful-restart/scripts/regression_gate.py --l
 | 18 | protocol 恒定局；task 完成度取单个最新 execution；无条件读回 child；增加或重置预算 | R18-1~4 |
 | 19（**P0×2**） | running NULL 已确认清理写 abandoned；recovery_blocked 父重新排队；6 条 probe false-negative | R19-P0-1 / R19-P0-2 + 扩匹配 |
 | 20 | probe allow 被同句无关 SHALL NOT/grant_delta 绕过（P1-6）；history_backlog 旧独立列；task 级 active 单值聚合；resolved cache 当真相源；terminal_source_status='unknown' | window 绑定 + R20-1~4 |
+| 21（**P0×2**） | 全局自增 id/BIGSERIAL/MAX(messages.id) 充当已提交水位/续传游标（PG late-commit 越位）；断言 child 全局 id 必然大于父；successor 续订携带父全局 Last-Event-ID（两口径未归一）；三分列 partial unique + NOT EXISTS 保证并集唯一（READ COMMITTED 跨列并发双 child） | R21-1a（per-execution event_seq / conversation message_seq 行锁）+ R21-1b/1c（切 child + event_seq 起点回放、口径归一）+ R21-2（execution_edges 边表 UNIQUE(parent)） |
 
 ## 维护约定（每新增一轮 Review 必做）
 
