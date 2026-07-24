@@ -35,13 +35,16 @@
           <span class="dot-live"></span>正在运行（{{ ov.running_count }}）
         </div>
         <div v-if="runningOpen && ov.running.length" class="ov-list">
-          <div v-for="r in ov.running" :key="r.task_run_id" class="ov-row running"
-               @click="jumpLineage(r.project_id, r.task_id)">
+          <div v-for="r in ov.running" :key="r.task_run_id" class="ov-row running">
             <span class="ov-pulse"></span>
             <span class="ov-row-name">{{ r.agent_display }}</span>
-            <span class="ov-row-proj">{{ r.project_title || '项目#' + r.project_id }}</span>
+            <span class="ov-row-proj clickable" @click="openTask(r.project_id, r.task_id)"
+                  title="打开任务详情页">{{ r.project_title || '项目#' + r.project_id }}</span>
             <el-tag v-if="r.is_subtask" size="small" effect="plain" class="ov-subtag">子任务</el-tag>
-            <span class="ov-row-task">#{{ r.task_id }} {{ r.task_title || '—' }}</span>
+            <span class="ov-row-task clickable" @click="openTask(r.project_id, r.task_id)"
+                  title="打开任务详情页">#{{ r.task_id }} {{ r.task_title || '—' }}</span>
+            <a class="ov-row-lineage" @click="jumpLineage(r.project_id, r.parent_task_id || r.task_id)"
+               title="在下方链路可观测区展开该任务链路">查看链路</a>
             <span class="ov-spacer"></span>
             <span class="ov-row-since" v-if="r.started_at">{{ r.started_at }}</span>
             <span class="ov-row-state running">运行中</span>
@@ -230,6 +233,11 @@ async function jumpProject(pid) {
   await loadTopTasks()
   syncQuery()
 }
+// 点项目名/任务名：跳转到对应任务详情页
+function openTask(pid, tid) {
+  if (!pid || !tid) return
+  router.push(`/projects/${pid}/tasks/${tid}`)
+}
 
 const transcriptVisible = ref(false)
 const transcriptRunId = ref(null)
@@ -395,10 +403,14 @@ onBeforeUnmount(() => { if (ovTimer) clearInterval(ovTimer) })
 .ov-row {
   display: flex; align-items: center; gap: 8px;
   background: #fff; border: 1px solid #ebeef5; border-radius: 8px;
-  padding: 8px 12px; cursor: pointer; font-size: 13px;
+  padding: 8px 12px; font-size: 13px;
   transition: border-color .15s, background .15s;
 }
 .ov-row:hover { border-color: #dcdfe6; background: #fafbfc; }
+/* 空闲行整行可点（跳项目）；运行行改为局部可点（项目/任务名跳详情、查看链路展开链路） */
+.ov-row.idle { cursor: pointer; }
+.ov-row .clickable { cursor: pointer; }
+.ov-row .clickable:hover { text-decoration: underline; }
 .ov-row.running { border-left: 3px solid #e6a23c; }
 .ov-row.idle { border-left: 3px solid #dcdfe6; }
 .ov-pulse { width: 8px; height: 8px; border-radius: 50%; background: #e6a23c; flex-shrink: 0; animation: ovpulse 1.4s ease-in-out infinite; }
@@ -407,6 +419,8 @@ onBeforeUnmount(() => { if (ovTimer) clearInterval(ovTimer) })
 .ov-row-name { font-weight: 600; color: #303133; flex-shrink: 0; }
 .ov-row-proj { color: #409eff; flex-shrink: 0; }
 .ov-row-task { color: #606266; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ov-row-lineage { color: #409eff; flex-shrink: 0; cursor: pointer; font-size: 12px; }
+.ov-row-lineage:hover { text-decoration: underline; }
 .ov-subtag { flex-shrink: 0; }
 .ov-lead { transform: scale(.9); flex-shrink: 0; }
 .ov-spacer { flex: 1; }

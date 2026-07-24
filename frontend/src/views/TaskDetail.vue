@@ -98,7 +98,7 @@
           <div class="composer-input-wrap">
             <el-input ref="inputEl" v-model="input" type="textarea" :rows="6" :disabled="streaming"
                       resize="none"
-                      placeholder="下达指令，输入 @ 点名成员；Enter 发送 / Shift+Enter 换行"
+                      placeholder="下达指令，输入 @ 点名成员；回车换行，点「发送」提交"
                       @input="onInput" @keydown="onComposerKeydown" />
             <!-- @ 补全浮层 -->
             <div v-if="mentionOpen && mentionList.length" class="mention-pop" :style="mentionPopStyle">
@@ -394,8 +394,7 @@ function onComposerKeydown(e) {
     if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); pickMention(mentionList.value[mentionIdx.value]); return }
     if (e.key === 'Escape') { mentionOpen.value = false; return }
   }
-  // 普通 Enter 发送（Shift+Enter 换行）
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
+  // 回车不发送：Enter 一律换行，发送只能点「发送」按钮（无键盘发送快捷键）
 }
 
 // 聊天气泡：解析一条消息的发言人。user 消息用后端返回的实际发送者名（user_name，
@@ -479,7 +478,7 @@ function relTime(ts) {
 }
 
 // 动态折叠
-const FOLD_WINDOW = 1   // 滑动窗口：默认只展开最后 1 条消息，其余默认折叠
+const FOLD_WINDOW = 5   // 滑动窗口：默认展开最近 5 条消息，更早的默认折叠；消息 ≤ 5 条则全展开
 const folded = ref({})
 function isFolded(i) { return !!folded.value[i] }
 function toggleFold(i) { folded.value[i] = !folded.value[i] }

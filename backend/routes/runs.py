@@ -564,6 +564,7 @@ async def agents_overview(days: int = 30):
             "project_id": r["project_id"], "project_title": r["project_title"],
             "task_id": r["task_id"], "task_title": r["task_title"],
             "is_subtask": r["parent_task_id"] is not None,
+            "parent_task_id": r["parent_task_id"],
             "started_at": to_beijing(r["started_at"]),
         })
 
