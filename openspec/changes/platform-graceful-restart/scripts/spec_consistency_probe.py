@@ -351,6 +351,50 @@ STRUCTURAL = [
          window=True,  # 第二十轮 P1-6 自查：allow 只认命中处前窗口，防尾随「SHALL NOT/quarantine/隔离表」放行前半「=unknown」。
          allow=["不含 unknown", "无 unknown", "非 unknown", "不引入 unknown", "SHALL NOT 引入", "而非 unknown", "已删",
                 "值域恒", "值域三值", "三值"]),
+    # ── 第二十一轮新增跨真相源结构规则（3 条：R21-1a/1b/1c + R21-2，守护本轮 2 个 P0 收口不回归） ──
+    # R21-1a（P0-1 提交顺序安全游标）：把「全局自增 id / BIGSERIAL / IDENTITY / MAX(messages.id)」
+    #   **充当已提交水位/续传游标**即违规——PG identity 在 INSERT 时分配、不等提交，late-commit 小 id
+    #   会被 reader 永久越过。真相源是 per-execution `event_seq`（run_queue 行锁）/ conversation
+    #   `message_seq`（conversations 行锁）。specs 里合法出现均为「SHALL NOT 用全局…作水位/游标」否定式
+    #   或 SQLite 过渡说明，靠命中处**前** 24 字窗口 allow 放行。
+    dict(pattern=r"(全局\s*(自增\s*)?(`?id`?|BIGSERIAL|IDENTITY)|MAX\s*\(\s*messages\.id\s*\))[^。；;!？|]{0,30}(作为?|充当|当作?|直接充当|用作|视作|拿来?作)[^。；;!？|]{0,12}(已提交\s*)?(水位|游标|watermark|cursor)",
+         reason="全局自增 id/BIGSERIAL/IDENTITY/MAX(messages.id) SHALL NOT 充当已提交水位/续传游标——PG identity 在 INSERT 时分配不等提交、late-commit 小 id 被 reader 永久越过；真相源=per-execution event_seq（run_queue 行锁）/ conversation message_seq（conversations 行锁）（第二十一轮 P0-1）",
+         scope="segment",
+         window=True,  # allow 只认命中处前 24 字窗口，防尾随「…SHALL NOT/而非/过渡」放行前半「全局 id 作水位」。
+         # 「若用/仍用/如仍用/如用」= P0-1 根因解释 + concurrency 检测 WHEN 子句的假设/检测标记
+         # （描述「用全局 id 作水位会被越过」以将其禁止），非规范性主张，属合法否定语境。
+         allow=["SHALL NOT", "不用", "不作", "不充当", "不得用", "而非", "非全局", "过渡", "SQLite", "late-commit",
+                "会被", "永久越过", "替代", "已删", "不等提交", "根因", "若用", "仍用", "如仍用", "如用", "不一致"]),
+    # R21-1b（P0-1 跨 execution 可比假设）：断言「child … 全局 id 必然大于/更大 父」即违规——
+    #   per-execution `event_seq` 下父子事件序不需要跨 execution 可比，late-commit 下该全局假设不成立。
+    #   死短语式（bare 断言即信号），合法弃用说明常在同段（「…是全局游标的产物…SHALL NOT 再保留…归一」），
+    #   故用整段 allow（同 R20-1，不加 window——避免前窗口够不到句首的「旧的/产物/归一」而误报弃用句）。
+    dict(pattern=r"child[^。；;!？|]{0,12}全局\s*(`?id`?|Last-Event-ID)[^。；;!？|]{0,8}必然[^。；;!？|]{0,6}(大于|更大)",
+         reason="per-execution event_seq 下父子事件序不需跨 execution 可比，SHALL NOT 断言「child 全局 id 必然大于父」（late-commit 下不成立，第二十一轮 P0-1）——切 child execution_id 从 child event_seq 起点回放",
+         scope="segment",
+         allow=["SHALL NOT", "而非", "归一", "不再依赖", "不依赖", "不成立", "产物", "已删", "替代",
+                "late-commit", "废弃", "旧口径", "旧的", "不需"]),
+    # R21-1c（P0-1 successor 续订游标）：断言「携带（当前/父的）全局 Last-Event-ID **续订/续传/回放/切 child**」
+    #   即违规——successor 订阅 SHALL 切 child execution_id、从 child `event_seq` 起点回放，不复用父的跨
+    #   execution 全局游标。要求动词后缀（续订/续传/续跑/回放/订阅/切）——specs 里「携带…全局 Last-Event-ID
+    #   且/或依赖」等描述/否定式不带该动词后缀、天然不命中;真正的续订复用旧口径才命中。window 兜底。
+    dict(pattern=r"携带\s*(当前\s*|父的?\s*)?(较大\s*)?全局\s*`?Last-Event-ID`?[^。；;!？|]{0,10}(续订|续传|续跑|回放|订阅|切\s*child|切\s*successor)",
+         reason="successor 续订 SHALL 切 child execution_id、从 child event_seq 起点回放，SHALL NOT 携带父的跨 execution 全局 Last-Event-ID 续订（per-execution 游标口径归一，第二十一轮 P0-1）",
+         scope="segment",
+         window=True,
+         allow=["SHALL NOT", "不携带", "不复用", "而非", "不再", "归一", "旧口径", "废弃", "旧的", "产物"]),
+    # R21-2（P0-2 并集唯一真相源）：断言「三分列 partial unique + 中心化 NOT EXISTS **保证并集唯一/一父
+    #   至多一后继**」即违规——PG READ COMMITTED 下两事务各插不同列、命中不同 partial unique 均可提交，
+    #   NOT EXISTS 看不到对方未提交行，会建多后继。跨键并集唯一真相源=`execution_edges` 边表
+    #   UNIQUE(parent_execution_id)（三类 successor helper 同事务先插边表再建 child）。要求 partial unique
+    #   + NOT EXISTS + 唯一性断言宾语（并集唯一/一父至多一后继/跨键唯一）三者共现——specs 里
+    #   「SHALL NOT 仅靠…NOT EXISTS」「不再依赖中心化 NOT EXISTS」等否定式无该断言宾语、且 window 兜底。
+    dict(pattern=r"(三(个|分)?列|分列)?\s*partial\s*unique[^。；;!？|]{0,20}(\+|加|与|及|和)?[^。；;!？|]{0,10}NOT\s*EXISTS[^。；;!？|]{0,28}(保证|挡住?|防住?|使|令|够|足以|确保)[^。；;!？|]{0,14}(并集唯一|一父至多一(个)?后继|跨键(并集)?唯一|唯一后继|至多一后继|一父一子)",
+         reason="跨键「一父至多一后继」并集唯一真相源=execution_edges 边表 UNIQUE(parent_execution_id)（三类 successor helper 同事务先插边表再建 child），SHALL NOT 靠「三分列 partial unique + 中心化 NOT EXISTS」保证——PG READ COMMITTED 下两事务各插不同列均可提交、NOT EXISTS 看不到未提交行会建多后继（第二十一轮 P0-2）",
+         scope="segment",
+         window=True,
+         allow=["SHALL NOT", "不(依赖|靠|够|能)", "仅靠", "不再依赖", "而非", "挡不住", "不成立", "会建",
+                "READ COMMITTED", "execution_edges", "边表", "已删", "不足"]),
 ]
 
 # 显式历史标记（第十二轮 P1-D 引入，第十三轮 P1-E 收紧作用域）：需引用已废旧模型时，
@@ -990,6 +1034,54 @@ def _self_test():
     for i, s in enumerate(r20_tail_bypass, start=1):
         check(f"R20-{i+1} 尾随 allow 绕过被拦",
               any(k == "structural" for _, k, _, _ in scan_text(s)))
+
+    # ── 第二十一轮新增 R21-1a/1b/1c + R21-2 各正负样本（本轮 2 个 P0 的真实残留 + 正向守护） ──
+    # R21-1a（P0-1 提交顺序安全游标）：全局 id / MAX(messages.id) 充当水位/游标 → 命中
+    check("R21-1a 全局自增 id 充当已提交水位被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "SSE 续传用全局自增 id 直接充当已提交水位、reader 之后只查 id > 大id")))
+    check("R21-1a MAX(messages.id) 作水位被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "session 增量用 MAX(messages.id) 作水位、committed_msg_id 推进")))
+    # R21-1a 正确口径：per-execution event_seq / message_seq 行锁 → 放行
+    check("R21-1a per-execution event_seq 行锁放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "SHALL NOT 用全局自增 id 作水位——真相源是 per-execution event_seq 由 run_queue 行锁分配")))
+    check("R21-1a SQLite 过渡说明放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "SQLite 过渡期单写事务下全局 id 无 late-commit 问题、可作 event_seq 过渡实现、而非永久契约")))
+    # R21-1a window 自查：尾随 allow 不得放行前半「全局 id 作水位」
+    check("R21-1a 尾随 allow 绕过被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "全局自增 id 作已提交水位，SQLite 过渡另说。")))
+    # R21-1b（P0-1 跨 execution 可比假设）：断言 child 全局 id 必然大于父 → 命中
+    check("R21-1b child 全局 id 必然大于父被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "child 事件全局 id 必然大于父 superseded event id，前端续订即可无损")))
+    # R21-1b 正确口径：per-execution 不需跨 execution 可比 → 放行
+    check("R21-1b per-execution 不需跨 execution 可比放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "父子事件序不需要跨 execution 可比，SHALL NOT 断言 child 全局 id 必然大于父——late-commit 下不成立、已废弃的旧口径产物")))
+    # R21-1c（P0-1 successor 续订游标）：携带父全局 Last-Event-ID 续订 → 命中
+    check("R21-1c 携带全局 Last-Event-ID 续订被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "前端收父 superseded 后携带当前全局 Last-Event-ID 续订 successor 流")))
+    # R21-1c 正确口径：切 child execution_id 从 child event_seq 回放 → 放行
+    check("R21-1c 切 child 从 event_seq 回放放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "successor 续订 SHALL 切 child execution_id、从 child event_seq 起点回放，不复用父的全局 Last-Event-ID")))
+    # R21-2（P0-2 并集唯一）：partial unique + NOT EXISTS 保证并集唯一 → 命中
+    check("R21-2 三分列 partial unique + NOT EXISTS 保证并集唯一被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "三分列 partial unique + 中心化 NOT EXISTS 保证一父至多一后继并集唯一")))
+    # R21-2 正确口径：execution_edges 边表 UNIQUE(parent) → 放行
+    check("R21-2 execution_edges 边表并集唯一放行",
+          not any(k == "structural" for _, k, _, _ in scan_text(
+              "跨键并集唯一以 execution_edges 边表 UNIQUE(parent_execution_id) 为准，SHALL NOT 靠三分列 partial unique + NOT EXISTS——READ COMMITTED 下挡不住跨列并发")))
+    # R21-2 window 自查：尾随 allow 不得放行前半「partial unique + NOT EXISTS 保证并集唯一」
+    check("R21-2 尾随 allow 绕过被拦",
+          any(k == "structural" for _, k, _, _ in scan_text(
+              "三分列 partial unique + NOT EXISTS 保证并集唯一，execution_edges 另说。")))
 
     passed = sum(1 for _, ok in cases if ok)
     print("🧪 self-test")

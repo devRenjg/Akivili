@@ -64,7 +64,7 @@
 **不变量**：崩溃时**宁可重复喂，绝不能漏喂**（at-least-once）。用 2 个字段实现（对齐用户拍板，不用三段）：
 
 - **`agent_sessions.committed_msg_id`**：上次**成功**执行确认喂到的水位——**只有 run 成功收尾才推进**。
-- **`task_runs.planned_through_msg_id`**：本次构建 prompt 那刻的快照终点 = 该 conversation 当时的 `MAX(messages.id)`。落在 task_runs（每 run 一行、天然是历史快照），不污染 session 主状态。
+- **`task_runs.planned_through_msg_id`**：本次构建 prompt 那刻的快照终点 = 该 conversation 当时的 `MAX(message_seq)`（conversation 提交顺序安全序号，第二十一轮 P0-1，SHALL NOT 用全局 `MAX(messages.id)`——late-commit 小 id 会漏灌）。落在 task_runs（每 run 一行、天然是历史快照），不污染 session 主状态。
 - **起点不单存**：本次增量起点永远 = 上次的 `committed_msg_id`，查出来即可。
 - **增量 = `messages WHERE conversation_id=? AND id > committed_msg_id AND id <= planned_through_msg_id AND 非本 agent 自产`**（参数化）：
   - 别人（含人工）在上次成功水位之后、本次快照之前说的话 → 喂给本 Agent。
@@ -125,7 +125,7 @@
 
 - **T1 建表**：`agent_sessions`，唯一键 `(conversation_id, agent_slug)`；`database.py` 建表 + 迁移（存量无行，首次执行自然走全量分支）。加 **(conversation, agent) active 唯一约束（NULL 组索引仅作存量脏数据并发防御、非可执行兜底，第六轮 P1-1 两组互补 index + 第十二轮 P0-A）**（决策 1 串行）+ **task:conversation 1:1 约束 `UNIQUE(tasks.conversation_id) WHERE NOT NULL`（第七轮 P0-3）** + **NULL task 不可执行三层硬门（dispatch 拒绝 / scheduler 排除 / claim CAS `AND conversation_id IS NOT NULL`，第十二轮 P0-A）**。
 - **T2 claude 抓取**：`claude_code.py::_parse_line` 提 session_id；`ExecEvent` 增字段承载；`runner.py` 流中途 pin + 收尾覆盖存（COALESCE）。
-- **T3 增量取历史**：`runner.py` 执行前查 `agent_sessions`，决定「全量首建 / 增量 + resume」；增量 SQL 参数化 `id > committed_msg_id AND id <= planned_through_msg_id AND author != 本agent`；`planned_through_msg_id`（落 task_runs）= prompt-build 时 `MAX(messages.id)`；`committed_msg_id`（session）只在成功收尾推进。
+- **T3 增量取历史**：`runner.py` 执行前查 `agent_sessions`，决定「全量首建 / 增量 + resume」；增量 SQL 参数化 `message_seq > committed_msg_id AND message_seq <= planned_through_msg_id AND author != 本agent`（第二十一轮 P0-1：水位统一为 conversation `message_seq`、SHALL NOT 用全局 `messages.id`）；`planned_through_msg_id`（落 task_runs）= prompt-build 时 `MAX(message_seq)`；`committed_msg_id`（session）只在成功收尾推进。
 - **T4 claude resume**：命中 session 时 `args += ["--resume", sid]`；`resolveSessionID` 落地判定；未落地 → 清 sid + 本次降级全量。
 - **T5 codex app-server**：`codex.py` 从 `exec` 一次性改为 `app-server --listen stdio://` + `thread/resume`(回退 `thread/start`) + `turn/start`；握手超时、进程组隔离、`threadId` 捕获。**改动最大的一处**。
 - **T6 poisoned 分类**：定义 poisoned 失败集（iteration_limit / api 400 / codex 语义静默）；命中 → 丢 session、不 resume。
