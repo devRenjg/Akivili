@@ -33,7 +33,7 @@ Akivili 后端的数据访问层是「手工作坊」形态，与 Multica 的工
 ## Impact
 
 - **本 change 涉及大范围机械改造，分阶段落地、每阶段独立验收后再进下一阶段。** 落实时预计涉及：
-  - `backend/requirements.txt`：新增 `sqlalchemy[asyncio]`、`alembic`、`asyncpg`（S3/S4）。
+  - `backend/requirements.txt`：新增 `alembic`（S2，连带 `sqlalchemy` Core 作传递依赖装入——见 design 决策 2「依赖边界澄清」：S2 装但只跑迁移不写 ORM）；`sqlalchemy[asyncio]` 显式提升为 ORM 用法依赖 + `asyncpg`（S3/S4）。
   - `backend/database.py`：连接入口统一 + PRAGMA（S1）；引擎方言收敛（S3）；driver 抽象（S4）。
   - 11 处旁路连接：`routes/auth.py`(3)、`skills.py`(2)、`auth.py`(2)、`agents.py`(2)、`database.py`(2) 改走统一入口（S1）。
   - 新增 `backend/migrations/`（Alembic 环境 + 001 基线 + 后续迁移，S2）。

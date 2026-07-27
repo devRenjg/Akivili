@@ -23,6 +23,8 @@
 - Alembic 是 SQLAlchemy 官方迁移工具，与决策 1 天然配套：可从 ORM 模型 autogenerate 迁移，也可手写。
 - **对标编号迁移**：Alembic 的 revision 链 = Multica 的 001→221 编号链；`alembic_version` 表 = Multica 迁移已应用记录；`upgrade head` = 启动自动 apply。
 - **001 基线策略**：不追求「把历史 41 处兜底拆成 N 个迁移」，而是把**当前实际 schema 快照**（S0.1 导出）固化成单个 `001_baseline`。历史怎么长出来的不重要，重要的是「从今天起 schema 由迁移唯一定义」。存量库用 `alembic stamp 001` 标记已应用，不重跑建表。
+- **依赖边界澄清（2026-07-27 用户拍板）**：Alembic 强依赖 SQLAlchemy（Alembic 由 SQLAlchemy 作者维护、其 migration context 建立在 SQLAlchemy Core 之上），装 alembic 必然连带装 sqlalchemy。故 proposal「S2 只加 alembic、sqlalchemy 留到 S3」的措辞应理解为**用法边界而非安装边界**：S2 引入 `alembic`（连带 `sqlalchemy` Core 作为其依赖装入），但 **S2 只用它跑迁移 DDL，不写任何 ORM 模型、不用 SQLAlchemy 做业务查询**；业务查询迁到 ORM 是 S3 的事。「依赖装入 ≠ 开始用 ORM」。S2.1 的 requirements 因此新增 `alembic`（`sqlalchemy` 作为传递依赖自动装入，可显式 pin 版本）。
+- **迁移 driver（2026-07-27 用户拍板）**：Alembic 迁移用**同步 `sqlite3`(pysqlite) driver** 跑，与运行期解耦——迁移是启动时一次性 DDL、无需 async；业务运行期仍走 S1 的 `aiosqlite + WAL`。二者 driver 分离是 Alembic 官方默认姿势，最简单稳妥，避免为 migration env 配 async engine 的额外复杂度（S2 阶段收益不明显）。迁移连接同样 `PRAGMA journal_mode=WAL`，与运行期库模式一致。
 
 ## 决策 3：SQLite / PostgreSQL 方言差异清单（S3/S4 收敛目标）
 
