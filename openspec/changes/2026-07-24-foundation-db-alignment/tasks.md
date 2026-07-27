@@ -28,14 +28,14 @@
 
 > 详细施工书见同目录 `s2-plan.md`。关键决策见 `design.md` 决策 2：依赖边界（装 alembic 连带 sqlalchemy Core，S2 只跑迁移不写 ORM）/ 迁移用同步 sqlite3 driver / 001 照 baseline_schema.sql 固化 / 存量库先备份再 stamp。
 
-- [ ] S2.1 引入 `alembic` 依赖（连带 `sqlalchemy` Core 传递装入，S2 不写 ORM）；`alembic init backend/migrations`，env.py 用**同步 sqlite3** driver + 从 `config.py` 读 DB URL + 迁移连接置 WAL
-- [ ] S2.2 关闭 `database.py` 里 `PRAGMA table_info` 兜底加列逻辑的「隐式演进」——改为「schema 只由迁移定义」（本任务只标记与规划，实际切换在 S2.4 后）
-- [ ] S2.3 编写 `001_baseline` 迁移：把 S0.1 的 `baseline_schema.sql` **原样**转成 Alembic 迁移（表/列/索引逐一对齐，不改任何结构）
-- [ ] S2.4 启动流程接入 `alembic upgrade head`（`main.py` startup 内，早于 `reclaim_orphan_runs`）
-- [ ] S2.5 空库可重放验证：全新空库启动 → 自动 apply 001 → 结构与 S0.1 快照逐字段一致
-- [ ] S2.6 存量库幂等验证：现有 `jianagency.db` 启动 → 标记为 001 已应用（`alembic stamp`）→ 不重复建表、不丢数据
-- [ ] S2.7 回滚验证：`alembic downgrade` 能回退 001（验证 down 迁移可用，不实际用于生产数据）
-- [ ] **S2.V 验收**：空库重建结构 == 基线快照；存量库启动幂等无损；up/down 双向可用；S0.2 回归全绿 → **提交，回滚锚点 B**
+- [x] S2.1 引入 `alembic` 依赖（连带 `sqlalchemy` Core 传递装入，S2 不写 ORM）；`alembic init backend/migrations`，env.py 用**同步 sqlite3** driver + 从 `config.py` 读 DB URL + 迁移连接置 WAL。**实测装 alembic==1.18.5 + SQLAlchemy==2.0.51(传递依赖)；env.py 加 ALEMBIC_DB_PATH 隔离逃生口(供测试/S2.5/S2.7 隔离，config 无 env_prefix 不认 AKIVILI_DB_PATH)；WAL 用独立 AUTOCOMMIT 连接置（避免扰乱版本 stamp 事务）**
+- [x] S2.2 关闭 `database.py` 里 `PRAGMA table_info` 兜底加列逻辑的「隐式演进」——改为「schema 只由迁移定义」（本任务只标记与规划，实际切换在 S2.4 后）。**SCHEMA 常量 + _migrate() 加 🔒 冻结标记注释，逻辑未改（存量库迁移前仍靠它）**
+- [x] S2.3 编写 `001_baseline` 迁移：把 S0.1 的 `baseline_schema.sql` **原样**转成 Alembic 迁移（表/列/索引逐一对齐，不改任何结构）。**op.execute 逐条嵌入18表原始CREATE(仅去IF NOT EXISTS，含补列最终形态+列注释)，不用op.create_table避免重排；空库重建与baseline逐字节diff一致；SQLite方言原样保留(方言收敛留S3)**
+- [x] S2.4 启动流程接入 `alembic upgrade head`（`main.py` startup 内，早于 `reclaim_orphan_runs`）。**新增 db_migrate.py 编程式接入，三状态健壮处理：空库upgrade/已纳管noop/存量库未纳管自动stamp；main.py startup 用 asyncio.to_thread 调用，早于 init_db；临时库验证三状态全对**
+- [x] S2.5 空库可重放验证：全新空库启动 → 自动 apply 001 → 结构与 S0.1 快照逐字段一致。**空库 upgrade→18表逐字节==baseline、version=001、WAL生效、foreign_key_check零违规、二次upgrade幂等；固化为 run_migration_probe.py 常驻护栏**
+- [x] S2.6 存量库幂等验证：现有 `jianagency.db` 启动 → 标记为 001 已应用（`alembic stamp`）→ 不重复建表、不丢数据。**先备份 jianagency.db.bak_pre_s2_20260727(38MB,gitignore忽略)；杀净8100进程树(无在跑Agent)+端口空闲后重启→日志 stamp_revision->001；真实库 version=001/18表/projects4·tasks221·task_runs635数据零丢/WAL生效；服务接口200·login401；二次run_migrations=noop幂等**
+- [x] S2.7 回滚验证：`alembic downgrade` 能回退 001（验证 down 迁移可用，不实际用于生产数据）。**临时库 upgrade→downgrade base(干净DROP全18表+version清空)→再upgrade(重建18表)往返逐字节无损；固化进 run_migration_probe.py**
+- [x] **S2.V 验收**：空库重建结构 == 基线快照；存量库启动幂等无损；up/down 双向可用；S0.2 回归全绿 → **提交，回滚锚点 B**。**空库重建逐字节==baseline✓；真实库stamp幂等无损(数据零丢)✓；up/down双向✓；回归258/258全绿(主套件31+隔离227，S2新增run_migration_probe 15/15)✓**
 
 ## S3. ORM（SQLAlchemy 2.0 async）+ SQL 收敛 + 方言隔离
 - [ ] S3.1 引入 `sqlalchemy[asyncio]` 依赖；建 `backend/models/` 定义全部表的 ORM 模型（对齐 001 基线，逐表）

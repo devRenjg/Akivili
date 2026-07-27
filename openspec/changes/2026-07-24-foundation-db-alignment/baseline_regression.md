@@ -12,7 +12,7 @@
 |---|---|---|---|
 | `run_qa_suite.py` | **31/31** | 0 | 2026-07-24 |
 
-## 隔离 probe（23 个）
+## 隔离 probe（24 个）
 
 | 脚本 | 基线 N/N | exit | 跑通日期 |
 |---|---|---|---|
@@ -39,8 +39,9 @@
 | `run_task_gates_probe.py` | 10/10 | 0 | 2026-07-24 |
 | `run_timeout_and_qa_probe.py` | 14/14 | 0 | 2026-07-24 |
 | `run_wal_concurrency_probe.py` | 8/8 | 0 | 2026-07-27 |
+| `run_migration_probe.py` | 15/15 | 0 | 2026-07-27 |
 
-**隔离 probe 合计：212/212**（S1 新增 `run_wal_concurrency_probe.py` 8/8，2026-07-27）
+**隔离 probe 合计：227/227**（S1 新增 `run_wal_concurrency_probe.py` 8/8；S2 新增 `run_migration_probe.py` 15/15，2026-07-27）
 
 ## 不纳入基线（需真实 CLI 供应商，非隔离桩，`*`）
 
@@ -53,5 +54,6 @@
 
 - **S0 基线（2026-07-24）：主套件 31/31 + 隔离 probe 204/204 = 235/235，全绿，零已知红项。**
 - **S1 后（2026-07-27）：主套件 31/31 + 隔离 probe 212/212 = 243/243**——S1 新增 `run_wal_concurrency_probe.py` 8/8（WAL/busy_timeout 生效 + 480 并发写零 locked + 收口护栏），其余 22 个 probe 数不变。
-- 后续 S2–S5 每阶段 `S*.V` 验收门必须：主套件仍 31/31、23 个隔离 probe 各自不低于上表通过数、无脚本从绿转红。
+- **S2 后（2026-07-27）：主套件 31/31 + 隔离 probe 227/227 = 258/258**——S2 新增 `run_migration_probe.py` 15/15（空库 upgrade 逐字节对齐基线 + 版本 stamp + 幂等 + WAL + 存量库自动 stamp 不丢数据 + up/down 往返无损），其余 23 个 probe 数不变。
+- 后续 S3–S5 每阶段 `S*.V` 验收门必须：主套件仍 31/31、24 个隔离 probe 各自不低于上表通过数、无脚本从绿转红。
 - 若某阶段引入新 probe，追加到本清单并记录其基线 N/N。

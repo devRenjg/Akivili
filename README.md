@@ -225,6 +225,15 @@ JianAgency/
 
 ## 版本记录
 
+### 数据底座对标 Multica · S2 迁移框架 Alembic — 2026-07-27
+- 🔧 **Schema 版本化（能力 `foundation-data-layer`，OpenSpec change `2026-07-24-foundation-db-alignment`，回滚锚点 B）**
+  - **背景**：schema 此前由 `database.py` 的 `SCHEMA` 常量（18 表）+ `_migrate()` 手工 `ALTER` 补列管理，无版本号、无法回滚、无法可重放重建。S2 引入 Alembic 把 schema 升级为「版本化、可回滚、可重放」的工程化管理，**结构零改动**——把当前 18 表原样固化成 `001_baseline`，只搬家不改表。是平滑重启等被阻塞 change 的地基（它们的 `run_queue`/`task_runs` 加列将改用 Alembic 迁移，不再手工兜底）。
+  - **依赖与边界**：新增 `alembic==1.18.5`（连带 `SQLAlchemy==2.0.51` 传递依赖）。**S2 只用 Alembic 跑迁移 DDL，不写 ORM、不做业务查询**（ORM 用法在 S3）。迁移用同步 `sqlite3` driver、与运行期 `aiosqlite` 解耦；迁移连接置 WAL 与运行期一致。方言（`AUTOINCREMENT`/`datetime('now')`）原样保留，收敛留 S3。
+  - **001 基线**：`op.execute` 逐条嵌入 `baseline_schema.sql` 的 18 表原始 DDL（含补列最终形态 + 列注释），不用 `op.create_table` 避免重排——空库重建结构与基线**逐字节一致**。
+  - **启动接入（`db_migrate.py`）**：main.py startup 最先 `alembic upgrade head`（`asyncio.to_thread` 不阻塞）。健壮处理三种库状态——空库 upgrade 建表 / 已纳管 noop / **存量库有表无 version 自动 stamp**（不重建、不丢数据），内建兜底避免"忘了先 stamp 就 upgrade"撞表已存在崩溃。
+  - ⚠️ **上线需重启后端**触发 startup 迁移；重启前务必备份库 + 杀净所有 8100 监听进程。**迁移接入后成了服务启动的前置关卡**（迁移失败 = 起不来），故 001 保持最简、S2.5/S2.6/S2.7 先在临时库充分验证再碰真实库。
+  - 验证：真实库先备份（`jianagency.db.bak_pre_s2_20260727`，38MB）→ 重启自动 `stamp 001`→ **18 表齐、projects 4/tasks 221/task_runs 635 数据零丢、version=001、WAL 生效、二次启动幂等**；服务接口 200 + login 401；**回归 258/258 全绿**（主套件 31/31 + 隔离 227，S2 新增 `run_migration_probe.py` 15/15：空库逐字节重建 + stamp 幂等 + 存量库自动 stamp 不丢数据 + up/down 往返无损）。回滚锚点 B。
+
 ### 数据底座对标 Multica · S1 连接收口 + PRAGMA 调优 — 2026-07-27
 - 🔧 **统一连接入口 + WAL/busy_timeout（能力 `foundation-data-layer`，OpenSpec change `2026-07-24-foundation-db-alignment`）**
   - **背景**：数据访问层是「手工作坊」形态——`get_connection()` 虽是中心入口（现网 100+ 处在用），但仍有 9 处旁路各自 `aiosqlite.connect`；且全库只开了 `foreign_keys`、**未开 WAL、未设 busy_timeout**，多 Agent 并发写（现网 12 数字员工 / 213 轮次每周）随时可能 `database is locked`。这是对标 Multica 工程化底座的第一步（S1→S5：连接收口 → Alembic 迁移 → SQLAlchemy ORM → 双引擎 → PostgreSQL 默认化）。

@@ -16,6 +16,10 @@ import aiosqlite
 from config import load_settings
 
 # 表结构基线。projects/agents 等的业务字段在各自阶段补充。
+# 🔒 数据底座 S2（冻结标记）：schema 自 001_baseline 起由 Alembic 迁移唯一定义。
+#    本 SCHEMA 常量 + 下方 _migrate() 的建表/补列逻辑将在 S2.4（启动接入 alembic upgrade head）
+#    验证通过后冻结停用——届时建表责任移交 migrations/。此前保持不动，避免中途空窗。
+#    新增列/改结构一律写 Alembic 迁移，不再往此处或 _migrate 追加。见 openspec 决策 2。
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -233,7 +237,13 @@ async def init_db() -> None:
 
 
 async def _migrate(db) -> None:
-    """轻量迁移：为已存在的旧表补新列（CREATE TABLE IF NOT EXISTS 不会加列）。"""
+    """轻量迁移：为已存在的旧表补新列（CREATE TABLE IF NOT EXISTS 不会加列）。
+
+    🔒 数据底座 S2（冻结标记）：此手工补列逻辑自 001_baseline 起由 Alembic 取代。
+    S2.4 接入 `alembic upgrade head` 并验证通过后，本函数将冻结停用。
+    在此之前保持原样运行（存量库仍靠它补列），不再新增任何补列分支——
+    新列一律写 Alembic 迁移。见 openspec 决策 2 / s2-plan。
+    """
     # projects.git_url（仓库链接，展示用）
     cur = await db.execute("PRAGMA table_info(projects)")
     pjcols = {row[1] for row in await cur.fetchall()}

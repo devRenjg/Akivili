@@ -3,3 +3,7 @@ uvicorn[standard]
 pydantic-settings
 aiosqlite
 httpx
+# 数据底座 S2：Alembic 迁移框架。SQLAlchemy 是 alembic 的传递依赖，
+# S2 只用它跑迁移 DDL、不写 ORM；ORM 用法在 S3 引入（见 openspec 决策 2）。
+alembic==1.18.5
+SQLAlchemy==2.0.51
