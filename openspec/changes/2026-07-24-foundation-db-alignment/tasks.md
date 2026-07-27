@@ -7,19 +7,22 @@
 
 > 详细施工书见同目录 `s0-plan.md`（命令、产出、验收逐条钉死）。S0 全程零代码 / 零 schema / 零重启。
 
-- [ ] S0.1 记录当前基线：`jianagency.db` 复制为 `jianagency.db.bak_baseline-<YYYYMMDD>`（已核对匹配 gitignore `*.db.bak*`，不入仓）；用 `py -3.12` 遍历 `sqlite_master` 导出全表结构快照到 `openspec/changes/2026-07-24-foundation-db-alignment/baseline_schema.sql`（纳入追踪）作为 S2 固化的比对基准
-- [ ] S0.2 建立回归基准：入口已确认 = `TestReport/run_qa_suite.py`（主套件 31/31）+ 25 个隔离 probe（见 `TestReport/README.md`，全部临时 DB 隔离、不碰真实库）。跑一遍记录每脚本实测 `N/N` 到 change 目录 `baseline_regression.md`，作为后续每阶段「行为不回退」对照；`*` 标记的需真实 CLI 供应商（collab/codex smoke）不纳入基线
-- [ ] S0.3 统计并登记 SQL 访问面清单（15 文件 / 398 调用点 / 11 旁路连接 / 41 datetime / 17 AUTOINCREMENT）到 change 目录 `sql_surface_checklist.md`，每项带 `file:line`（执行时 Grep 复核刷新行号），作为 S1/S3 收敛的 checklist
+- [x] S0.1 记录当前基线：`jianagency.db` 复制为 `jianagency.db.bak_baseline-20260724`（已核对匹配 gitignore `*.db.bak*`，不入仓）；用 `py -3.12` 遍历 `sqlite_master` 导出全表结构快照到 `openspec/changes/2026-07-24-foundation-db-alignment/baseline_schema.sql`（纳入追踪）作为 S2 固化的比对基准。**实测 18 表（== database.py 的 18 处 CREATE TABLE，无漏表；s0-plan 估算的 ~41 偏高）、0 索引（代码无 CREATE INDEX，隐式 PK/UNIQUE 自动索引 sql 为 NULL 已正确排除）；补列列齐（projects/tasks/run_queue/messages/run_logs 抽查全 OK）；回归期间真实库 mtime 未变，零污染**
+- [x] S0.2 建立回归基准：入口 = `TestReport/run_qa_suite.py`（主套件 **31/31**）+ 22 个隔离 probe（临时 DB 隔离、不碰真实库）。已跑通并记录每脚本实测 `N/N` 到 change 目录 `baseline_regression.md`。**隔离 probe 合计 204/204，总计 235/235 全绿零红项**；`*` 标记的 `run_collab_scenario.py` / `run_codex_cli_smoke.py`（需真实 CLI 供应商）不纳入基线
+- [x] S0.3 统计并登记 SQL 访问面清单到 change 目录 `sql_surface_checklist.md`，每项带 `file:line`。**Grep 复核订正：调用点 254 / 19 文件（s0-plan 的 398/15 偏高且漏登 4 文件，以清单为准）；旁路 aiosqlite.connect 11（9 待收口 + 2 豁免：init_db 与 get_connection 本体）；datetime('now') 41（含 1 处 timeutil docstring，实际代码站点 40）；AUTOINCREMENT 17（全在 database.py）——三类核心数与估算一致**
 
 ## S1. 连接收口 + PRAGMA 调优（零行为变更）
-- [ ] S1.1 `get_connection()` 统一开启 `PRAGMA journal_mode=WAL`、`PRAGMA busy_timeout=<配置>`、`PRAGMA foreign_keys=ON`（busy_timeout 值走 `config.py`，不硬编码）
-- [ ] S1.2 `routes/auth.py` 3 处旁路 `aiosqlite.connect` 改走 `get_connection()`
-- [ ] S1.3 `auth.py` 2 处旁路改走 `get_connection()`
-- [ ] S1.4 `skills.py` 2 处旁路改走 `get_connection()`
-- [ ] S1.5 `agents.py` 2 处旁路改走 `get_connection()`
-- [ ] S1.6 `database.py` 内 2 处直接 `connect`（init 建库除外）审查：init 路径保留、运行期路径收口
-- [ ] S1.7 连接生命周期审查：确认 WAL 下连接复用/关闭策略一致，无连接泄漏
-- [ ] **S1.V 验收**：全库 `grep aiosqlite.connect` 仅剩 init 建库处；WAL 文件（`-wal`/`-shm`）正常生成；并发写压测不再 `database is locked`；S0.2 回归全绿（行为零变更）→ **提交，回滚锚点 A**
+
+> 详细施工书见同目录 `s1-plan.md`（逐处行号、关闭语义差异、验收门钉死）。WAL 机制与跨引擎适用性见 `design.md` 决策 6。`db_busy_timeout_ms` 默认值 = 5000ms（用户 2026-07-27 拍板）。
+
+- [x] S1.1 `get_connection()` 统一开启 `PRAGMA journal_mode=WAL`、`PRAGMA busy_timeout=<配置>`、`PRAGMA foreign_keys=ON`（busy_timeout 值走 `config.py`，不硬编码）。**实测 get_connection 返回连接 journal_mode=wal / busy_timeout=5000 / foreign_keys=1；config.py 加 `db_busy_timeout_ms` 默认5000（env AKIVILI_DB_BUSY_TIMEOUT_MS 可覆盖）**
+- [x] S1.2 `routes/auth.py` 3 处旁路 `aiosqlite.connect` 改走 `get_connection()`（login/logout/me；删 2 处冗余 row_factory；改 `async with`→`try/finally: await db.close()`；import 去 aiosqlite/get_db_path 换 get_connection）
+- [x] S1.3 `auth.py` 2 处旁路改走 `get_connection()`（seed_admin/_user_from_token；删 1 处冗余 row_factory）
+- [x] S1.4 `skills.py` 2 处旁路改走 `get_connection()`（rescan/count_skills；row[0] 下标取值 Row 兼容）
+- [x] S1.5 `agents.py` 2 处旁路改走 `get_connection()`（rescan/count_templates；row[0] 下标取值 Row 兼容）
+- [x] S1.6 `database.py` 内 2 处直接 `connect`（init 建库除外）审查：init 路径保留**并加 `PRAGMA journal_mode=WAL`**（新建库即 WAL 模式，消除时序空窗）、`get_connection()` 工厂为收口出口非旁路
+- [x] S1.7 连接生命周期审查：确认 WAL 下连接复用/关闭策略一致，无连接泄漏。**全库 116 个 `= await get_connection()` 调用点均后跟 `try:`，连接均 close（collab.py 4 处用别名 db0/db2/db3/dbf close，为既有代码非本次改动）；无「开了不关」路径**
+- [x] **S1.V 验收**：全库源码 `aiosqlite.connect` 仅剩 `database.py` 2 处（init 建库 + 工厂本体），9 处旁路清零（checklist B1 9→0）；重启后 `get_connection` 实测 journal_mode=wal（`-wal`/`-shm` 仅活跃连接期存在，连接干净关闭后 checkpoint 清理——属正常）；并发写压测 **12 写者×40轮=480 写全成功、零 database-is-locked**（1.78s）；服务自检 divisions/projects/settings/前端根路径 200 + login 401（收口无破坏）；**回归 235/235 全绿**（主套件 31/31 + 22 probe 204/204，每项 N/N 与基线逐一吻合，行为零变更）→ **提交，回滚锚点 A**
 
 ## S2. 迁移框架 Alembic（Schema 版本化，结构不变）
 - [ ] S2.1 引入 `alembic` 依赖；`alembic init backend/migrations`，配置 async engine + 从 `config.py` 读 DB URL

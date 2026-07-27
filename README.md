@@ -225,6 +225,14 @@ JianAgency/
 
 ## 版本记录
 
+### 数据底座对标 Multica · S1 连接收口 + PRAGMA 调优 — 2026-07-27
+- 🔧 **统一连接入口 + WAL/busy_timeout（能力 `foundation-data-layer`，OpenSpec change `2026-07-24-foundation-db-alignment`）**
+  - **背景**：数据访问层是「手工作坊」形态——`get_connection()` 虽是中心入口（现网 100+ 处在用），但仍有 9 处旁路各自 `aiosqlite.connect`；且全库只开了 `foreign_keys`、**未开 WAL、未设 busy_timeout**，多 Agent 并发写（现网 12 数字员工 / 213 轮次每周）随时可能 `database is locked`。这是对标 Multica 工程化底座的第一步（S1→S5：连接收口 → Alembic 迁移 → SQLAlchemy ORM → 双引擎 → PostgreSQL 默认化）。
+  - **S1.1 连接调优**：`get_connection()` 统一开启 `PRAGMA journal_mode=WAL`（读写不互斥，消除 `database is locked`）+ `busy_timeout`（写-写竞争时等待而非立即报错）+ `foreign_keys`。`busy_timeout` 值走 `config.py` 的 `db_busy_timeout_ms`（默认 5000ms，环境变量 `AKIVILI_DB_BUSY_TIMEOUT_MS` 可覆盖），不硬编码。`init_db()` 建库时也置 WAL，新建库即 WAL 模式。
+  - **S1.2~S1.6 旁路收口**：`routes/auth.py`(3) / `auth.py`(2) / `skills.py`(2) / `agents.py`(2) 共 9 处旁路 `aiosqlite.connect` 全部改走 `get_connection()`，`async with connect()` 统一改为 `try/finally: await db.close()`（与现网既有关闭模式对齐）。全库源码 `aiosqlite.connect` 仅剩 `database.py` 2 处（init 建库 + 工厂本体）。**零业务行为变更**——不碰业务 SQL、不碰方言、不改 schema、不引新依赖。
+  - ⚠️ **上线需重启后端**让 WAL 生效。重启前务必杀净所有 8100 监听进程（含脱离 DB 追踪的孤儿 CLI 子进程）。
+  - 验证：并发写压测 **12 写者×40 轮=480 写全成功、零 `database is locked`**（1.78s）；服务自检核心接口 + 前端根路径 200、login 401（收口无破坏）；**回归 235/235 全绿**（主套件 31/31 + 22 隔离 probe 204/204，每项 N/N 与 S0 基线逐一吻合，证明行为零变更）。回滚锚点 A。
+
 ### v0.16.23 — 2026-07-14
 - ✨ **运行时页新增「实时 Agent 总览」+ 下线限流/429 展示**（能力 `agent-collaboration`）
   - **背景**：此前运行时页顶部是「限流/429 命中率」面板，但至今没遇到过限流场景，信息价值低；同时页面只有「选项目+选任务」后才能看具体 Agent 运行状态（历史链路复盘视角），缺一个「当前谁在跑、谁空闲」的全局实时视角。

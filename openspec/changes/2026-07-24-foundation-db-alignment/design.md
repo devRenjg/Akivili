@@ -53,6 +53,16 @@
 - 因此迁 PG 的动机**不是**当下的并发原语需求，而是**与 Multica 底层一致 + 为未来并发扩展铺路**（用户诉求）。当前收益主要来自 S2（版本化）+ S3（收敛），S4/S5（引擎）是面向未来的对齐投资。
 - 一旦未来做多 worker / 拆 daemon（[platform-concurrency-scaling]），PG 的 `SKIP LOCKED` 立刻用得上，届时底座已就位，无需二次大改。
 
+## 决策 6：WAL 是什么，以及为何只有 SQLite 需要手动开
+
+**WAL（Write-Ahead Logging，预写日志）**：改数据时不直接改主库，而是把改动追加写到旁边的日志文件（`jianagency.db-wal`），再择机批量合并回主库（checkpoint）。相对 SQLite 默认的 rollback journal（改动前先备份旧数据、改主库时锁死整库），WAL 的关键收益是**读写不互斥**——一个连接在写时，其他连接照样能读，不再触发 `database is locked`。
+
+- **为何 S1 要手动开**：SQLite 是嵌入式单文件库，为保持零配置默认用 rollback journal，WAL 是**可选开关**。当前平台全库只开了 `foreign_keys`、没开 WAL，多 Agent 并发写（现网 12 数字员工 / 213 轮次每周）会偶发 `database is locked`。S1.1 开 WAL 消除这类读写互锁。
+- **WAL 改不了单写者限制**：WAL 只解决「读 vs 写」互斥，SQLite 仍是**单写者**（同一时刻只能一个写）。「写 vs 写」竞争靠 `busy_timeout`（后到的写等待而非立即报错）兜底。故 S1 是 **WAL + busy_timeout 两条 PRAGMA 一起加**，缺一不可。
+- **跨引擎适用性**：WAL 的思想（先写日志再合并）几乎所有严肃数据库都用，但**只有 SQLite 需要你手动开**。PostgreSQL 天生强制开、且命名就叫 WAL（关不掉）；MySQL InnoDB 叫 redo log、内建；Oracle/SQL Server 同理。区别在：服务器型数据库从设计第一天就为多连接并发而生，WAL 是内建强制地基；SQLite 是嵌入式库，WAL 是可选补丁。
+- **与本 change 路线的关系**：S1 手动开 WAL 是给「本不为高并发设计的 SQLite」补一个 PG 天生就有的能力，撑过渡期；其单写者天花板搬不动（正是「越拓展越重」的物理根因）。S5 迁到 PostgreSQL 后，PG 的 WAL 内建 + MVCC 多写者并发，`busy_timeout` 排队等锁这类补丁的使命即完成。
+- **副作用（正常，非异常）**：开 WAL 后 `backend/` 常驻 `jianagency.db-wal` + `jianagency.db-shm`，是 WAL 的正常组成，**勿手动删**；备份需连带考虑。WAL 模式写进库文件头、持久生效，故 `init_db()` 也设 WAL，让新建库从第一次即 WAL 模式，避免「首个 get_connection 才切」的时序空窗。
+
 ## 风险与回滚
 
 - **S3 是最大工程量**（398 处），风险最高。缓解：按表分批（S3.4a-j），每批独立提交 + 独立回归，任一批出问题只回退该批。
