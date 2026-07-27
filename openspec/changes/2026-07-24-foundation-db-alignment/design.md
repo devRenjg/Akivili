@@ -26,6 +26,23 @@
 - **依赖边界澄清（2026-07-27 用户拍板）**：Alembic 强依赖 SQLAlchemy（Alembic 由 SQLAlchemy 作者维护、其 migration context 建立在 SQLAlchemy Core 之上），装 alembic 必然连带装 sqlalchemy。故 proposal「S2 只加 alembic、sqlalchemy 留到 S3」的措辞应理解为**用法边界而非安装边界**：S2 引入 `alembic`（连带 `sqlalchemy` Core 作为其依赖装入），但 **S2 只用它跑迁移 DDL，不写任何 ORM 模型、不用 SQLAlchemy 做业务查询**；业务查询迁到 ORM 是 S3 的事。「依赖装入 ≠ 开始用 ORM」。S2.1 的 requirements 因此新增 `alembic`（`sqlalchemy` 作为传递依赖自动装入，可显式 pin 版本）。
 - **迁移 driver（2026-07-27 用户拍板）**：Alembic 迁移用**同步 `sqlite3`(pysqlite) driver** 跑，与运行期解耦——迁移是启动时一次性 DDL、无需 async；业务运行期仍走 S1 的 `aiosqlite + WAL`。二者 driver 分离是 Alembic 官方默认姿势，最简单稳妥，避免为 migration env 配 async engine 的额外复杂度（S2 阶段收益不明显）。迁移连接同样 `PRAGMA journal_mode=WAL`，与运行期库模式一致。
 
+### Alembic 的跨引擎适用性（为何在 PostgreSQL 上反而更好用）
+
+Alembic 是**数据库无关**的迁移框架（SQLAlchemy 支持的库基本都支持：PostgreSQL 一流、MySQL/MariaDB 良好、SQLite 能用但受限、Oracle/SQL Server 覆盖）。选它**不是为 SQLite 选的，而是为对标 Multica 的 PostgreSQL 终局选的**——它在目标引擎（PG）上恰是最佳工具，现在只是提前在 SQLite 上把它用起来。
+
+两个核心能力在不同引擎上的表现差异，正好解释了「S2 先上 Alembic、S4/S5 再迁 PG」的顺序：
+
+| 能力 | PostgreSQL / MySQL | SQLite（S2 现状） |
+|---|---|---|
+| **autogenerate**（对比模型与库结构自动生成迁移） | 元数据接口完整，检测列/索引/约束/类型变化最准 | 能用但检测能力弱 |
+| **ALTER 执行方式** | 原生支持改列类型/删列/加约束，一条 `ALTER` 搞定 | DDL 弱：不能改列类型/删列，改表须 **batch 模式**（建新表→拷数据→删旧表→改名），慢且有搬运风险 |
+
+**与 WAL 的对照（两笔投资性质相反）**：
+- **WAL**（决策 6）= SQLite 的补丁，迁到 PG 后使命完成、被 PG 内建能力取代。
+- **Alembic** = 跨引擎框架，迁到 PG 后**同一套迁移体系无缝延续**，且立刻升级体验（autogenerate 变准、ALTER 变简单、batch 模式的坑消失）。是一笔「现在在 SQLite 建好、终局在 PG 发挥全部能力」的长期投资。
+
+**SQLite batch 模式的天花板**：S2 的 001 只是 `CREATE TABLE` 不受影响；但**后续**基于 001 的迁移若要改已有表结构，在 SQLite 上会撞 batch 重建的麻烦——这也是 S4/S5 迁 PostgreSQL 的动因之一。S2 阶段不涉及，但天花板存在，需知晓。
+
 ## 决策 3：SQLite / PostgreSQL 方言差异清单（S3/S4 收敛目标）
 
 本清单是 S3「方言隔离」与 S4「双跑修正」的 checklist。收敛后这些差异只存在于 ORM/helper 一层：
