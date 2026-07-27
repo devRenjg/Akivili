@@ -25,7 +25,10 @@
 - [x] **S1.V 验收**：全库源码 `aiosqlite.connect` 仅剩 `database.py` 2 处（init 建库 + 工厂本体），9 处旁路清零（checklist B1 9→0）；重启后 `get_connection` 实测 journal_mode=wal（`-wal`/`-shm` 仅活跃连接期存在，连接干净关闭后 checkpoint 清理——属正常）；并发写压测 **12 写者×40轮=480 写全成功、零 database-is-locked**（1.78s）；服务自检 divisions/projects/settings/前端根路径 200 + login 401（收口无破坏）；**回归 235/235 全绿**（主套件 31/31 + 22 probe 204/204，每项 N/N 与基线逐一吻合，行为零变更）→ **提交，回滚锚点 A**
 
 ## S2. 迁移框架 Alembic（Schema 版本化，结构不变）
-- [ ] S2.1 引入 `alembic` 依赖；`alembic init backend/migrations`，配置 async engine + 从 `config.py` 读 DB URL
+
+> 详细施工书见同目录 `s2-plan.md`。关键决策见 `design.md` 决策 2：依赖边界（装 alembic 连带 sqlalchemy Core，S2 只跑迁移不写 ORM）/ 迁移用同步 sqlite3 driver / 001 照 baseline_schema.sql 固化 / 存量库先备份再 stamp。
+
+- [ ] S2.1 引入 `alembic` 依赖（连带 `sqlalchemy` Core 传递装入，S2 不写 ORM）；`alembic init backend/migrations`，env.py 用**同步 sqlite3** driver + 从 `config.py` 读 DB URL + 迁移连接置 WAL
 - [ ] S2.2 关闭 `database.py` 里 `PRAGMA table_info` 兜底加列逻辑的「隐式演进」——改为「schema 只由迁移定义」（本任务只标记与规划，实际切换在 S2.4 后）
 - [ ] S2.3 编写 `001_baseline` 迁移：把 S0.1 的 `baseline_schema.sql` **原样**转成 Alembic 迁移（表/列/索引逐一对齐，不改任何结构）
 - [ ] S2.4 启动流程接入 `alembic upgrade head`（`main.py` startup 内，早于 `reclaim_orphan_runs`）
