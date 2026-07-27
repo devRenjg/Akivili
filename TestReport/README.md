@@ -51,6 +51,7 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 | `run_timeout_and_qa_probe.py` | 14/14 | 静默超时(A) + 宽限保成果(B) + 硬墙钟(C)、超时收尾验收路由 |
 | `run_subtask_autocomplete_probe.py` | 6/6 | 子任务执行完自动进 done、全子完成→父任务 reviewing、失败任务不推进 |
 | `run_reactivate_probe.py` | 5/5 | 重跑子任务时父任务状态即时回写 in_progress |
+| `run_wal_concurrency_probe.py` | 8/8 | 数据底座 S1 回归护栏：get_connection 开 WAL/busy_timeout(config)/foreign_keys、init_db 建库即 WAL、12写者×40轮=480 并发写零 `database is locked`、aiosqlite.connect 仅剩 database.py 2 处(init+工厂)防旁路复活 |
 | `run_collab_scenario.py` `*` | 12 断言 | 真实 CLI 端到端协同场景（claude-cli/codex-cli 供应商） |
 
 ### 记忆与反思（Agent 成长）
