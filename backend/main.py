@@ -4,6 +4,7 @@
 - 启动时建库。
 - host 默认 127.0.0.1（本地工具，默认不对外暴露）；reload 由 JIANAGENCY_RELOAD 环境变量控制。
 """
+import asyncio
 import os
 
 import uvicorn
@@ -12,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import load_settings
 from database import init_db
+from db_migrate import run_migrations
 from routes import settings as settings_routes
 from routes import agents as agents_routes
 from routes import projects as projects_routes
@@ -84,6 +86,12 @@ app.include_router(agent_cli_routes.router)
 
 @app.on_event("startup")
 async def _startup():
+    # 数据底座 S2：schema 由 Alembic 迁移唯一定义，启动最先 upgrade head。
+    #   空库→建全部基线表；存量库已纳管→空跑；存量库未纳管→自动 stamp（见 db_migrate）。
+    #   同步执行，用 to_thread 不阻塞事件循环。迁移成功后 init_db 的 SCHEMA(IF NOT EXISTS)
+    #   已是幂等空操作（S2.2 冻结标记），保留仅作过渡期双保险，不再承担建表真相源。
+    action = await asyncio.to_thread(run_migrations)
+    print(f"[db_migrate] alembic upgrade head done (action={action})")
     await init_db()
     await auth_mod.seed_admin()
     memory_mod.ensure_memory_dir()
