@@ -4,10 +4,8 @@
 """
 from pathlib import Path
 
-import aiosqlite
-
 from config import load_settings
-from database import get_db_path
+from database import get_connection
 
 # 非角色目录：示例 / 工具集成 / 策略文档 / 资源 / 脚本 / 版本控制
 EXCLUDED_DIRS = {"examples", "integrations", "strategy", "assets", "scripts", ".git", ".github", "node_modules"}
@@ -92,7 +90,8 @@ async def rescan(root_dir: str | None = None) -> dict:
     root_dir = root_dir or load_settings().agent_library_dir
     templates, skipped = scan_templates_from_disk(root_dir)
     inserted = updated = 0
-    async with aiosqlite.connect(get_db_path()) as db:
+    db = await get_connection()
+    try:
         for t in templates:
             cur = await db.execute("SELECT id FROM agent_templates WHERE slug = ?", (t["slug"],))
             exists = await cur.fetchone()
@@ -114,12 +113,17 @@ async def rescan(root_dir: str | None = None) -> dict:
                 )
                 inserted += 1
         await db.commit()
+    finally:
+        await db.close()
     return {"inserted": inserted, "updated": updated, "skipped": skipped,
             "total": inserted + updated}
 
 
 async def count_templates() -> int:
-    async with aiosqlite.connect(get_db_path()) as db:
+    db = await get_connection()
+    try:
         cur = await db.execute("SELECT COUNT(*) FROM agent_templates")
         row = await cur.fetchone()
         return row[0] if row else 0
+    finally:
+        await db.close()

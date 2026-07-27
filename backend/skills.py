@@ -6,11 +6,9 @@ Skill = 能力说明/规范/操作要领的纯文本，运行时（P4）注入�
 import re
 from pathlib import Path
 
-import aiosqlite
-
 from agents import parse_frontmatter
 from config import load_settings
-from database import get_db_path
+from database import get_connection
 
 _SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -108,7 +106,8 @@ def _parse_downloadable(meta: dict) -> int:
 async def rescan() -> dict:
     skills, skipped = scan_from_disk(load_settings().skills_dir)
     inserted = updated = 0
-    async with aiosqlite.connect(get_db_path()) as db:
+    db = await get_connection()
+    try:
         for s in skills:
             ex = await (await db.execute("SELECT id FROM skills WHERE slug=?", (s["slug"],))).fetchone()
             if ex:
@@ -125,13 +124,18 @@ async def rescan() -> dict:
                      s.get("is_dir", 0), s.get("downloadable", 1)))
                 inserted += 1
         await db.commit()
+    finally:
+        await db.close()
     return {"inserted": inserted, "updated": updated, "skipped": skipped, "total": inserted + updated}
 
 
 async def count_skills() -> int:
-    async with aiosqlite.connect(get_db_path()) as db:
+    db = await get_connection()
+    try:
         row = await (await db.execute("SELECT COUNT(*) FROM skills")).fetchone()
         return row[0] if row else 0
+    finally:
+        await db.close()
 
 
 def save_skill_file(slug: str, name: str, description: str, body: str) -> None:

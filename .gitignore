@@ -58,3 +58,8 @@ _tmp_*
 
 # 个人产物（简历等，与项目无关，不入仓）
 Resume/
+
+# 周报临时产物（数据快照 / 截图，不入仓）
+backend/wk_stats*.txt
+backend/wk_tasks.txt
+backend/wk_shots/

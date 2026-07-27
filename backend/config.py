@@ -39,6 +39,9 @@ _ROOT = Path(__file__).parent.parent   # 项目根目录（backend 的上一级�
 
 class Settings(BaseSettings):
     db_path: str = str(Path(__file__).parent / "jianagency.db")
+    # SQLite 连接锁等待超时（毫秒）：WAL 下写-写竞争时后到的写等待而非立即 database is locked。
+    # 默认 5000（5 秒），可用环境变量 AKIVILI_DB_BUSY_TIMEOUT_MS 覆盖。
+    db_busy_timeout_ms: int = int(os.environ.get("AKIVILI_DB_BUSY_TIMEOUT_MS", "5000"))
     # Agent 模版库根目录：默认项目内 agents/，可用环境变量 AKIVILI_AGENT_LIBRARY_DIR 指向外部库
     agent_library_dir: str = os.environ.get("AKIVILI_AGENT_LIBRARY_DIR", str(_ROOT / "agents"))
     memory_dir: str = os.environ.get("AKIVILI_MEMORY_DIR", str(_ROOT / "memory"))   # Agent 记忆目录（每个 slug.md 一份）

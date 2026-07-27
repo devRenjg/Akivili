@@ -10,10 +10,9 @@ import hmac
 import os
 import secrets
 
-import aiosqlite
 from fastapi import Request, HTTPException
 
-from database import get_db_path
+from database import get_connection
 
 COOKIE_NAME = "akivili_token"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 天
@@ -39,7 +38,8 @@ def verify_password(password: str, hashed: str, salt: str) -> bool:
 
 async def seed_admin() -> None:
     """首次启动播种管理员；已存在则跳过。"""
-    async with aiosqlite.connect(get_db_path()) as db:
+    db = await get_connection()
+    try:
         cur = await db.execute("SELECT id FROM users WHERE username=?", (SEED_ADMIN_USERNAME,))
         if await cur.fetchone():
             return
@@ -48,16 +48,20 @@ async def seed_admin() -> None:
             "INSERT INTO users (username, password_hash, password_salt, role) VALUES (?,?,?, 'admin')",
             (SEED_ADMIN_USERNAME, hashed, salt))
         await db.commit()
+    finally:
+        await db.close()
 
 
 async def _user_from_token(request: Request) -> dict | None:
     token = request.cookies.get(COOKIE_NAME)
     if not token:
         return None
-    async with aiosqlite.connect(get_db_path()) as db:
-        db.row_factory = aiosqlite.Row
+    db = await get_connection()
+    try:
         row = await (await db.execute(
             "SELECT id, username, role FROM users WHERE token=?", (token,))).fetchone()
+    finally:
+        await db.close()
     return {"id": row["id"], "username": row["username"], "role": row["role"]} if row else None
 
 

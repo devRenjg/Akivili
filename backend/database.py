@@ -224,6 +224,8 @@ def get_db_path() -> str:
 async def init_db() -> None:
     """建库 + 基线表。幂等，可重复调用。"""
     async with aiosqlite.connect(get_db_path()) as db:
+        # 新建库即置 WAL 模式（写进库文件头、持久生效），避免「首个 get_connection 才切 WAL」的时序空窗。
+        await db.execute("PRAGMA journal_mode = WAL")
         await db.execute("PRAGMA foreign_keys = ON")
         await db.executescript(SCHEMA)
         await _migrate(db)
@@ -319,8 +321,11 @@ async def _migrate(db) -> None:
 
 
 async def get_connection() -> aiosqlite.Connection:
-    """获取一个开启外键约束、行可按列名取值的连接。调用方负责关闭。"""
+    """获取统一调优的连接：WAL(读写不互斥) + busy_timeout(写锁竞争等待) + 外键约束，
+    行可按列名取值。调用方负责关闭（全库统一 try/finally: await db.close()）。"""
     db = await aiosqlite.connect(get_db_path())
+    await db.execute("PRAGMA journal_mode = WAL")
+    await db.execute(f"PRAGMA busy_timeout = {load_settings().db_busy_timeout_ms}")
     await db.execute("PRAGMA foreign_keys = ON")
     db.row_factory = aiosqlite.Row
     return db
