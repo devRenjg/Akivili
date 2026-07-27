@@ -195,6 +195,12 @@ claimed/preparing → running ─┬─→ succeeded         (该 attempt 成功
 - **恢复前先安全清理旧进程树并确认成功**；无法证明旧执行已停 → **不创建 recovery child**（宁可不续，不可双执行）。
 - **fencing 兜底**（不变量 5）：即便清理有遗漏，`jian` 写接口按 generation 拒绝旧进程写平台。
 
+**实证案例（2026-07-27 坐实，非重启场景也会脱管）**：一次 S1 重启前排查发现 8100 后端下挂着一个 hang 死的 codex 进程树（`cmd.exe→node→codex.exe`，北京 11:54 起、17:00 仍存活、5 小时仅 29.8 CPU 秒、CPU 静默），但 `task_runs` 无任何对应 running 记录、`_RUN_PIDS` 也已清空。**根因链（每环有代码/DB 佐证）**：① `codex.py:62` 用 `Popen` 经 `codex.CMD` 拉起三层进程树，`on_pid` 只登记最外层 pid;② 该 run（task 273 的 backend-architect run）在 `runner.py:572-576` **正常收尾**——`_finish_run(succeeded)` + `clear_pid()`，**只落 DB 终态 + 清内存 pid 登记，不 kill 进程树**（注释假设"进程此刻已退出"）;③ 但 codex 子进程 hang 死不退出，stdout 早被读完、run 已收尾;④ 收尾后 `task_runs`=succeeded、`_RUN_PIDS` 已清 → **再无 run_id 指向该进程** → 两个孤儿巡检（`reclaim_orphan_runs`/`sweep_orphan_task_runs`）都只 `WHERE status='running'`，扫不到 → 永久无人杀，只能重启时人肉 `taskkill`。
+
+**这暴露了两类盲区，本决策的 containment 是彻底解法，另有一个低成本兜底**：
+- **盲区 A「正常收尾不杀树」**：`runner.py:572` 的 succeeded/failed 收尾路径假设进程自退，未对 `_RUN_PIDS` 登记的进程树做兜底 kill。→ **低风险精准修法**：收尾时对本 run_id 登记的进程树做一次幂等 `taskkill /F /T`（进程已退则无害，hang 死则正好收掉）。此刻 run_id→pid 映射仍在，杀的是自己 spawn 的确切进程树，不涉及进程枚举/归属猜测。**可独立于本 change 先行落地。**
+- **盲区 B「孤儿治理仅 DB 记录驱动」**：`reclaim`/`sweep` 都从 `task_runs.status='running'` 出发，对"账已平、进程却还在"的反向脱管完全无感知。→ **彻底修法即本决策的 Job Object containment**（Worker 死则进程树随 OS 清理，从根杜绝脱管）；过渡期若要主动收存量脱管进程，需 OS 进程反查 + 严格归属校验（父进程链 + 创建时间 + CPU 静默 + 不在 active 名下），**误杀风险高**（同机岚 8088/克里珀等也跑 codex），SHALL 谨慎，不宜在 containment 就绪前贸然启用。
+
 ### 决策 8：交棒有 generation + ack + fencing（Review P0-4；单机简化版）
 
 交棒不是「写标记就杀」，要有世代与确认。**单机单 Worker 采用简化模型**（不建多节点的 `worker_instances`/`restart_requests` 表）：
