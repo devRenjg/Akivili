@@ -55,8 +55,13 @@
   - [x] S3.4 批11 `collab.py`（probe 32/32，commit fdbb744；_claim_one 优先级+FIFO+退避、两层 reclaim、julianday idle sweep）
   - [~] `database.py`（41）**改判为基础设施，非数据访问**：全部为 `init_db`(DDL/PRAGMA) / `_migrate`(ALTER/PRAGMA table_info) / `get_connection`(PRAGMA 工厂)，无一条数据查询，无法「迁成 ORM select」。归 S3.6 下线，不属 S3.4 迁移面。`models/engine.py` 3 处为 ORM 自身 PRAGMA 监听器，永不迁移。
 - [x] S3.5 每批迁移后校验：每文件一隔离 probe，逐一对照读结果/写副作用与迁移前等价（含金样对照与 TestClient 真实接口）；每批跑全量回归（schema parity 604 + engine 8 + dialect 7 + batch1-11 + S1 8 + S2 15）+ E2E QA 31/31，全绿方提交
-- [ ] S3.6 下线 `init_db()` 建表职责：`database.py` 的 SCHEMA 常量与 001 基线已漂移（缺 `agent_templates.tags`），S3 起 ORM 按 001 读写，凡只走 init_db 建库（不先 Alembic）的路径会崩。根治：移除 SCHEMA 常量 + init_db 建表逻辑，建表唯一走 Alembic（生产 main._startup 已先跑迁移，下线无行为变更）。独立提交、独立验收。见记忆 init-db-schema-stale-vs-alembic
-- [ ] **S3.V 验收**：`grep` 手写 SQL 归零（或仅剩迁移文件）；方言用法集中在 helper/ORM 一层；init_db 建表职责已下线（S3.6）；S0.2 回归全绿；关键接口逐一自测通过 → **提交，回滚锚点 C**
+- [x] S3.6 下线 `init_db()` 建表职责（commit 1e9dd6c）：`database.py` 移除 SCHEMA 常量 + `init_db()` + `_migrate()`（~300 行，自 001 起即冗余），仅保留 `get_connection()` 连接工厂。原 `_migrate` 两条数据规整（planning→backlog / archived→done）落成 Alembic **002** 数据迁移（幂等、downgrade no-op）。`main._startup` 删 init_db 调用，`run_migrations()` 成唯一建表路径（env.py 已用 AUTOCOMMIT 连接置 WAL，S1 时序保证不回退）。QA bootstrap + 5 个直调 init_db 的 probe → 统一 `run_migrations`；`run_orm_engine`/`run_wal_concurrency` 建库入口改判 + wal「database.py 恰 1 个 connect 点」；`run_migration_probe` head 断言 001→002 + 新增 002 数据规整 3 条覆盖。见记忆 [[init-db-schema-stale-vs-alembic]]。方案见 s3.6-plan.md
+- [x] **S3.V 验收**（回滚锚点 C）：
+  - **手写 SQL 归零**：业务/路由/执行层零 `get_connection` 调用、零裸 SELECT/INSERT/UPDATE/DELETE 字面量、零 `session.execute(text(SQL))` 混入。残留仅 `database.py` 的 PRAGMA(连接工厂调优) + `migrations/`(建表 DDL) + `models/engine.py:101` ping 的 `SELECT 1`(健康检查)——均属基础设施，非数据查询。
+  - **方言集中**：时间「现在」统一走 `now_expr()` helper（29 处调用，零裸 `datetime('now')` 运行时字面量）；相对时间窗口/julianday 时长聚合是 SQLite 固有方言点，集中在 `collab.py`(2) + `routes/runs.py`(3)，逐点标注「S4 迁 PG 改 EXTRACT EPOCH」，边界清晰。
+  - **init_db 建表职责已下线**（S3.6）：建表唯一走 Alembic。
+  - **回归全绿**：35 个隔离 probe 合计 **1059 [PASS] 零 [FAIL]**（schema parity 604 + engine 8 + dialect 7 + batch1-11 + migration 18 + wal 8 + 18 个遗留 bootstrap probe）+ E2E QA **31/31**。
+  - → 提交回滚锚点 C，S3（ORM + SQL 收敛 + 方言隔离）完成。
 
 ## S4. 引擎抽象 + SQLite⇄PostgreSQL 双跑
 - [ ] S4.1 引入 `asyncpg` 依赖；`config.py` 支持 `DB_URL` 切换（sqlite / postgresql），engine 按 URL 构造
