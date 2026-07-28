@@ -11,64 +11,77 @@ from auth import require_admin
 from pydantic import BaseModel
 
 import skills as skills_mod
-from database import get_connection
+from models import Skill, SkillDownload, get_session_factory
+from sqlalchemy import func, or_, select
 
 router = APIRouter(prefix="/api/skills", tags=["skills"])
 
 _SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
+# skills 表物理列序（对齐 001 基线），供 SELECT * → dict 保持键集合/顺序
+_SKILL_COLS = (
+    "id", "slug", "name", "description", "source_path",
+    "body", "imported_at", "is_dir", "downloadable",
+)
+
+
+def _skill_dict(s: Skill) -> dict:
+    return {c: getattr(s, c) for c in _SKILL_COLS}
+
 
 @router.get("")
 async def list_skills(q: str = ""):
-    sql = ("SELECT s.id, s.slug, s.name, s.description, s.is_dir, s.downloadable, "
-           "(SELECT COUNT(*) FROM skill_downloads d WHERE d.skill_id=s.id) AS download_count "
-           "FROM skills s WHERE 1=1")
-    params: list = []
+    # 相关子查询：每个 skill 的下载数（对齐旧 (SELECT COUNT(*) ...) AS download_count）
+    download_count = (
+        select(func.count())
+        .select_from(SkillDownload)
+        .where(SkillDownload.skill_id == Skill.id)
+        .scalar_subquery()
+    )
+    stmt = select(
+        Skill.id, Skill.slug, Skill.name, Skill.description,
+        Skill.is_dir, Skill.downloadable,
+        download_count.label("download_count"),
+    )
     if q:
-        sql += " AND (s.name LIKE ? OR s.description LIKE ?)"
-        params += [f"%{q}%", f"%{q}%"]
+        like = f"%{q}%"
+        stmt = stmt.where(or_(Skill.name.like(like), Skill.description.like(like)))
     # 按下载量降序（热门在前）；仅集成/无下载的默认 0，自然沉底；同下载量按名字稳定兜底。
-    sql += " ORDER BY download_count DESC, s.name"
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(sql, params)).fetchall()
-        return {"skills": [dict(r) for r in rows], "count": len(rows)}
-    finally:
-        await db.close()
+    stmt = stmt.order_by(download_count.desc(), Skill.name)
+    async with get_session_factory()() as session:
+        rows = (await session.execute(stmt)).all()
+        skills = [{"id": r.id, "slug": r.slug, "name": r.name, "description": r.description,
+                   "is_dir": r.is_dir, "downloadable": r.downloadable,
+                   "download_count": r.download_count} for r in rows]
+        return {"skills": skills, "count": len(skills)}
 
 
 @router.get("/{skill_id}")
 async def get_skill(skill_id: int):
-    db = await get_connection()
-    try:
-        row = await (await db.execute("SELECT * FROM skills WHERE id=?", (skill_id,))).fetchone()
-        if not row:
+    async with get_session_factory()() as session:
+        s = (await session.execute(select(Skill).where(Skill.id == skill_id))).scalar_one_or_none()
+        if not s:
             raise HTTPException(404, "Skill 不存在")
-        return dict(row)
-    finally:
-        await db.close()
+        return _skill_dict(s)
 
 
 @router.get("/{skill_id}/download")
 async def download_skill(skill_id: int, request: Request):
     """下载 Skill：目录型打包成 zip（含 SKILL.md + scripts + references）；单文件型下 .md。
     记录下载日志（IP + 时间）。"""
-    db = await get_connection()
-    try:
-        row = await (await db.execute("SELECT * FROM skills WHERE id=?", (skill_id,))).fetchone()
-        if not row:
+    async with get_session_factory()() as session:
+        s = (await session.execute(select(Skill).where(Skill.id == skill_id))).scalar_one_or_none()
+        if not s:
             raise HTTPException(404, "Skill 不存在")
-        row = dict(row)
+        row = _skill_dict(s)
         # 禁止下载的 Skill（downloadable=0）：仅展示、供 Agent 集成，服务端硬拦截（防绕过前端直接打接口）
         if not row.get("downloadable", 1):
             raise HTTPException(403, "该 Skill 不提供下载（仅供 Agent 集成使用）")
         # 记录下载：客户端 IP（优先 X-Forwarded-For，兜底直连 IP）
         ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
               or (request.client.host if request.client else ""))
-        await db.execute("INSERT INTO skill_downloads (skill_id, ip) VALUES (?,?)", (skill_id, ip))
-        await db.commit()
-    finally:
-        await db.close()
+        session.add(SkillDownload(skill_id=skill_id, ip=ip))
+        await session.commit()
 
     src = Path(row["source_path"])
     if row.get("is_dir") and src.is_dir():
@@ -92,15 +105,15 @@ async def download_skill(skill_id: int, request: Request):
 @router.get("/{skill_id}/downloads", dependencies=[Depends(require_admin)])
 async def download_logs(skill_id: int):
     """某 Skill 的下载记录（时间 + IP），仅管理员。"""
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(
-            "SELECT ip, ts FROM skill_downloads WHERE skill_id=? ORDER BY id DESC LIMIT 200", (skill_id,))).fetchall()
-        total = await (await db.execute(
-            "SELECT COUNT(*) c FROM skill_downloads WHERE skill_id=?", (skill_id,))).fetchone()
-        return {"total": total["c"] if total else 0, "logs": [dict(r) for r in rows]}
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(SkillDownload.ip, SkillDownload.ts)
+            .where(SkillDownload.skill_id == skill_id)
+            .order_by(SkillDownload.id.desc()).limit(200))).all()
+        total = (await session.execute(
+            select(func.count()).select_from(SkillDownload)
+            .where(SkillDownload.skill_id == skill_id))).scalar_one()
+        return {"total": total, "logs": [{"ip": r.ip, "ts": r.ts} for r in rows]}
 
 
 @router.post("/rescan", dependencies=[Depends(require_admin)])
