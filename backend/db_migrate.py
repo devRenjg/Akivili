@@ -9,8 +9,9 @@
    把老库一次性纳入 Alembic 管理。等价于 S2.6 的手工 `alembic stamp 001`，
    但内建为兜底，避免"忘了先 stamp 就 upgrade"导致撞表已存在、启动崩溃。
 
-迁移用同步 sqlite3 driver（与运行期 aiosqlite 解耦），env.py 已配置从 config.py
-读 db_path。见 openspec s2-plan / 决策 2。
+迁移用同步 driver（与运行期异步 driver 解耦）：sqlite 走 pysqlite、PostgreSQL 走
+psycopg v3（asyncpg 纯异步跑不了 Alembic 同步引擎）。迁移 URL 由 config.migration_db_url()
+单一构造，见 openspec s2-plan / 决策 2 / S4.1。
 """
 import os
 
@@ -19,18 +20,12 @@ from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from sqlalchemy import create_engine, inspect
 
-from config import load_settings
+from config import migration_db_url
 
 # 本文件所在目录 = backend/，alembic.ini 与 migrations/ 都在其下。
 _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 _ALEMBIC_INI = os.path.join(_BACKEND_DIR, "alembic.ini")
 _MIGRATIONS_DIR = os.path.join(_BACKEND_DIR, "migrations")
-
-
-def _sync_db_url() -> str:
-    """迁移用同步 sqlite URL（与 migrations/env.py 一致；ALEMBIC_DB_PATH 优先供测试隔离）。"""
-    db_path = os.environ.get("ALEMBIC_DB_PATH") or load_settings().db_path
-    return "sqlite:///" + db_path.replace("\\", "/")
 
 
 def _alembic_config() -> Config:
@@ -46,7 +41,7 @@ def run_migrations() -> str:
     同步执行（Alembic 本身同步）；在 startup 里用 asyncio.to_thread 或直接调用皆可，
     因为它只在启动早期跑一次、耗时极短。
     """
-    url = _sync_db_url()
+    url = migration_db_url()
     engine = create_engine(url)
     try:
         # 判定库状态：有无业务表、有无 alembic_version 记录。

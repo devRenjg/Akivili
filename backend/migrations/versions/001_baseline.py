@@ -214,7 +214,26 @@ _DROP_ORDER = [
 
 
 def upgrade() -> None:
-    """Upgrade schema：空库建全部基线表（存量库走 alembic stamp，不执行此处）。"""
+    """Upgrade schema：空库建全部基线表（存量库走 alembic stamp，不执行此处）。
+
+    S4 双引擎：按方言分支。
+    - SQLite：逐条 op.execute 原始 DDL（逐字节对齐存量库/baseline_schema.sql，不变）。
+    - PostgreSQL：走 ORM metadata.create_all——SQLAlchemy 按 PG 方言生成等价 DDL
+      （AUTOINCREMENT→IDENTITY、datetime('now')→now()），避免手写 PG DDL 与 ORM 漂移。
+      ORM 模型（backend/models/tables.py）已与本基线逐列对齐、由 parity 探针守护。
+    """
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        # 延迟 import：001 顶部只依赖 alembic/sqlalchemy，建表时才引 models（避免迁移框架
+        # 反向依赖业务模型的导入副作用）。create_all 内部按外键依赖自动排序建表。
+        import sys
+        from pathlib import Path
+        _backend = Path(__file__).resolve().parents[2]
+        if str(_backend) not in sys.path:
+            sys.path.insert(0, str(_backend))
+        from models import Base  # noqa: PLC0415
+        Base.metadata.create_all(bind)
+        return
     for ddl in _TABLES:
         op.execute(ddl)
 

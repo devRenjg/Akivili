@@ -23,6 +23,8 @@ from models import (
     TaskRun,
     get_session_factory,
     now_expr,
+    now_offset,
+    elapsed_seconds,
 )
 from timeutil import to_beijing
 from redact import redact_secrets
@@ -481,10 +483,9 @@ async def rate_limit_metrics(hours: int = 24):
     命中率高说明瓶颈在 CLI 账号侧，加并发只会更多撞 429——此时应考虑多账号分流而非加并发。
     """
     hours = max(1, min(int(hours), 720))   # 1h~30d
-    since = f"-{hours} hours"
-    # 窗口下界：datetime('now', '-N hours')（SQLite 相对时间算术，与旧 SQL 一致；
-    # S4 迁 PG 时这类相对时间是方言点，届时改 now()-interval）
-    window = func.datetime(now_expr(), since)
+    # 窗口下界：now - N 小时。now_offset 方言感知（SQLite→datetime('now','-N seconds')、
+    # PG→now()-interval），产出与时间列同格式的 UTC text，供 ended_at>=window 的 text 比较。
+    window = now_offset(-hours * 3600)
     async with get_session_factory()() as session:
         total = (await session.execute(
             select(func.count()).select_from(TaskRun)
@@ -529,8 +530,8 @@ async def agents_overview(days: int = 30):
     `days`：时间窗口天数，clamp 到 1..365（覆盖最近一个月=30、最近半年=180、最近一年=365，及用户自填）。
     """
     days = max(1, min(int(days), 365))
-    since = f"-{days} days"
-    window = func.datetime(now_expr(), since)   # datetime('now','-N days')，同 rate_limit_metrics
+    # 窗口下界：now - N 天（now_offset 方言感知，同 rate_limit_metrics）。
+    window = now_offset(-days * 86400)
     async with get_session_factory()() as session:
         # 累计 stats：限定 started_at 落在最近 days 天内
         total_runs = (await session.execute(
@@ -544,10 +545,10 @@ async def agents_overview(days: int = 30):
             select(func.count(distinct(TaskRun.agent_slug)))
             .where(TaskRun.started_at.is_not(None), TaskRun.started_at >= window))).scalar_one()
         # 累计运行总时长：已结束 run 的 (ended_at - started_at) 求和（秒）；
-        # julianday 差是 SQLite 方言（同 dialect.elapsed_seconds_sql），S4 迁 PG 改 EXTRACT EPOCH
+        # elapsed_seconds 方言感知（SQLite→julianday 差、PG→EXTRACT EPOCH）。
         total_seconds = (await session.execute(
             select(func.coalesce(
-                func.sum((func.julianday(TaskRun.ended_at) - func.julianday(TaskRun.started_at)) * 86400),
+                func.sum(elapsed_seconds(TaskRun.ended_at, TaskRun.started_at)),
                 0))
             .where(TaskRun.ended_at.is_not(None), TaskRun.started_at.is_not(None),
                    TaskRun.started_at >= window))).scalar_one()

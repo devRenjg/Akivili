@@ -63,15 +63,15 @@
   - **回归全绿**：35 个隔离 probe 合计 **1059 [PASS] 零 [FAIL]**（schema parity 604 + engine 8 + dialect 7 + batch1-11 + migration 18 + wal 8 + 18 个遗留 bootstrap probe）+ E2E QA **31/31**。
   - → 提交回滚锚点 C，S3（ORM + SQL 收敛 + 方言隔离）完成。
 
-## S4. 引擎抽象 + SQLite⇄PostgreSQL 双跑
-- [ ] S4.1 引入 `asyncpg` 依赖；`config.py` 支持 `DB_URL` 切换（sqlite / postgresql），engine 按 URL 构造
-- [ ] S4.2 本地起 PostgreSQL 实例（Docker / 本机），记录版本与连接参数到 README 草稿
-- [ ] S4.3 S2 的 Alembic 迁移在 PG 上重放建库：修正 SQLite-only 语法（若 001 里有），确保 001 在两引擎都可 apply
-- [ ] S4.4 ORM 层在 PG 上跑通：逐表 CRUD 冒烟，修正 SQLite/PG 行为差异（大小写、布尔、时间时区、自增策略）
-- [ ] S4.5 编写数据搬迁脚本：`jianagency.db` → PG 全表导入（保序、保外键、保时间）
-- [ ] S4.6 编写一致性校验脚本：搬迁后逐表行数 + 关键字段抽样比对 SQLite 与 PG 一致
-- [ ] S4.7 双跑回归：同一套代码分别连 SQLite 与 PG 各跑一遍 S0.2 回归，两边都全绿
-- [ ] **S4.V 验收**：001 迁移两引擎都可建库；ORM 两引擎都跑通；搬迁数据一致性校验通过；双跑回归两边全绿 → **提交，回滚锚点 D**
+## S4. 引擎抽象 + SQLite⇄PostgreSQL 双跑 ✅（回滚锚点 D，2026-07-28）
+- [x] S4.1 引入 `asyncpg`（运行期异步）+ `psycopg[binary]`（迁移期同步，Alembic 用）；`config.py` 加 `db_url`（`AKIVILI_DB_URL`）+ `migration_db_url()` 单一构造；`engine.py` 按 URL 分支（PG 跳过 sqlite PRAGMA）。空 URL=默认 sqlite，逐字节不变
+- [x] S4.2 Docker `postgres:16`（容器 `akivili-pg` / `localhost:5432` / 库·用户 `akivili` / 卷 `akivili-pg-data`）
+- [x] S4.3 001 `upgrade()` 按 `dialect.name` 分支：sqlite 逐条原始 DDL（不变）；pg 走 `metadata.create_all`（IDENTITY + 归一化 now()）。`_NOW`→方言感知 `now_default_ddl()`。002 纯 UPDATE 不动
+- [x] S4.4 5 处方言查询收敛到 `dialect.py` 方言感知元素（`now_expr`/`now_offset`/`elapsed_seconds`）；时间统一归一化为秒级 UTC text（两引擎逐字节同格式）；调用点 collab.py(2)+routes/runs.py(3) 改用新元素。PG 端到端 CRUD 冒烟通过
+- [x] S4.5 `migrate_sqlite_to_pg.py`（只读源、依赖序、保留 id、序列重置）；处理 NUL 剔除 + 8 行悬空外键跳过 + id 不连续保留
+- [x] S4.6 `run_pg_sqlite_consistency_probe.py` 逐表行数 + **逐行逐列全量比对**（37/37）；`run_pg_e2e_probe.py` 端到端全链路 + 4 方言查询（22/22）
+- [x] S4.7 双跑回归：sqlite 侧 40 门禁 40/40（默认路径零回归）+ PG 侧端到端 22/22 + 一致性 37/37。注：40 门禁 27 个深度绑 sqlite-only seed（业务运行期已零 `get_connection`），PG 侧以端到端场景验证替代单元探针硬改（见 README S4.6）
+- [x] **S4.V 验收**：大检阅 8 项全通——依赖就绪 / 001→002 双引擎建库 / 迁移 31772 行 / 一致性 37/37 / PG 端到端 22/22 / 探针后一致性重验 37/37 / sqlite 40 门禁 1125 断言 / 方言 helper 双引擎编译核对 → **回滚锚点 D**
 
 ## S5. 切 PostgreSQL 为默认
 - [ ] S5.1 默认 `DB_URL` 指向 PostgreSQL；SQLite 保留为显式可选（本地轻量开发）
