@@ -53,7 +53,8 @@
   - [ ] S3.4i `routes/agent_cli.py`（12）
   - [ ] S3.4j 其余文件（`agent_config.py` 8 / `reflect.py` 8 / `activity.py` 7 / `skills.py` 6 / `projects.py` 6 / `skills(root).py` 4 等）
 - [ ] S3.5 每批迁移后校验：该表相关接口行为与迁移前逐一对照（读结果一致、写副作用一致）
-- [ ] **S3.V 验收**：`grep` 手写 SQL 归零（或仅剩迁移文件）；方言用法集中在 helper/ORM 一层；S0.2 回归全绿；关键接口逐一自测通过 → **提交，回滚锚点 C**
+- [ ] S3.6 下线 `init_db()` 建表职责：`database.py` 的 SCHEMA 常量与 001 基线已漂移（缺 `agent_templates.tags`），S3 起 ORM 按 001 读写，凡只走 init_db 建库（不先 Alembic）的路径会崩。根治：移除 SCHEMA 常量 + init_db 建表逻辑，建表唯一走 Alembic（生产 main._startup 已先跑迁移，下线无行为变更）。独立提交、独立验收。见记忆 init-db-schema-stale-vs-alembic
+- [ ] **S3.V 验收**：`grep` 手写 SQL 归零（或仅剩迁移文件）；方言用法集中在 helper/ORM 一层；init_db 建表职责已下线（S3.6）；S0.2 回归全绿；关键接口逐一自测通过 → **提交，回滚锚点 C**
 
 ## S4. 引擎抽象 + SQLite⇄PostgreSQL 双跑
 - [ ] S4.1 引入 `asyncpg` 依赖；`config.py` 支持 `DB_URL` 切换（sqlite / postgresql），engine 按 URL 构造
