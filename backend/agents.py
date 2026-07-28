@@ -4,8 +4,10 @@
 """
 from pathlib import Path
 
+from sqlalchemy import func, select, update as sa_update
+
 from config import load_settings
-from database import get_connection
+from models import AgentTemplate, get_session_factory
 
 # 非角色目录：示例 / 工具集成 / 策略文档 / 资源 / 脚本 / 版本控制
 EXCLUDED_DIRS = {"examples", "integrations", "strategy", "assets", "scripts", ".git", ".github", "node_modules"}
@@ -90,40 +92,29 @@ async def rescan(root_dir: str | None = None) -> dict:
     root_dir = root_dir or load_settings().agent_library_dir
     templates, skipped = scan_templates_from_disk(root_dir)
     inserted = updated = 0
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         for t in templates:
-            cur = await db.execute("SELECT id FROM agent_templates WHERE slug = ?", (t["slug"],))
-            exists = await cur.fetchone()
+            exists = (await session.execute(
+                select(AgentTemplate.id).where(AgentTemplate.slug == t["slug"]))).first()
             if exists:
-                await db.execute(
-                    """UPDATE agent_templates SET name=?, division=?, description=?,
-                       emoji=?, color=?, source_path=?, body=? WHERE slug=?""",
-                    (t["name"], t["division"], t["description"], t["emoji"],
-                     t["color"], t["source_path"], t["body"], t["slug"]),
-                )
+                await session.execute(
+                    sa_update(AgentTemplate).where(AgentTemplate.slug == t["slug"]).values(
+                        name=t["name"], division=t["division"], description=t["description"],
+                        emoji=t["emoji"], color=t["color"], source_path=t["source_path"],
+                        body=t["body"]))
                 updated += 1
             else:
-                await db.execute(
-                    """INSERT INTO agent_templates
-                       (slug, name, division, description, emoji, color, source_path, body)
-                       VALUES (?,?,?,?,?,?,?,?)""",
-                    (t["slug"], t["name"], t["division"], t["description"],
-                     t["emoji"], t["color"], t["source_path"], t["body"]),
-                )
+                session.add(AgentTemplate(
+                    slug=t["slug"], name=t["name"], division=t["division"],
+                    description=t["description"], emoji=t["emoji"], color=t["color"],
+                    source_path=t["source_path"], body=t["body"]))
                 inserted += 1
-        await db.commit()
-    finally:
-        await db.close()
+        await session.commit()
     return {"inserted": inserted, "updated": updated, "skipped": skipped,
             "total": inserted + updated}
 
 
 async def count_templates() -> int:
-    db = await get_connection()
-    try:
-        cur = await db.execute("SELECT COUNT(*) FROM agent_templates")
-        row = await cur.fetchone()
-        return row[0] if row else 0
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        return (await session.execute(
+            select(func.count()).select_from(AgentTemplate))).scalar_one()

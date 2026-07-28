@@ -84,3 +84,30 @@ def insert_or_ignore(table):
     else:
         raise ValueError(f"insert_or_ignore 未覆盖方言: {name}")
     return _ins(table).on_conflict_do_nothing()
+
+
+def _dialect_insert(table):
+    """按当前 engine 方言返回对应的 insert 构造器（支持 on_conflict_*）。"""
+    from models.engine import get_engine
+
+    name = get_engine().dialect.name
+    if name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as _ins
+    elif name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as _ins
+    else:
+        raise ValueError(f"upsert 未覆盖方言: {name}")
+    return _ins(table)
+
+
+def upsert(table, index_elements, insert_values: dict, update_values: dict):
+    """「插入冲突则按 update_values 更新」（对齐 SQLite INSERT ... ON CONFLICT DO UPDATE）。
+
+    - index_elements：冲突判定列（如 ['slug']），对应旧 SQL 的 ON CONFLICT(slug)。
+    - insert_values：无冲突时插入的完整值。
+    - update_values：有冲突时更新的列（对应 DO UPDATE SET ...；旧代码里用 excluded.x，
+      这里直接给最终值即可）。
+    SQLite→sqlite.insert().on_conflict_do_update()，PG 同名分支，S4 无缝延续。
+    """
+    stmt = _dialect_insert(table).values(**insert_values)
+    return stmt.on_conflict_do_update(index_elements=index_elements, set_=update_values)

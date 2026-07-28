@@ -11,6 +11,7 @@ from .dialect import (
     elapsed_seconds_sql,
     insert_or_ignore,
     now_expr,
+    upsert,
 )
 from .engine import (
     dispose_engine,
@@ -50,6 +51,7 @@ __all__ = [
     "now_expr",
     "elapsed_seconds_sql",
     "insert_or_ignore",
+    "upsert",
     # 表模型（S3.1）
     "Activity",
     "AgentProfile",

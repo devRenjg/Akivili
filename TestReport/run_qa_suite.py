@@ -177,7 +177,12 @@ async def bootstrap_backend(paths: dict[str, Path]):
     import skills as skills_mod  # noqa: PLC0415
     import memory as memory_mod  # noqa: PLC0415
     import main  # noqa: PLC0415
+    from db_migrate import run_migrations  # noqa: PLC0415
 
+    # 与生产 main._startup 一致：先跑 Alembic 迁移(schema 由 001 基线唯一定义，
+    # 含 tags/origin 等全部历史补列)，再 init_db(IF NOT EXISTS 幂等空操作)。
+    # 不能只 init_db——其 SCHEMA 常量已冻结且缺 tags，ORM 写 agent_templates 会失败。
+    await asyncio.to_thread(run_migrations)
     await database.init_db()
     await auth_mod.seed_admin()
     memory_mod.ensure_memory_dir()
