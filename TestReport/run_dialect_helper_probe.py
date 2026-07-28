@@ -49,8 +49,9 @@ async def _run():
     import models
     import timeutil
     from sqlalchemy import text
+    from db_migrate import run_migrations
 
-    await database.init_db()
+    run_migrations()   # 建库唯一走 Alembic（S3.6 已下线 init_db 建表）
 
     # 1) now_expr() 编译为 SQLite 的 CURRENT_TIMESTAMP
     from sqlalchemy.dialects import sqlite as sqlite_dialect

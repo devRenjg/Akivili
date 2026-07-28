@@ -46,11 +46,11 @@ class Probe:
 async def run_probe(paths: dict, keep: bool) -> Probe:
     probe = Probe()
     import config  # noqa: PLC0415
-    import database  # noqa: PLC0415
     from database import get_connection  # noqa: PLC0415
+    from db_migrate import run_migrations  # noqa: PLC0415
 
-    # Fresh isolated DB built by init_db().
-    await database.init_db()
+    # Fresh isolated DB built by Alembic (S3.6 下线 init_db；env.py 已置 WAL).
+    run_migrations()
     expected_bt = config.load_settings().db_busy_timeout_ms
 
     # --- Check 1: get_connection() applies WAL + busy_timeout + foreign_keys ---
@@ -66,14 +66,16 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
                 f"got {bt}, expected {expected_bt}")
     probe.check("get_connection foreign_keys=ON", fk == 1, f"got {fk}")
 
-    # --- Check 2: init_db() left the DB itself in WAL mode (timing-gap guard) ---
+    # --- Check 2: run_migrations() left the DB itself in WAL mode (timing-gap guard) ---
+    # Alembic env.py 用独立 AUTOCOMMIT 连接置 PRAGMA journal_mode=WAL（持久写库头），
+    # 建库即 WAL，无「首个 get_connection 才切 WAL」的时序空窗（S1 保证经 S3.6 仍成立）。
     import aiosqlite  # noqa: PLC0415
     raw = await aiosqlite.connect(paths["db"])
     try:
         jm2 = (await (await raw.execute("PRAGMA journal_mode")).fetchone())[0]
     finally:
         await raw.close()
-    probe.check("init_db leaves DB in WAL", str(jm2).lower() == "wal", f"got {jm2}")
+    probe.check("run_migrations leaves DB in WAL", str(jm2).lower() == "wal", f"got {jm2}")
 
     # --- Check 3: concurrent writers never hit "database is locked" ---
     WORKERS, ROUNDS = 12, 40
@@ -120,8 +122,9 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
     non_db = [h for h in hits if not h.startswith("database.py:")]
     probe.check("aiosqlite.connect confined to database.py", not non_db,
                 f"stray: {non_db}" if non_db else f"only database.py ({len(hits)} sites)")
-    probe.check("database.py has exactly 2 connect sites (init + factory)",
-                len([h for h in hits if h.startswith("database.py:")]) == 2,
+    # S3.6 下线 init_db 后，database.py 仅剩 get_connection 一个 connect 点（原 init_db 那个已删）。
+    probe.check("database.py has exactly 1 connect site (factory only)",
+                len([h for h in hits if h.startswith("database.py:")]) == 1,
                 f"database.py sites: {[h for h in hits if h.startswith('database.py:')]}")
 
     return probe

@@ -179,8 +179,8 @@ async def _test_activity():
 
 
 async def _run():
-    import database
-    await database.init_db()
+    from db_migrate import run_migrations
+    run_migrations()   # 建库唯一走 Alembic（S3.6 已下线 init_db 建表）
     await _test_auth()
     await _test_projects()
     await _test_activity()

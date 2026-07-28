@@ -74,9 +74,10 @@ async def _pragmas_via_orm_engine():
 async def _run():
     import database
     import models
+    from db_migrate import run_migrations
 
-    # 先用 init_db 建库（S1 路径建表 + 置 WAL），engine 连的是同一个库
-    await database.init_db()
+    # 建库唯一走 Alembic（S3.6 已下线 init_db；env.py 已置 WAL），engine 连同一个库
+    run_migrations()
 
     # 1) 连通性：ping 返回 1
     val = await models.ping()

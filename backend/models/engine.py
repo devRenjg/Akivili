@@ -12,9 +12,9 @@
     PRAGMA（busy_timeout 同样每连接读一次 config，与 S1 行为一致）。二者走同一套调优，
     不因 ORM/手写路径而分叉。
 
-**阶段边界（S3.2 红线）**：本模块只提供 engine/session 能力，**不接运行期**——
-main.py 不 import、业务代码不 import、init_db 仍走 aiosqlite。真正用 session 做查询
-是 S3.4 逐表迁移的事。S3.2 只保证「这个入口存在且调优正确」。
+**现状（S3.4 已完成）**：业务/路由/执行层的数据访问已全量走 session（本 engine）；
+database.py 仅保留 get_connection() 连接工厂（供部分测试 seed）。建表唯一走 Alembic
+（S3.6 已下线 init_db 建表职责）。
 
 driver 选型：运行期业务用 async（aiosqlite driver），与 S1 的 aiosqlite 同底层驱动；
 迁移仍走 S2 的同步 sqlite3（见决策 2，二者分离）。

@@ -46,8 +46,9 @@ async def _run():
     import database
     import models
     import agent_memory_sync as ams
+    from db_migrate import run_migrations
 
-    await database.init_db()
+    run_migrations()   # 建库唯一走 Alembic（S3.6 已下线 init_db 建表）
 
     # —— 复刻真实链：aiosqlite 写 project + project_agent + skills，commit+close ——
     db = await database.get_connection()

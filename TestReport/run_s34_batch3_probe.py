@@ -57,12 +57,12 @@ def _isolate(tmp):
 
 async def _direct_checks():
     """直接调用层：skills.rescan / count_skills。"""
-    import database
     import skills as skills_mod
     import auth as auth_mod
     import models
+    from db_migrate import run_migrations
 
-    await database.init_db()
+    run_migrations()   # 建库唯一走 Alembic（S3.6 已下线 init_db 建表）
     await auth_mod.seed_admin()  # 播种管理员(admin/changeme)，供 login 接口测试
 
     # rescan：首次全 insert

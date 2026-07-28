@@ -107,8 +107,9 @@ async def _run():
     import database
     import models
     import agent_memory_sync as ams
+    from db_migrate import run_migrations
 
-    await database.init_db()
+    run_migrations()   # 建库唯一走 Alembic（S3.6 已下线 init_db 建表）
 
     # 判定 is_test_project 确实认得 'QA-自动化测试'（否则过滤断言无意义）
     from config import is_test_project
