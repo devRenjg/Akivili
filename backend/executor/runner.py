@@ -6,8 +6,11 @@
 import os
 import signal
 
+from sqlalchemy import func, select, update as sa_update
+
 from config import load_settings
-from database import get_connection
+from models import (get_session_factory, now_expr,
+                    Activity, AgentSkill, Message, RunLog, Skill, TaskRun)
 from memory import read_memory, append_memory, select_relevant_knowhow, _managed_body
 from executor.base import ExecContext
 from executor.claude_code import ClaudeCodeBackend
@@ -226,18 +229,16 @@ async def _persist_memory(run_id: int) -> None:
     slug = ctx["slug"]
     conv_id = ctx["conv_id"]
     since_msg_id = ctx.get("since_msg_id", 0)
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(
-            """SELECT content FROM messages
-               WHERE conversation_id=? AND id>? AND role='assistant' AND author_slug=?
-               ORDER BY id""", (conv_id, since_msg_id, slug))).fetchall()
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(Message.content)
+            .where(Message.conversation_id == conv_id, Message.id > since_msg_id,
+                   Message.role == "assistant", Message.author_slug == slug)
+            .order_by(Message.id))).all()
     # 只记「净交付」：本轮该 Agent 经 jian comment/subtask 落库的发言。
     # 不拿流式 stdout 兜底——那是过程碎语（命令/环境/编码提示），进 recent 只会污染开工回忆上下文。
     # 无净交付时不记（未走 jian 的情况已由 execute_dispatch 打醒目标记，此处不重复噪声）。
-    conclusion = "\n".join(r["content"] for r in rows if (r["content"] or "").strip()).strip()
+    conclusion = "\n".join(r.content for r in rows if (r.content or "").strip()).strip()
     if not conclusion:
         return  # 本轮无净交付，不记 recent
 
@@ -375,14 +376,12 @@ async def build_context(agent_slug: str, persona: str, project_dir: str,
 
 
 async def _skill_bodies(agent_slug: str) -> list[str]:
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(
-            """SELECT s.name, s.body FROM agent_skills a JOIN skills s ON s.slug=a.skill_slug
-               WHERE a.agent_slug=?""", (agent_slug,))).fetchall()
-        return [f"## {r['name']}\n{r['body']}" for r in rows if (r["body"] or "").strip()]
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(Skill.name, Skill.body)
+            .select_from(AgentSkill).join(Skill, Skill.slug == AgentSkill.skill_slug)
+            .where(AgentSkill.agent_slug == agent_slug))).all()
+        return [f"## {r.name}\n{r.body}" for r in rows if (r.body or "").strip()]
 
 
 def get_backend_for(provider):
@@ -449,35 +448,36 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     provider = _provider_by_id(agent.get("provider_id_effective", ""))
     backend = _pick_backend(provider)
 
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         if persist_user_msg:
             # 人手输入的指令：落成 user 消息（带发送者名），进时间线展示
-            ucur = await db.execute(
-                "INSERT INTO messages (conversation_id, role, content, author_name) VALUES (?,?,?,?)",
-                (conv_id, "user", prompt, user_name or ""))
-            user_msg_id = ucur.lastrowid   # 本轮起点：之后该 Agent 的发言才算本轮产出
+            umsg = Message(conversation_id=conv_id, role="user", content=prompt,
+                           author_name=user_name or "")
+            session.add(umsg)
+            await session.flush()
+            user_msg_id = umsg.id   # 本轮起点：之后该 Agent 的发言才算本轮产出
             # 取会话历史（回灌，恢复上下文），不含刚插入的本轮
-            rows = await (await db.execute(
-                "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id", (conv_id,))).fetchall()
-            history = _clip_history([{"role": r["role"], "content": r["content"]} for r in rows[:-1]])
+            rows = (await session.execute(
+                select(Message.role, Message.content)
+                .where(Message.conversation_id == conv_id).order_by(Message.id))).all()
+            history = _clip_history([{"role": r.role, "content": r.content} for r in rows[:-1]])
         else:
             # 机器合成的派活指令：不落 user 消息（否则时间线会以「我」名义重复复述任务）。
             # 本轮起点取当前最大消息 id，之后该 Agent 的发言才算本轮产出。
-            rows = await (await db.execute(
-                "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id", (conv_id,))).fetchall()
-            history = _clip_history([{"role": r["role"], "content": r["content"]} for r in rows])
-            mrow = await (await db.execute(
-                "SELECT COALESCE(MAX(id), 0) AS mid FROM messages WHERE conversation_id=?", (conv_id,))).fetchone()
-            user_msg_id = mrow["mid"]
+            rows = (await session.execute(
+                select(Message.role, Message.content)
+                .where(Message.conversation_id == conv_id).order_by(Message.id))).all()
+            history = _clip_history([{"role": r.role, "content": r.content} for r in rows])
+            user_msg_id = (await session.execute(
+                select(func.coalesce(func.max(Message.id), 0))
+                .where(Message.conversation_id == conv_id))).scalar_one()
         # 建 run
-        cur = await db.execute(
-            "INSERT INTO task_runs (task_id, conversation_id, agent_slug, provider_id, status) VALUES (?,?,?,?, 'running')",
-            (task["id"], conv_id, slug, provider.id if provider else ""))
-        run_id = cur.lastrowid
-        await db.commit()
-    finally:
-        await db.close()
+        run = TaskRun(task_id=task["id"], conversation_id=conv_id, agent_slug=slug,
+                      provider_id=provider.id if provider else "", status="running")
+        session.add(run)
+        await session.flush()
+        run_id = run.id
+        await session.commit()
 
     # 登记写记忆上下文：正常收尾与超时兜底(finalize_run)共用，谁先写谁 pop，幂等不重复
     _RUN_CTX[run_id] = {
@@ -611,15 +611,10 @@ async def _log(run_id: int, channel: str, content: str,
                tool: str = "", tool_input: dict | None = None, tool_output: str = ""):
     import json as _json
     ti = _json.dumps(tool_input, ensure_ascii=False) if tool_input else ""
-    db = await get_connection()
-    try:
-        await db.execute(
-            "INSERT INTO run_logs (run_id, channel, content, tool, tool_input, tool_output) "
-            "VALUES (?,?,?,?,?,?)",
-            (run_id, channel, content, tool, ti, tool_output))
-        await db.commit()
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        session.add(RunLog(run_id=run_id, channel=channel, content=content,
+                           tool=tool, tool_input=ti, tool_output=tool_output))
+        await session.commit()
 
 
 async def _has_jian_deliverable(conv_id: int, slug: str, since_msg_id: int,
@@ -634,21 +629,25 @@ async def _has_jian_deliverable(conv_id: int, slug: str, since_msg_id: int,
       → 查本 run 启动之后（created_at >= task_runs.started_at）该 slug 的上述活动。
     CLI 后端的 stdout 已不落会话消息，故消息检查不会把 stdout 误判成交付。
     """
-    db = await get_connection()
-    try:
-        msg = await (await db.execute(
-            "SELECT 1 FROM messages WHERE conversation_id=? AND id>? AND role='assistant' "
-            "AND author_slug=? LIMIT 1", (conv_id, since_msg_id, slug))).fetchone()
+    async with get_session_factory()() as session:
+        msg = (await session.execute(
+            select(1).select_from(Message)
+            .where(Message.conversation_id == conv_id, Message.id > since_msg_id,
+                   Message.role == "assistant", Message.author_slug == slug)
+            .limit(1))).first()
         if msg is not None:
             return True
-        act = await (await db.execute(
-            "SELECT 1 FROM activities a JOIN task_runs r ON r.id=? "
-            "WHERE a.task_id=? AND a.actor_type='agent' AND a.actor_name=? "
-            "AND a.action IN ('commented','status_changed') AND a.created_at >= r.started_at LIMIT 1",
-            (run_id, task_id, slug))).fetchone()
+        # activities a JOIN task_runs r ON r.id=<run_id>：用 run 的 started_at 作时间下界，
+        # 判本 run 启动后该 slug 是否有 commented/status_changed 活动
+        act = (await session.execute(
+            select(1).select_from(Activity)
+            .join(TaskRun, TaskRun.id == run_id)
+            .where(Activity.task_id == task_id, Activity.actor_type == "agent",
+                   Activity.actor_name == slug,
+                   Activity.action.in_(("commented", "status_changed")),
+                   Activity.created_at >= TaskRun.started_at)
+            .limit(1))).first()
         return act is not None
-    finally:
-        await db.close()
 
 
 async def _has_trailing_stdout_after_deliverable(
@@ -660,58 +659,51 @@ async def _has_trailing_stdout_after_deliverable(
     判据：本 run 内该 Agent 最后一条落库交付（comment 消息 / commented|status_changed 活动）
     的时间，早于本 run 最后一条 stdout 的时间（留 15s 容差，避免正常收尾发言后的零星刷新误报）。
     """
-    db = await get_connection()
-    try:
-        last_stdout = await (await db.execute(
-            "SELECT MAX(ts) AS t FROM run_logs WHERE run_id=? AND channel='stdout' "
-            "AND length(trim(content)) > 40", (run_id,))).fetchone()
-        if not last_stdout or not last_stdout["t"]:
+    async with get_session_factory()() as session:
+        last_stdout_t = (await session.execute(
+            select(func.max(RunLog.ts))
+            .where(RunLog.run_id == run_id, RunLog.channel == "stdout",
+                   func.length(func.trim(RunLog.content)) > 40))).scalar_one()
+        if not last_stdout_t:
             return False
-        started = await (await db.execute(
-            "SELECT started_at FROM task_runs WHERE id=?", (run_id,))).fetchone()
-        run_start = started["started_at"] if started else None
-        last_msg = await (await db.execute(
-            "SELECT MAX(created_at) AS t FROM messages WHERE conversation_id=? "
-            "AND role='assistant' AND author_slug=?", (conv_id, slug))).fetchone()
-        last_act = await (await db.execute(
-            "SELECT MAX(created_at) AS t FROM activities WHERE task_id=? AND actor_type='agent' "
-            "AND actor_name=? AND action IN ('commented','status_changed') "
-            "AND created_at >= ?", (task_id, slug, run_start or ""))).fetchone()
-        deliver_ts = max([t for t in (last_msg["t"] if last_msg else None,
-                                      last_act["t"] if last_act else None) if t], default=None)
+        run_start = (await session.execute(
+            select(TaskRun.started_at).where(TaskRun.id == run_id))).scalar_one_or_none()
+        last_msg_t = (await session.execute(
+            select(func.max(Message.created_at))
+            .where(Message.conversation_id == conv_id, Message.role == "assistant",
+                   Message.author_slug == slug))).scalar_one()
+        last_act_t = (await session.execute(
+            select(func.max(Activity.created_at))
+            .where(Activity.task_id == task_id, Activity.actor_type == "agent",
+                   Activity.actor_name == slug,
+                   Activity.action.in_(("commented", "status_changed")),
+                   Activity.created_at >= (run_start or "")))).scalar_one()
+        deliver_ts = max([t for t in (last_msg_t, last_act_t) if t], default=None)
         if deliver_ts is None:
             return False   # 没交付由 _has_jian_deliverable 那条分支负责，这里只管「有交付但收尾漏了」
-        # 最后 stdout 明显晚于最后交付（>15s）→ 收尾结论没落库
-        from datetime import datetime, timedelta
-        fmt = "%Y-%m-%d %H:%M:%S"
-        try:
-            return datetime.strptime(last_stdout["t"][:19], fmt) - \
-                   datetime.strptime(deliver_ts[:19], fmt) > timedelta(seconds=15)
-        except (ValueError, TypeError):
-            return False
-    finally:
-        await db.close()
+    # 最后 stdout 明显晚于最后交付（>15s）→ 收尾结论没落库
+    from datetime import datetime, timedelta
+    fmt = "%Y-%m-%d %H:%M:%S"
+    try:
+        return datetime.strptime(last_stdout_t[:19], fmt) - \
+               datetime.strptime(deliver_ts[:19], fmt) > timedelta(seconds=15)
+    except (ValueError, TypeError):
+        return False
 
 
 async def _save_assistant(conv_id: int, content: str, author_slug: str = "", run_id: int | None = None):
-    db = await get_connection()
-    try:
-        await db.execute(
-            "INSERT INTO messages (conversation_id, role, content, author_slug, run_id) VALUES (?,?,?,?,?)",
-            (conv_id, "assistant", content, author_slug, run_id))
-        await db.commit()
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        session.add(Message(conversation_id=conv_id, role="assistant", content=content,
+                            author_slug=author_slug, run_id=run_id))
+        await session.commit()
 
 
 async def _finish_run(run_id: int, status: str):
-    db = await get_connection()
-    try:
-        await db.execute("UPDATE task_runs SET status=?, ended_at=datetime('now') WHERE id=?",
-                         (status, run_id))
-        await db.commit()
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        await session.execute(
+            sa_update(TaskRun).where(TaskRun.id == run_id)
+            .values(status=status, ended_at=now_expr()))
+        await session.commit()
 
 
 async def _finalize_if_running(run_id: int, status: str) -> bool:
@@ -719,13 +711,11 @@ async def _finalize_if_running(run_id: int, status: str) -> bool:
     供「生成器被中断/取消」兜底：客户端断连、asyncio 任务取消时，execute_dispatch 的正常收尾
     （_finish_run）跑不到，task_runs 会永久卡 running 成孤儿（run#183/#185 泄漏事故）。
     用 `WHERE status='running'` 条件更新，绝不覆盖已定终态的 run（succeeded/failed/killed 幂等安全）。"""
-    db = await get_connection()
-    try:
-        cur = await db.execute(
-            "UPDATE task_runs SET status=?, ended_at=datetime('now') WHERE id=? AND status='running'",
-            (status, run_id))
-        await db.commit()
-        return cur.rowcount > 0
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        res = await session.execute(
+            sa_update(TaskRun)
+            .where(TaskRun.id == run_id, TaskRun.status == "running")
+            .values(status=status, ended_at=now_expr()))
+        await session.commit()
+        return res.rowcount > 0
 
