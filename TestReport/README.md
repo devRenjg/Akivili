@@ -51,19 +51,21 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 干净环境自动复现、被挑进 CI 每次自动跑的那批。
 
 ```
-全套 43 个 run_*.py
+全套 45 个 run_*.py
 ├── run_ci_suite.py            ← 不是测试，是「调度器」(按 GATE 清单跑其余 40 个、收退出码)
 ├── 40 个 → 进 CI 门禁 ✅       (39 隔离 probe + run_qa_suite 主套件)
-└── 2 个 → 不进门禁 ❌
+└── 4 个 → 不进门禁 ❌
       ├── run_collab_scenario.py   (需真实 claude/codex CLI + LLM)
-      └── run_codex_cli_smoke.py   (需真实 Codex CLI)
+      ├── run_codex_cli_smoke.py   (需真实 Codex CLI)
+      ├── run_pg_e2e_probe.py      (需真实 PostgreSQL；数据底座 S4.6)
+      └── run_pg_sqlite_consistency_probe.py  (需真实 PostgreSQL；数据底座 S4.5)
 ```
 
 |  | 全套测试集合 | CI 40 门禁 |
 |---|---|---|
-| **范围** | 所有 `run_*.py`（43 个） | 其中挑进 `GATE` 的 40 个 |
+| **范围** | 所有 `run_*.py`（45 个） | 其中挑进 `GATE` 的 40 个 |
 | **触发** | 人工挑着单跑 / 本地 `run_ci_suite` 一键 | GitHub 每次 push/PR **自动** |
-| **含真实 CLI 测试** | 含（2 个） | **不含**（CI 无 CLI/无 API key，跑不了） |
+| **含真实外部依赖测试** | 含（4 个：2 CLI + 2 PG） | **不含**（CI 无 CLI/无 PG，跑不了） |
 | **保障对象** | 逻辑正确 + 与真实外部世界的集成 | 逻辑正确（鉴权/CRUD/ORM 等价/调度/回收…） |
 
 **为什么分两层**（本质都是保障测试，分界在「能否在真空里复现」）：
@@ -127,10 +129,19 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 | `run_skill_downloadable_probe.py` | 7/7 | 「仅集成不下载」契约：downloadable=false 硬拦截 403、目录型 Skill 扫描 |
 | `run_codex_cli_smoke.py` `*` | 冒烟 | Codex CLI 后端连通性烟测（单点，非断言式） |
 
+### 数据底座 S4（需真实 PostgreSQL，门禁外 `*`）
+| 脚本 | 实测 | 覆盖 |
+|---|---|---|
+| `run_pg_sqlite_consistency_probe.py` `*` | 37/37 | 数据底座 S4.5：SQLite⇄PG **逐行逐列全量一致性**校验（表集合+逐表行数+每行每列值，NUL 剔除/悬空外键排除同口径，主键唯一性保证无错位）。搬迁后跑，无 `AKIVILI_DB_URL` 指向 PG 时明确退出 |
+| `run_pg_e2e_probe.py` `*` | 22/22 | 数据底座 S4.6：直连迁移后真实 PG 库跑端到端全链路（存量读 + 建项目/Agent/任务/enqueue/finalize/活动流 + 4 处方言查询 now_expr/now_offset/elapsed_seconds + 级联清理闭环），验证平台可运行在 PostgreSQL 上 |
+
+> 运行前置：`AKIVILI_DB_URL=postgresql+asyncpg://…` 指向已建库+已迁移的 PG（见根 README「数据底座 S4」）。这两个探针依赖真实 PG 容器，与 `*` CLI 探针同理留门禁外。
+
 ### 工具（非测试）
 | 脚本 | 说明 |
 |---|---|
 | `cleanup_test_data.py` | 真实库测试数据清理：测试项目精确 id 级联删、真实目录（Qlipoth/Agents）硬保护、删前自动备份 |
+| `migrate_sqlite_to_pg.py`（在 `backend/`） | 数据底座 S4.5：SQLite→PG 全量数据迁移（只读源、依赖序插入、保留原始 id、NUL 剔除、悬空外键跳过、迁移后重置 PG 序列，`--truncate` 幂等重跑） |
 
 ## 覆盖盲区（尚无专项探针）
 

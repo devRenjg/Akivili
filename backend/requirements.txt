@@ -7,3 +7,11 @@ httpx
 # S2 只用它跑迁移 DDL、不写 ORM；ORM 用法在 S3 引入（见 openspec 决策 2）。
 alembic==1.18.5
 SQLAlchemy==2.0.51
+# 数据底座 S4：PostgreSQL 双引擎切换。不影响 sqlite 默认路径——仅当 AKIVILI_DB_URL
+# 指向 postgresql 时才用到（见 openspec 决策 3 / S4.1）。
+# - asyncpg：运行期异步驱动（postgresql+asyncpg://），配 SQLAlchemy async engine。
+# - psycopg[binary]：迁移期同步驱动（postgresql+psycopg://）。Alembic 走同步引擎，
+#   asyncpg 是纯异步跑不了；psycopg v3 是 SQLAlchemy 2.0 官方推荐的同步 PG 驱动。
+#   [binary] 变体自带预编译 libpq，免本地装 PostgreSQL 客户端/编译链。
+asyncpg==0.30.0
+psycopg[binary]==3.3.4

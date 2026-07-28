@@ -19,14 +19,15 @@ from sqlalchemy import ForeignKey, Integer, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
+from .dialect import now_default_ddl
 
-# server_default 的时间字面量：**保持 001 基线的 DDL 原文**（datetime('now')）。
-# 这是「建表默认值」，由 001 迁移冻结、必须与库结构逐字节一致，不走 func.now()——
-# 若改为 func.now() 会让 create_all 的 DDL 偏离基线（parity 探针会拦截）。
-# 运行期 INSERT/UPDATE 写「当前时间」的收敛是另一回事：S3.4 用 dialect.now_expr()
-# （= func.now()，SQLite 下编译为 CURRENT_TIMESTAMP，与 datetime('now') 同格式同 UTC）。
+# server_default 的时间字面量：**建表默认值**，由 001 迁移冻结。
+# S4 双引擎：改用方言感知的 now_default_ddl()——SQLite 下渲染为 `(datetime('now'))`
+# （与 001 基线 DDL 逐字节一致，parity 探针只在 sqlite 上比对，不受影响）；PostgreSQL
+# 下渲染为 `now()`（PG 无 datetime() 函数）。
+# 运行期 INSERT/UPDATE 写「当前时间」是另一回事：用 dialect.now_expr()（= func.now()）。
 # 二者分属「DDL 默认值」与「运行期取值表达式」，刻意分离。见 dialect.py。
-_NOW = text("(datetime('now'))")
+_NOW = now_default_ddl()
 # 自增主键表的 __table_args__（SQLite AUTOINCREMENT：禁止 rowid 复用，对齐基线）
 _AUTOINC = {"sqlite_autoincrement": True}
 

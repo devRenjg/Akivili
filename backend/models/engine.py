@@ -53,11 +53,22 @@ def _apply_pragmas(dbapi_conn, _connection_record) -> None:
 
 
 def _build_engine() -> AsyncEngine:
-    """按当前 config 建 async engine（aiosqlite driver），挂 PRAGMA 监听器。"""
-    db_path = load_settings().db_path
-    url = "sqlite+aiosqlite:///" + db_path.replace("\\", "/")
+    """按当前 config 建 async engine。
+
+    S4 双引擎：db_url 非空则直接用（PostgreSQL，如 postgresql+asyncpg://...）；
+    否则用 db_path 拼 SQLite URL（S1-S3 默认路径，行为不变）。
+    PRAGMA 监听器是 SQLite 专属（WAL/busy_timeout/foreign_keys），PG 分支不挂——
+    PG 的 WAL/MVCC/外键是内建强制的，无需也不接受这些 PRAGMA。
+    """
+    settings = load_settings()
+    if settings.db_url:
+        # PostgreSQL（或其它 SQLAlchemy 支持的引擎）：URL 由 config 显式给全
+        engine = create_async_engine(settings.db_url, future=True)
+        return engine
+    # SQLite 默认路径（与 S1-S3 逐字一致）
+    url = "sqlite+aiosqlite:///" + settings.db_path.replace("\\", "/")
     engine = create_async_engine(url, future=True)
-    # sync_engine 上挂 connect 监听：每条新连接执行 PRAGMA
+    # sync_engine 上挂 connect 监听：每条新连接执行 PRAGMA（仅 SQLite）
     event.listen(engine.sync_engine, "connect", _apply_pragmas)
     return engine
 

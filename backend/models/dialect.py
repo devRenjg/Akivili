@@ -33,17 +33,132 @@
 """
 from __future__ import annotations
 
-from sqlalchemy import func
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.elements import ColumnElement
 
 
-def now_expr() -> ColumnElement:
-    """跨方言「当前 UTC 时间」表达式。
+# 时间字符串统一格式：'YYYY-MM-DD HH:MM:SS'（UTC、秒级、无时区后缀）。
+# 两个引擎的时间列都是 TEXT 存这个格式——SQLite 的 datetime('now')/CURRENT_TIMESTAMP 天生如此，
+# PG 侧用 to_char(... AT TIME ZONE 'UTC', ...) 强制归一化到同格式，保证跨引擎逐字节一致
+# （字典序比较、timeutil.to_beijing 解析、S4.6 数据迁移全无缝）。见 openspec S4.4 决策。
+_PG_TS_NORMALIZE = "'YYYY-MM-DD HH24:MI:SS'"
 
-    SQLite→CURRENT_TIMESTAMP（与旧 datetime('now') 逐字节同格式、同 UTC 语义），
-    PostgreSQL→now()。用于 ORM insert/update 的时间列赋值与 server_default。
+
+class now_expr(ColumnElement):
+    """跨方言「当前 UTC 时间」运行期表达式（用于 INSERT/UPDATE 的时间列赋值）。
+
+    - SQLite→ `CURRENT_TIMESTAMP`（与旧 datetime('now') 逐字节同格式、同 UTC 语义）。
+    - PostgreSQL→ `to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS')`——归一化到
+      SQLite 同格式（秒级 text、无时区后缀），保证时间列跨引擎逐字节一致。
+
+    历史上是 func.now()；S4.4 起改为方言感知元素，因 PG 原生 now() 带微秒+时区、格式与
+    SQLite 不符。sqlite 侧渲染不变，S3.4 的 41 处调用行为一致。
     """
-    return func.now()
+
+    inherit_cache = True
+
+
+@compiles(now_expr, "sqlite")
+def _now_expr_sqlite(element, compiler, **kw):  # noqa: ANN001, ARG001
+    # 与历史 func.now() 在 sqlite 下的渲染一致，保证 S3.4 各处逐字节不变。
+    return "CURRENT_TIMESTAMP"
+
+
+@compiles(now_expr, "postgresql")
+def _now_expr_pg(element, compiler, **kw):  # noqa: ANN001, ARG001
+    return f"to_char(now() AT TIME ZONE 'UTC', {_PG_TS_NORMALIZE})"
+
+
+class now_default_ddl(ColumnElement):
+    """建表 DDL 的「当前时间」server_default，按方言编译（S4 双引擎）。
+
+    - SQLite→ `(datetime('now'))`：与 001 基线 DDL 逐字节一致，存量库/parity 探针零影响。
+    - PostgreSQL→ `(to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS'))`：归一化到
+      SQLite 同格式（秒级 text），PG 无 datetime() 函数、原生 now() 格式也不符，故用 to_char。
+
+    仅用于 mapped_column(server_default=now_default_ddl())——即建表时冻结进 schema 的
+    默认值。运行期 INSERT/UPDATE 取「当前时间」用 now_expr()，二者分属「DDL 默认值」与
+    「运行期取值」，刻意分离（见 tables.py 说明）。
+    """
+
+    inherit_cache = True
+
+
+@compiles(now_default_ddl, "sqlite")
+def _now_default_sqlite(element, compiler, **kw):  # noqa: ANN001, ARG001
+    # 括号写法与 001 基线逐字一致：server_default=text("(datetime('now'))") 的等价渲染。
+    return "(datetime('now'))"
+
+
+@compiles(now_default_ddl, "postgresql")
+def _now_default_pg(element, compiler, **kw):  # noqa: ANN001, ARG001
+    return f"(to_char(now() AT TIME ZONE 'UTC', {_PG_TS_NORMALIZE}))"
+
+
+class now_offset(ColumnElement):
+    """「当前时间 ± N 秒」的方言感知表达式，产出与时间列同格式的 UTC text。
+
+    替代原 `func.datetime(now_expr(), '+N seconds' / '-N hours' / '-N days')`——那是 SQLite
+    方言（datetime 的相对修饰符），PG 无此函数。hours/days 由调用方换算成秒统一走本元素。
+
+    - SQLite→ `datetime('now', '±N seconds')`（与旧 SQL 逐字节一致）。
+    - PostgreSQL→ `to_char((now() AT TIME ZONE 'UTC') + N * interval '1 second', 'YYYY-...')`，
+      归一化到同格式。
+
+    delta_seconds 为整数（正=未来，负=过去），非用户输入（调用方由 backoff/hours/days 换算）。
+    """
+
+    inherit_cache = True
+
+    def __init__(self, delta_seconds: int):
+        self.delta_seconds = int(delta_seconds)
+
+
+@compiles(now_offset, "sqlite")
+def _now_offset_sqlite(element, compiler, **kw):  # noqa: ANN001, ARG001
+    n = element.delta_seconds
+    sign = "+" if n >= 0 else "-"
+    return f"datetime('now', '{sign}{abs(n)} seconds')"
+
+
+@compiles(now_offset, "postgresql")
+def _now_offset_pg(element, compiler, **kw):  # noqa: ANN001, ARG001
+    n = element.delta_seconds
+    return (f"to_char((now() AT TIME ZONE 'UTC') + ({n} * interval '1 second'), "
+            f"{_PG_TS_NORMALIZE})")
+
+
+class elapsed_seconds(ColumnElement):
+    """两个时间列相差的秒数（end - start），方言感知。
+
+    替代原 `(func.julianday(end) - func.julianday(start)) * 86400`——julianday 是 SQLite
+    方言。时间列在两引擎都是 TEXT，PG 侧先 ::timestamp 再 EXTRACT EPOCH。
+
+    - SQLite→ `(julianday(end) - julianday(start)) * 86400`（与旧 SQL 逐字节一致）。
+    - PostgreSQL→ `EXTRACT(EPOCH FROM (end::timestamp - start::timestamp))`。
+
+    start_expr / end_expr 为 SQLAlchemy 列表达式（ORM 列或标量子查询）。
+    """
+
+    inherit_cache = True
+
+    def __init__(self, end_expr, start_expr):
+        self.end_expr = end_expr
+        self.start_expr = start_expr
+
+
+@compiles(elapsed_seconds, "sqlite")
+def _elapsed_seconds_sqlite(element, compiler, **kw):  # noqa: ANN001
+    end_sql = compiler.process(element.end_expr, **kw)
+    start_sql = compiler.process(element.start_expr, **kw)
+    return f"(julianday({end_sql}) - julianday({start_sql})) * 86400"
+
+
+@compiles(elapsed_seconds, "postgresql")
+def _elapsed_seconds_pg(element, compiler, **kw):  # noqa: ANN001
+    end_sql = compiler.process(element.end_expr, **kw)
+    start_sql = compiler.process(element.start_expr, **kw)
+    return f"EXTRACT(EPOCH FROM ({end_sql}::timestamp - {start_sql}::timestamp))"
 
 
 # 方言相关的 SQL 片段：按 dialect name 返回。S4 接入 PG 时在此补分支。

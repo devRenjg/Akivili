@@ -8,9 +8,11 @@
 """
 from .base import Base
 from .dialect import (
+    elapsed_seconds,
     elapsed_seconds_sql,
     insert_or_ignore,
     now_expr,
+    now_offset,
     upsert,
 )
 from .engine import (
@@ -47,8 +49,10 @@ __all__ = [
     "get_session_factory",
     "dispose_engine",
     "ping",
-    # 方言 helper（S3.3）
+    # 方言 helper（S3.3 / S4.4）
     "now_expr",
+    "now_offset",
+    "elapsed_seconds",
     "elapsed_seconds_sql",
     "insert_or_ignore",
     "upsert",

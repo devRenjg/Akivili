@@ -225,6 +225,18 @@ JianAgency/
 
 ## 版本记录
 
+### 数据底座对标 Multica · S4 双引擎 SQLite⇄PostgreSQL — 2026-07-28
+- 🔧 **引擎抽象 + SQLite/PostgreSQL 双跑（能力 `foundation-data-layer`，OpenSpec change `2026-07-24-foundation-db-alignment`，回滚锚点 D）**
+  - **背景**：S3 把数据访问收敛到 ORM、方言收敛到 helper 后，双引擎的最后障碍是「连接构造写死 sqlite + 001 基线含 SQLite 专属 DDL + 5 处方言查询留待迁移」。S4 让同一套代码可按 `AKIVILI_DB_URL` 切 SQLite / PostgreSQL，并把真实数据迁到 PG 做逐行逐列一致性验证。
+  - **S4.1 双驱动 + URL 切换**：新增 `asyncpg==0.30.0`（运行期异步）+ `psycopg[binary]==3.3.4`（迁移期同步——Alembic 走同步引擎，asyncpg 纯异步跑不了）。`config.py` 加 `db_url`（环境变量 `AKIVILI_DB_URL`，不落 config.json 避免连接串入库）+ `migration_db_url()` 单一构造迁移 URL（sqlite→pysqlite / pg→psycopg，`+asyncpg` 自动转 `+psycopg`）；`engine.py` 按 URL 分支（PG 跳过 sqlite PRAGMA）。空 URL = 默认 sqlite，行为与 S1–S3 逐字节一致。
+  - **S4.2 PG 环境**：Docker `postgres:16`（容器 `akivili-pg`，`localhost:5432`，库/用户 `akivili`，命名卷 `akivili-pg-data`）。
+  - **S4.3 001 双方言可重放**：001 `upgrade()` 按 `dialect.name` 分支——SQLite 逐条原始 DDL（逐字节不变，存量库/parity 探针零影响）；PostgreSQL 走 `Base.metadata.create_all`，由 SQLAlchemy 生成 PG 方言 DDL（`AUTOINCREMENT`→IDENTITY、`datetime('now')`→归一化 `now()`）。`tables.py` 的 `_NOW` 改用方言感知 `now_default_ddl()`。002 纯 UPDATE、方言无关不动。
+  - **S4.4 方言收敛 + 时间归一化**：S3 标注的 5 处 SQLite 方言查询收敛到 `dialect.py` 的方言感知元素——`now_expr`（SQLite `CURRENT_TIMESTAMP` / PG `to_char(now() AT TIME ZONE 'UTC',…)`）、`now_offset(秒)`（相对时间窗口）、`elapsed_seconds(end,start)`（SQLite `julianday` 差 / PG `EXTRACT(EPOCH…)`）。**时间统一归一化为秒级 UTC text**（`YYYY-MM-DD HH:MM:SS`），两引擎时间列逐字节同格式——字典序比较、`to_beijing` 解析、数据迁移全无缝。调用点（`collab.py` 2 处、`routes/runs.py` 3 处）改用新元素。
+  - **S4.5 数据迁移 + 严格一致性**：`backend/migrate_sqlite_to_pg.py`（只读源库、依赖序插入、保留原始 id、迁移后重置 PG 序列）+ `TestReport/run_pg_sqlite_consistency_probe.py`（逐表行数 + **逐行逐列全量比对**）。迁移中处理了 3 个 SQLite 宽松/PG 严格暴露的真实数据问题：**NUL 字节剔除**（2 字段，PG text 不接受 ` `）、**8 行悬空外键跳过**（`run_queue` 7 + `activities` 1 指向已删 task，SQLite 外键默认关闭积累的孤儿）、**id 不连续保留 + 序列重置**。
+  - **S4.6 端到端双跑**：`TestReport/run_pg_e2e_probe.py` 直连迁移后真实 PG 库跑全链路（建项目/Agent/任务/enqueue/finalize/活动流 + 4 处方言查询），验证业务在 PG 上正确运行。40 门禁里 27 个深度绑定 sqlite-only 造数入口（`get_connection` seed，业务运行期已零调用），故 S4.6 用端到端场景验证「平台跑在 PG 上」而非硬改单元探针；sqlite 40 门禁保持守 sqlite 侧。
+  - 验证：**S4.V 大检阅 8 项全通**——依赖就绪 + 001→002 双引擎建库 + 全量迁移 31772 行（跳过 8 悬空孤儿）+ **一致性逐行逐列 37/37** + **PG 端到端 22/22** + 探针后一致性重验 37/37（受控写闭环、存量零污染）+ **SQLite 40 门禁 40/40 · 1125 断言**（默认路径零回归）+ 方言 helper 双引擎编译核对。回滚锚点 D。
+  - ⚠️ 当前默认仍走 SQLite（PG 为显式可选，`AKIVILI_DB_URL` 指定）；切 PG 为默认是 S5。
+
 ### 数据底座对标 Multica · S3 ORM + SQL 收敛 + 方言隔离 — 2026-07-28
 - 🔧 **手写 SQL 全量迁 SQLAlchemy 2.0 async ORM（能力 `foundation-data-layer`，OpenSpec change `2026-07-24-foundation-db-alignment`，回滚锚点 C）**
   - **背景**：S2 后 schema 已版本化，但业务层仍是 ~241 处手写 `db.execute("SQL")`（散落 15 个数据文件），字符串拼接、`datetime('now')` 等 SQLite 方言硬编码遍布，是「双引擎（S4）→ PostgreSQL 默认化（S5）」的最大障碍。S3 把数据访问收敛到 ORM 一层、方言收敛到 helper 一层。

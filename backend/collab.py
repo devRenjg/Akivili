@@ -11,7 +11,7 @@ import re
 
 from sqlalchemy import case, func, select, update as sa_update
 
-from models import (get_session_factory, now_expr,
+from models import (get_session_factory, now_expr, now_offset, elapsed_seconds,
                     Activity, AgentProfile, AgentSkill, Message, Project,
                     ProjectAgent, RunEvent, RunLog, RunQueue, Skill, Task, TaskRun)
 
@@ -882,7 +882,7 @@ async def _process_one(item: dict) -> None:
                 await session.execute(
                     sa_update(RunQueue).where(RunQueue.id == item["id"]).values(
                         status="queued", attempts=attempts,
-                        next_retry_at=func.datetime(now_expr(), f"+{backoff} seconds")))
+                        next_retry_at=now_offset(backoff)))
                 await session.commit()
                 from activity import log_activity
                 await log_activity(item["task_id"], "commented", "system", "",
@@ -1030,13 +1030,13 @@ async def sweep_orphan_task_runs(idle_sec: int | None = None) -> int:
     from executor import runner  # noqa: PLC0415
     idle = idle_sec if idle_sec is not None else ORPHAN_SWEEP_IDLE_SEC
     # 用 SQL 直接算「最后活动距今秒数」：last = max(run_logs.ts) 或 started_at。
-    # julianday 差 * 86400 = 秒。ts 存 UTC，now 也是 UTC，口径一致。
-    # julianday 是 SQLite 方言（同 dialect.elapsed_seconds_sql），S4 迁 PG 改 EXTRACT EPOCH。
+    # 「最后活动距今秒数」= now - max(run_logs.ts)（无日志则用 started_at）。ts 存 UTC，now
+    # 也是 UTC，口径一致。elapsed_seconds 是方言感知（SQLite→julianday 差、PG→EXTRACT EPOCH）。
     last_ts = (select(func.max(RunLog.ts))
                .where(RunLog.run_id == TaskRun.id)
                .correlate(TaskRun).scalar_subquery())
-    idle_s = ((func.julianday(now_expr())
-               - func.julianday(func.coalesce(last_ts, TaskRun.started_at))) * 86400).label("idle_s")
+    idle_s = elapsed_seconds(now_expr(),
+                             func.coalesce(last_ts, TaskRun.started_at)).label("idle_s")
     async with get_session_factory()() as session:
         rows = (await session.execute(
             select(TaskRun.id, TaskRun.task_id, TaskRun.agent_slug, idle_s)

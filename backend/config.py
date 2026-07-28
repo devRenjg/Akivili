@@ -39,8 +39,13 @@ _ROOT = Path(__file__).parent.parent   # 项目根目录（backend 的上一级�
 
 class Settings(BaseSettings):
     db_path: str = str(Path(__file__).parent / "jianagency.db")
+    # 数据底座 S4：显式数据库 URL（双引擎切换）。
+    # 空（默认）= 用 db_path 走 SQLite，行为与 S1-S3 完全一致；
+    # 非空则优先，支持 PostgreSQL，如 postgresql+asyncpg://user:pass@host:5432/dbname。
+    # 由环境变量 AKIVILI_DB_URL 提供（不落 config.json，避免把连接串/口令写进文件）。
+    db_url: str = os.environ.get("AKIVILI_DB_URL", "")
     # SQLite 连接锁等待超时（毫秒）：WAL 下写-写竞争时后到的写等待而非立即 database is locked。
-    # 默认 5000（5 秒），可用环境变量 AKIVILI_DB_BUSY_TIMEOUT_MS 覆盖。
+    # 默认 5000（5 秒），可用环境变量 AKIVILI_DB_BUSY_TIMEOUT_MS 覆盖。（仅 SQLite 有意义）
     db_busy_timeout_ms: int = int(os.environ.get("AKIVILI_DB_BUSY_TIMEOUT_MS", "5000"))
     # Agent 模版库根目录：默认项目内 agents/，可用环境变量 AKIVILI_AGENT_LIBRARY_DIR 指向外部库
     agent_library_dir: str = os.environ.get("AKIVILI_AGENT_LIBRARY_DIR", str(_ROOT / "agents"))
@@ -79,6 +84,41 @@ def load_settings() -> Settings:
         data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         return Settings(**data)
     return Settings()
+
+
+def _sqlite_sync_url(db_path: str) -> str:
+    """同步 sqlite URL；db_path 的反斜杠(Windows)转正斜杠避免被当转义。"""
+    return "sqlite:///" + db_path.replace("\\", "/")
+
+
+def _pg_sync_url(url: str) -> str:
+    """把运行期 PG URL（postgresql+asyncpg://…）转成迁移期同步 psycopg URL。
+
+    Alembic 走同步引擎，asyncpg 是纯异步驱动跑不了；psycopg v3 是同步驱动。
+    统一把任意 driver 段替换成 +psycopg：
+      postgresql+asyncpg://…  → postgresql+psycopg://…
+      postgresql://…          → postgresql+psycopg://…
+    """
+    scheme, sep, rest = url.partition("://")
+    base = scheme.split("+", 1)[0]   # 取 driver 前的方言名，如 "postgresql"
+    return f"{base}+psycopg{sep}{rest}"
+
+
+def migration_db_url() -> str:
+    """迁移期（Alembic，同步）数据库 URL —— db_migrate.py 与 migrations/env.py 的单一真相源。
+
+    优先级：
+      1. ALEMBIC_DB_PATH（测试隔离，始终 sqlite）——保持 S1-S3 测试路径逐字节不变，最高优先。
+      2. db_url（S4 双引擎，PG）——转成同步 psycopg URL。
+      3. db_path（默认 sqlite）。
+    """
+    alembic_path = os.environ.get("ALEMBIC_DB_PATH")
+    if alembic_path:
+        return _sqlite_sync_url(alembic_path)
+    settings = load_settings()
+    if settings.db_url:
+        return _pg_sync_url(settings.db_url)
+    return _sqlite_sync_url(settings.db_path)
 
 
 def save_settings(settings: Settings) -> None:
