@@ -25,6 +25,7 @@ TestReport/*
 *.db.bak_*
 *.db-journal
 *.db-wal
+*.db-shm
 *.bak
 *.bak_*
 
