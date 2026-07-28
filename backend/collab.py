@@ -9,7 +9,26 @@
 import asyncio
 import re
 
-from database import get_connection
+from sqlalchemy import case, func, select, update as sa_update
+
+from models import (get_session_factory, now_expr,
+                    Activity, AgentProfile, AgentSkill, Message, Project,
+                    ProjectAgent, RunEvent, RunLog, RunQueue, Skill, Task, TaskRun)
+
+# tasks / project_agents 物理列序（_load_task_agent 的 SELECT t.* / SELECT * 用，保持 dict 契约）
+_TASK_COLS = (
+    "id", "project_id", "title", "description", "status", "assignee_slug",
+    "conversation_id", "order_idx", "created_at", "updated_at", "priority", "parent_task_id",
+)
+_PA_COLS = (
+    "id", "project_id", "template_id", "slug", "name", "emoji", "color",
+    "persona", "provider_id", "enabled", "created_at", "is_leader",
+)
+# run_queue 物理列序（_claim_one 的 SELECT q.* → dict(item) 契约）
+_RQ_COLS = (
+    "id", "task_id", "agent_slug", "trigger", "is_leader", "prompt", "status",
+    "created_at", "attempts", "next_retry_at", "task_run_id", "source_run_id", "source_message_id",
+)
 
 # 单任务累计 run 总量闸（绝对失控的最后兜底）。start_loop 时从 Settings 覆盖，见 _apply_settings。
 MAX_RUNS_PER_TASK = 200
@@ -72,21 +91,21 @@ def _hard_wall(slug: str) -> int:
 async def _run_produced_deliverable(task_id: int, slug: str) -> bool:
     """该 run 是否已产出真实交付：本任务会话里有该 Agent 的 assistant 发言（jian comment/subtask），
     或它已把任务状态改动过（jian status）。用于「超时保成果」：已交付就不该判失败销毁。"""
-    from database import get_connection
-    db = await get_connection()
-    try:
-        row = await (await db.execute(
-            """SELECT 1 FROM messages m JOIN tasks t ON t.conversation_id=m.conversation_id
-               WHERE t.id=? AND m.role='assistant' AND m.author_slug=? LIMIT 1""",
-            (task_id, slug))).fetchone()
+    async with get_session_factory()() as session:
+        row = (await session.execute(
+            select(1).select_from(Message)
+            .join(Task, Task.conversation_id == Message.conversation_id)
+            .where(Task.id == task_id, Message.role == "assistant", Message.author_slug == slug)
+            .limit(1))).first()
         if row:
             return True
-        act = await (await db.execute(
-            "SELECT 1 FROM activities WHERE task_id=? AND actor_type='agent' AND actor_name=? "
-            "AND action IN ('commented','status_changed') LIMIT 1", (task_id, slug))).fetchone()
+        act = (await session.execute(
+            select(1).select_from(Activity)
+            .where(Activity.task_id == task_id, Activity.actor_type == "agent",
+                   Activity.actor_name == slug,
+                   Activity.action.in_(("commented", "status_changed")))
+            .limit(1))).first()
         return bool(act)
-    finally:
-        await db.close()
 
 
 async def _grace_then_kill(task_id: int, slug: str, agent: dict,
@@ -169,20 +188,18 @@ TEAM_LEADER_PROTOCOL = """## 团队负责人协作协议
 async def _member_names(project_id: int, exclude_slug: str = "") -> list[str]:
     """项目里真实成员的 @ 名字（昵称优先，回退 name），可排除某人（如负责人自己）。
     用于把真实花名册直接内联进 Leader 的 prompt，避免它自行探索/臆想成员。"""
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(
-            """SELECT pa.slug, pa.name, p.nickname AS nickname
-               FROM project_agents pa LEFT JOIN agent_profiles p ON p.slug = pa.slug
-               WHERE pa.project_id=? ORDER BY pa.is_leader DESC, pa.id""",
-            (project_id,))).fetchall()
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(ProjectAgent.slug, ProjectAgent.name, AgentProfile.nickname)
+            .select_from(ProjectAgent)
+            .outerjoin(AgentProfile, AgentProfile.slug == ProjectAgent.slug)
+            .where(ProjectAgent.project_id == project_id)
+            .order_by(ProjectAgent.is_leader.desc(), ProjectAgent.id))).all()
     names = []
     for r in rows:
-        if r["slug"] == exclude_slug:
+        if r.slug == exclude_slug:
             continue
-        names.append((r["nickname"] or r["name"] or "").strip())
+        names.append((r.nickname or r.name or "").strip())
     return [n for n in names if n]
 
 
@@ -192,20 +209,17 @@ async def resolve_agent_displays(slugs) -> dict:
     uniq = [s for s in {(s or "").strip() for s in slugs} if s]
     if not uniq:
         return {}
-    db = await get_connection()
-    try:
-        ph = ",".join("?" for _ in uniq)
-        rows = await (await db.execute(
-            f"""SELECT pa.slug, pa.name, p.nickname AS nickname
-                FROM project_agents pa LEFT JOIN agent_profiles p ON p.slug = pa.slug
-                WHERE pa.slug IN ({ph})""", tuple(uniq))).fetchall()
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(ProjectAgent.slug, ProjectAgent.name, AgentProfile.nickname)
+            .select_from(ProjectAgent)
+            .outerjoin(AgentProfile, AgentProfile.slug == ProjectAgent.slug)
+            .where(ProjectAgent.slug.in_(uniq)))).all()
     out: dict = {}
     for r in rows:
-        name = (r["name"] or r["slug"] or "").strip()
-        nick = (r["nickname"] or "").strip()
-        out[r["slug"]] = f"{nick}（{name}）" if nick else name
+        name = (r.name or r.slug or "").strip()
+        nick = (r.nickname or "").strip()
+        out[r.slug] = f"{nick}（{name}）" if nick else name
     # 查不到的 slug 回退为自身，避免前端显示空
     for s in uniq:
         out.setdefault(s, s)
@@ -216,24 +230,24 @@ async def build_roster(project_id: int, viewer_slug: str = "") -> str:
     """生成团队花名册：项目（= 一个 Team）全员的角色/一句话职责/技能 + @语法。
     每个成员执行时都注入此花名册——让整个 Team 互相认识（不只负责人）。
     viewer_slug 标出"就是你自己"，动态查库，组织变动即最新。"""
-    db = await get_connection()
-    try:
-        prow = await (await db.execute(
-            "SELECT title FROM projects WHERE id=?", (project_id,))).fetchone()
-        team_name = (prow["title"] if prow else "") or "本项目"
-        members = await (await db.execute(
-            """SELECT pa.slug, pa.name, pa.emoji, pa.persona, pa.is_leader, p.nickname AS nickname
-               FROM project_agents pa LEFT JOIN agent_profiles p ON p.slug = pa.slug
-               WHERE pa.project_id=? ORDER BY pa.is_leader DESC, pa.id""",
-            (project_id,))).fetchall()
+    async with get_session_factory()() as session:
+        team_name = (await session.execute(
+            select(Project.title).where(Project.id == project_id))).scalar_one_or_none() or "本项目"
+        mrows = (await session.execute(
+            select(ProjectAgent.slug, ProjectAgent.name, ProjectAgent.emoji,
+                   ProjectAgent.persona, ProjectAgent.is_leader, AgentProfile.nickname)
+            .select_from(ProjectAgent)
+            .outerjoin(AgentProfile, AgentProfile.slug == ProjectAgent.slug)
+            .where(ProjectAgent.project_id == project_id)
+            .order_by(ProjectAgent.is_leader.desc(), ProjectAgent.id))).all()
+        members = [dict(r._mapping) for r in mrows]
         skills_map = {}
         for m in members:
-            rows = await (await db.execute(
-                "SELECT s.name FROM agent_skills a JOIN skills s ON s.slug=a.skill_slug WHERE a.agent_slug=?",
-                (m["slug"],))).fetchall()
-            skills_map[m["slug"]] = [r["name"] for r in rows]
-    finally:
-        await db.close()
+            srows = (await session.execute(
+                select(Skill.name)
+                .select_from(AgentSkill).join(Skill, Skill.slug == AgentSkill.skill_slug)
+                .where(AgentSkill.agent_slug == m["slug"]))).all()
+            skills_map[m["slug"]] = [r.name for r in srows]
 
     def profile_summary(persona: str) -> str:
         """从 persona 提取专业摘要：跳过标题行，取头几句实质内容（便于负责人按专业匹配派活）。"""
@@ -282,13 +296,10 @@ async def build_roster(project_id: int, viewer_slug: str = "") -> str:
 # ---------- 入队 / 去重 / 深度上限 ----------
 
 async def _run_count(task_id: int) -> int:
-    db = await get_connection()
-    try:
-        row = await (await db.execute(
-            "SELECT COUNT(*) c FROM run_queue WHERE task_id=?", (task_id,))).fetchone()
-        return row["c"] if row else 0
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        return (await session.execute(
+            select(func.count()).select_from(RunQueue)
+            .where(RunQueue.task_id == task_id))).scalar_one()
 
 
 async def _mention_chain_len(task_id: int) -> int:
@@ -304,20 +315,18 @@ async def _mention_chain_len(task_id: int) -> int:
     含义（防误伤）：只有「连续多棒 @ 却谁都没产出」的**真死循环空转**才会累积撞闸；只要链中
     有 Agent 真交付了成果（多轮复验/返工这种长链协作即属此类），链就被重置，不会被误掐。
     真正的 Agent 互相 @ 空转（无新产出）仍会持续累积、如期熔断。（task149 误伤事故根因修复）"""
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(
-            "SELECT trigger, source_run_id, task_run_id, agent_slug FROM run_queue "
-            "WHERE task_id=? ORDER BY id DESC", (task_id,))).fetchall()
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(RunQueue.trigger, RunQueue.source_run_id,
+                   RunQueue.task_run_id, RunQueue.agent_slug)
+            .where(RunQueue.task_id == task_id).order_by(RunQueue.id.desc()))).all()
     n = 0
     for r in rows:
         # 非链式入队 → 断点，停
-        if not (r["trigger"] == "mention" and r["source_run_id"] is not None):
+        if not (r.trigger == "mention" and r.source_run_id is not None):
             break
         # 链式但有真实产出 → 这一棒是实质协作，重置链，停
-        if await _run_queue_item_produced(task_id, r["task_run_id"], r["agent_slug"]):
+        if await _run_queue_item_produced(task_id, r.task_run_id, r.agent_slug):
             break
         n += 1
     return n
@@ -333,14 +342,12 @@ async def _run_queue_item_produced(task_id: int, task_run_id, agent_slug: str) -
     task_run_id 为空（run 没起来）视为无产出。"""
     if not task_run_id:
         return False
-    db = await get_connection()
-    try:
-        msg = await (await db.execute(
-            "SELECT 1 FROM messages WHERE run_id=? AND role='assistant' LIMIT 1",
-            (task_run_id,))).fetchone()
+    async with get_session_factory()() as session:
+        msg = (await session.execute(
+            select(1).select_from(Message)
+            .where(Message.run_id == task_run_id, Message.role == "assistant")
+            .limit(1))).first()
         return bool(msg)
-    finally:
-        await db.close()
 
 
 async def log_run_event(event: str, *, run_queue_id: int | None = None,
@@ -350,16 +357,12 @@ async def log_run_event(event: str, *, run_queue_id: int | None = None,
     失败绝不冒泡影响调度主流程。"""
     import json as _json
     try:
-        db = await get_connection()
-        try:
-            await db.execute(
-                "INSERT INTO run_events (run_queue_id, task_run_id, task_id, agent_slug, event, detail) "
-                "VALUES (?,?,?,?,?,?)",
-                (run_queue_id, task_run_id, task_id, agent_slug, event,
-                 _json.dumps(detail or {}, ensure_ascii=False)))
-            await db.commit()
-        finally:
-            await db.close()
+        async with get_session_factory()() as session:
+            session.add(RunEvent(
+                run_queue_id=run_queue_id, task_run_id=task_run_id, task_id=task_id,
+                agent_slug=agent_slug, event=event,
+                detail=_json.dumps(detail or {}, ensure_ascii=False)))
+            await session.commit()
     except Exception:  # noqa: BLE001 — 埋点失败不影响调度
         pass
 
@@ -387,23 +390,21 @@ async def enqueue_run(task_id: int, agent_slug: str, prompt: str,
                                {"note": f"检测到连续 {MAX_MENTION_CHAIN} 次 @ 链式自动协同"
                                         f"（疑似循环），自动停止以防烧钱；如需继续请人工重新指派"})
             return None
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         # pending 去重：同一 (task, agent) 已有 queued/running 就不重复入队
-        dup = await (await db.execute(
-            "SELECT id FROM run_queue WHERE task_id=? AND agent_slug=? AND status IN ('queued','running')",
-            (task_id, agent_slug))).fetchone()
+        dup = (await session.execute(
+            select(RunQueue.id)
+            .where(RunQueue.task_id == task_id, RunQueue.agent_slug == agent_slug,
+                   RunQueue.status.in_(("queued", "running"))))).first()
         if dup:
             return None
-        cur = await db.execute(
-            "INSERT INTO run_queue (task_id, agent_slug, trigger, is_leader, prompt, "
-            "source_run_id, source_message_id) VALUES (?,?,?,?,?,?,?)",
-            (task_id, agent_slug, trigger, 1 if is_leader else 0, prompt,
-             source_run_id, source_message_id))
-        await db.commit()
-        rq_id = cur.lastrowid
-    finally:
-        await db.close()
+        rq = RunQueue(task_id=task_id, agent_slug=agent_slug, trigger=trigger,
+                      is_leader=1 if is_leader else 0, prompt=prompt,
+                      source_run_id=source_run_id, source_message_id=source_message_id)
+        session.add(rq)
+        await session.flush()
+        rq_id = rq.id
+        await session.commit()
     await log_run_event("enqueued", run_queue_id=rq_id, task_id=task_id, agent_slug=agent_slug,
                         detail={"trigger": trigger, "is_leader": bool(is_leader),
                                 "source_run_id": source_run_id, "source_message_id": source_message_id})
@@ -412,14 +413,13 @@ async def enqueue_run(task_id: int, agent_slug: str, prompt: str,
 
 async def _last_run_was_leader(task_id: int, agent_slug: str) -> bool:
     """该 agent 在此任务上最近一次运行是否以 leader 身份（自触发守卫用）。"""
-    db = await get_connection()
-    try:
-        row = await (await db.execute(
-            "SELECT is_leader FROM run_queue WHERE task_id=? AND agent_slug=? AND status='done' ORDER BY id DESC LIMIT 1",
-            (task_id, agent_slug))).fetchone()
-        return bool(row and row["is_leader"])
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        is_leader = (await session.execute(
+            select(RunQueue.is_leader)
+            .where(RunQueue.task_id == task_id, RunQueue.agent_slug == agent_slug,
+                   RunQueue.status == "done")
+            .order_by(RunQueue.id.desc()).limit(1))).scalar_one_or_none()
+        return bool(is_leader)
 
 
 # ---------- @mention 解析 ----------
@@ -461,24 +461,20 @@ async def parse_and_enqueue_mentions(task_id: int, project_id: int, text: str,
     if not text or "@" not in text:
         return []
     # 判断本 task 是否子任务（有 parent_task_id）
-    db0 = await get_connection()
-    try:
-        prow = await (await db0.execute(
-            "SELECT parent_task_id, title, description FROM tasks WHERE id=?", (task_id,))).fetchone()
-        in_subtask = bool(prow and prow["parent_task_id"])
-        task_title = (prow["title"] if prow else "") or ""
-        task_desc = (prow["description"] if prow else "") or ""
-    finally:
-        await db0.close()
-    db = await get_connection()
-    try:
-        members = await (await db.execute(
-            """SELECT pa.slug, pa.name, pa.is_leader, p.nickname AS nickname
-               FROM project_agents pa LEFT JOIN agent_profiles p ON p.slug = pa.slug
-               WHERE pa.project_id=?""", (project_id,))).fetchall()
-    finally:
-        await db.close()
-    members = [dict(m) for m in members]
+    async with get_session_factory()() as session:
+        prow = (await session.execute(
+            select(Task.parent_task_id, Task.title, Task.description)
+            .where(Task.id == task_id))).first()
+        in_subtask = bool(prow and prow.parent_task_id)
+        task_title = (prow.title if prow else "") or ""
+        task_desc = (prow.description if prow else "") or ""
+        mrows = (await session.execute(
+            select(ProjectAgent.slug, ProjectAgent.name, ProjectAgent.is_leader,
+                   AgentProfile.nickname)
+            .select_from(ProjectAgent)
+            .outerjoin(AgentProfile, AgentProfile.slug == ProjectAgent.slug)
+            .where(ProjectAgent.project_id == project_id))).all()
+    members = [dict(m._mapping) for m in mrows]
     # 按名字长度降序，避免短名误命中
     members.sort(key=lambda x: len(x["name"]), reverse=True)
 
@@ -546,26 +542,27 @@ def _unmatched_mentions(text: str, matched: list[str]) -> list[str]:
 
 async def _load_task_agent(task_id: int, slug: str):
     """取任务(含项目路径) + 成员(含 persona + 生效 provider)。"""
-    db = await get_connection()
-    try:
-        task = await (await db.execute(
-            """SELECT t.*, p.local_path AS project_dir
-               FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=?""", (task_id,))).fetchone()
-        if not task:
+    async with get_session_factory()() as session:
+        trow = (await session.execute(
+            select(Task, Project.local_path.label("project_dir"))
+            .join(Project, Project.id == Task.project_id)
+            .where(Task.id == task_id))).first()
+        if not trow:
             return None, None
-        task = dict(task)
-        agent = await (await db.execute(
-            "SELECT * FROM project_agents WHERE project_id=? AND slug=? LIMIT 1",
-            (task["project_id"], slug))).fetchone()
-        if not agent:
+        t_obj, project_dir = trow
+        task = {c: getattr(t_obj, c) for c in _TASK_COLS}
+        task["project_dir"] = project_dir
+        pa = (await session.execute(
+            select(ProjectAgent)
+            .where(ProjectAgent.project_id == task["project_id"], ProjectAgent.slug == slug)
+            .limit(1))).scalar_one_or_none()
+        if not pa:
             return task, None
-        agent = dict(agent)
-        prof = await (await db.execute(
-            "SELECT provider_id FROM agent_profiles WHERE slug=?", (slug,))).fetchone()
-        agent["provider_id_effective"] = prof["provider_id"] if prof else ""
+        agent = {c: getattr(pa, c) for c in _PA_COLS}
+        prof = (await session.execute(
+            select(AgentProfile.provider_id).where(AgentProfile.slug == slug))).first()
+        agent["provider_id_effective"] = prof.provider_id if prof else ""
         return task, agent
-    finally:
-        await db.close()
 
 
 async def _run_one(item: dict) -> None:
@@ -731,32 +728,25 @@ async def _run_one(item: dict) -> None:
     # P1-1 可观测性：把本队列项实际产生的 task_run.id 回填到 run_queue，打通两表关联
     # （此前两表无关联列，排查只能靠 task+slug+时间就近猜配对——task82 事故根因之一）。
     if rid:
-        db3 = await get_connection()
-        try:
-            await db3.execute("UPDATE run_queue SET task_run_id=? WHERE id=?", (rid, item.get("id")))
-            await db3.commit()
-        finally:
-            await db3.close()
+        async with get_session_factory()() as session:
+            await session.execute(
+                sa_update(RunQueue).where(RunQueue.id == item.get("id")).values(task_run_id=rid))
+            await session.commit()
     if run_status == "failed" and rid:
-        db2 = await get_connection()
-        try:
-            tr = await (await db2.execute(
-                "SELECT status FROM task_runs WHERE id=?", (rid,))).fetchone()
-        finally:
-            await db2.close()
-        if tr and tr["status"] == "succeeded":
+        async with get_session_factory()() as session:
+            tr_status = (await session.execute(
+                select(TaskRun.status).where(TaskRun.id == rid))).scalar_one_or_none()
+        if tr_status == "succeeded":
             run_status = "done"
             retriable_fail = False   # 实为成功（状态分叉伪失败），不进重试
             fail_reason = ""         # 实为成功，清空失败归因
 
     # P2-2 失败结构化归因：把判定的 fail_reason 写进 task_runs（成功则保持空）
     if run_status == "failed" and fail_reason and rid:
-        dbf = await get_connection()
-        try:
-            await dbf.execute("UPDATE task_runs SET fail_reason=? WHERE id=?", (fail_reason, rid))
-            await dbf.commit()
-        finally:
-            await dbf.close()
+        async with get_session_factory()() as session:
+            await session.execute(
+                sa_update(TaskRun).where(TaskRun.id == rid).values(fail_reason=fail_reason))
+            await session.commit()
 
     # 解析该成员发言里的 @，继续协同（因果链：这些下游 run 由本 run 的发言触发）
     if final_text:
@@ -784,14 +774,12 @@ async def _run_one(item: dict) -> None:
 
 async def get_leader_slug(project_id: int) -> str:
     """实时查当前项目的负责人 slug（不缓存——团队/负责人随时可能增删改，必须每次读最新）。"""
-    db = await get_connection()
-    try:
-        row = await (await db.execute(
-            "SELECT slug FROM project_agents WHERE project_id=? AND is_leader=1 LIMIT 1",
-            (project_id,))).fetchone()
-        return row["slug"] if row else ""
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        slug = (await session.execute(
+            select(ProjectAgent.slug)
+            .where(ProjectAgent.project_id == project_id, ProjectAgent.is_leader == 1)
+            .limit(1))).scalar_one_or_none()
+        return slug or ""
 
 
 # ---------- 后台循环（小并发池：卡死只占一个槽，不阻塞其他 Agent） ----------
@@ -830,24 +818,21 @@ async def _claim_one() -> dict | None:
     退避过滤：仅领取 next_retry_at 为空或已到点的行（失败重试的行在退避窗口内不被领取）。
     优先级取自 run_queue 所属 task 的 priority；LEFT JOIN 容错（task 理论上必存在）。
     """
-    db = await get_connection()
-    try:
-        row = await (await db.execute(
-            """SELECT q.* FROM run_queue q
-               LEFT JOIN tasks t ON t.id = q.task_id
-               WHERE q.status='queued'
-                 AND (q.next_retry_at IS NULL OR q.next_retry_at <= datetime('now'))
-               ORDER BY
-                 CASE t.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END ASC,
-                 q.id ASC
-               LIMIT 1""")).fetchone()
-        if not row:
+    prio = case((Task.priority == "high", 0), (Task.priority == "medium", 1), else_=2)
+    async with get_session_factory()() as session:
+        rq = (await session.execute(
+            select(RunQueue)
+            .outerjoin(Task, Task.id == RunQueue.task_id)
+            .where(RunQueue.status == "queued",
+                   (RunQueue.next_retry_at.is_(None)) | (RunQueue.next_retry_at <= now_expr()))
+            .order_by(prio.asc(), RunQueue.id.asc())
+            .limit(1))).scalar_one_or_none()
+        if not rq:
             return None
-        item = dict(row)
-        await db.execute("UPDATE run_queue SET status='running' WHERE id=?", (item["id"],))
-        await db.commit()
-    finally:
-        await db.close()
+        item = {c: getattr(rq, c) for c in _RQ_COLS}
+        await session.execute(
+            sa_update(RunQueue).where(RunQueue.id == item["id"]).values(status="running"))
+        await session.commit()
     if item is not None:
         await log_run_event("claimed", run_queue_id=item["id"], task_id=item["task_id"],
                             agent_slug=item["agent_slug"], detail={"attempts": item.get("attempts", 0)})
@@ -890,31 +875,28 @@ async def _process_one(item: dict) -> None:
     finally:
         attempts = int(item.get("attempts") or 0) + 1   # 本次已执行完，累计执行次数
         do_retry = retriable and attempts <= MAX_RETRY
-        db = await get_connection()
-        try:
+        async with get_session_factory()() as session:
             if do_retry:
                 # 回 queued + 退避：next_retry_at = now + 阶梯秒数（本次将成为第 attempts 次重试）
                 backoff = _RETRY_BACKOFF[min(attempts, len(_RETRY_BACKOFF)) - 1]
-                await db.execute(
-                    "UPDATE run_queue SET status='queued', attempts=?, "
-                    "next_retry_at=datetime('now', ?) WHERE id=?",
-                    (attempts, f"+{backoff} seconds", item["id"]))
-                await db.commit()
+                await session.execute(
+                    sa_update(RunQueue).where(RunQueue.id == item["id"]).values(
+                        status="queued", attempts=attempts,
+                        next_retry_at=func.datetime(now_expr(), f"+{backoff} seconds")))
+                await session.commit()
                 from activity import log_activity
                 await log_activity(item["task_id"], "commented", "system", "",
                                    {"note": f"run 执行异常，{backoff}s 后自动重试"
                                             f"（第 {attempts}/{MAX_RETRY} 次）"})
             else:
-                await db.execute(
-                    "UPDATE run_queue SET status=?, attempts=? WHERE id=?",
-                    (status, attempts, item["id"]))
-                await db.commit()
+                await session.execute(
+                    sa_update(RunQueue).where(RunQueue.id == item["id"]).values(
+                        status=status, attempts=attempts))
+                await session.commit()
                 if retriable and attempts > MAX_RETRY:
                     from activity import log_activity
                     await log_activity(item["task_id"], "commented", "system", "",
                                        {"note": f"run 重试 {MAX_RETRY} 次仍失败，终止"})
-        finally:
-            await db.close()
         _running.discard(item["id"])
         # run 级调度流水埋点（独立于 activities）
         if do_retry:
@@ -976,51 +958,48 @@ async def reclaim_orphan_runs() -> int:
     running 皆为无主孤儿。run_queue 落 failed；task_runs 落 killed（被中断，非正常失败）。"""
     from executor import runner  # noqa: PLC0415
     affected_tasks: set[int] = set()
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         # 1) run_queue 层
-        q_rows = await (await db.execute(
-            "SELECT id, task_id FROM run_queue WHERE status='running'")).fetchall()
+        q_rows = (await session.execute(
+            select(RunQueue.id, RunQueue.task_id).where(RunQueue.status == "running"))).all()
         # 2) task_runs 层
-        r_rows = await (await db.execute(
-            "SELECT id, task_id FROM task_runs WHERE status='running'")).fetchall()
+        r_rows = (await session.execute(
+            select(TaskRun.id, TaskRun.task_id).where(TaskRun.status == "running"))).all()
         if not q_rows and not r_rows:
             return 0
         if q_rows:
-            await db.execute("UPDATE run_queue SET status='failed' WHERE status='running'")
+            await session.execute(
+                sa_update(RunQueue).where(RunQueue.status == "running").values(status="failed"))
         if r_rows:
             # task_runs 孤儿的终态按其任务是否已成功收尾区分：
             #  - 任务已 done/reviewing → 这条 run 正是任务成功的产出，落 succeeded（否则会把
             #    已完成任务的成果 run 误标 killed，污染卡片「执行完成」显示与 solved_tasks 计数）；
             #  - 任务未收尾 → 确是被中断的孤儿，落 killed。
-            await db.execute(
-                """UPDATE task_runs SET status='succeeded', ended_at=datetime('now')
-                   WHERE status='running' AND task_id IN (
-                       SELECT id FROM tasks WHERE status IN ('done','reviewing'))""")
-            await db.execute(
-                "UPDATE task_runs SET status='killed', ended_at=datetime('now') WHERE status='running'")
-        await db.commit()
+            done_tasks = select(Task.id).where(Task.status.in_(("done", "reviewing")))
+            await session.execute(
+                sa_update(TaskRun)
+                .where(TaskRun.status == "running", TaskRun.task_id.in_(done_tasks))
+                .values(status="succeeded", ended_at=now_expr()))
+            await session.execute(
+                sa_update(TaskRun).where(TaskRun.status == "running")
+                .values(status="killed", ended_at=now_expr()))
+        await session.commit()
         for row in q_rows:
-            affected_tasks.add(row["task_id"])
+            affected_tasks.add(row.task_id)
         for row in r_rows:
-            affected_tasks.add(row["task_id"])
-    finally:
-        await db.close()
+            affected_tasks.add(row.task_id)
     # 清掉内存注册表里可能残留的这些 run（正常应已空，防御性）
     for row in r_rows:
-        runner._RUN_PIDS.pop(row["id"], None)
-        runner._KILLED.discard(row["id"])
+        runner._RUN_PIDS.pop(row.id, None)
+        runner._KILLED.discard(row.id)
     if not affected_tasks:
         return len(q_rows) + len(r_rows)
     # 查受影响任务的当前状态：已 done/reviewing 的不记「回收失败」活动（那是成功任务、只是 run 没落库）
-    db = await get_connection()
-    try:
-        ph = ",".join("?" for _ in affected_tasks)
-        finished = {r["id"] for r in await (await db.execute(
-            f"SELECT id FROM tasks WHERE id IN ({ph}) AND status IN ('done','reviewing')",
-            tuple(affected_tasks))).fetchall()}
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        finished = set((await session.execute(
+            select(Task.id)
+            .where(Task.id.in_(affected_tasks),
+                   Task.status.in_(("done", "reviewing"))))).scalars().all())
     # 落终态后，对未收尾的任务记一条活动 + 尝试推进父任务状态（清掉「执行中」假象后可能可收尾）
     from activity import log_activity
     from progress import maybe_advance_parent
@@ -1050,37 +1029,32 @@ async def sweep_orphan_task_runs(idle_sec: int | None = None) -> int:
     经 runner.finalize_run 幂等补落（不覆盖已定终态），并推进父任务状态。返回清理条数。"""
     from executor import runner  # noqa: PLC0415
     idle = idle_sec if idle_sec is not None else ORPHAN_SWEEP_IDLE_SEC
-    db = await get_connection()
-    try:
-        # 用 SQL 直接算「最后活动距今秒数」：last = max(run_logs.ts) 或 started_at。
-        # julianday 差 * 86400 = 秒。ts 存 UTC，datetime('now') 也是 UTC，口径一致。
-        rows = await (await db.execute(
-            """SELECT tr.id, tr.task_id, tr.agent_slug,
-                      (julianday('now') - julianday(
-                          COALESCE((SELECT MAX(ts) FROM run_logs WHERE run_id=tr.id), tr.started_at)
-                      )) * 86400 AS idle_s
-               FROM task_runs tr
-               WHERE tr.status='running'""")).fetchall()
-    finally:
-        await db.close()
+    # 用 SQL 直接算「最后活动距今秒数」：last = max(run_logs.ts) 或 started_at。
+    # julianday 差 * 86400 = 秒。ts 存 UTC，now 也是 UTC，口径一致。
+    # julianday 是 SQLite 方言（同 dialect.elapsed_seconds_sql），S4 迁 PG 改 EXTRACT EPOCH。
+    last_ts = (select(func.max(RunLog.ts))
+               .where(RunLog.run_id == TaskRun.id)
+               .correlate(TaskRun).scalar_subquery())
+    idle_s = ((func.julianday(now_expr())
+               - func.julianday(func.coalesce(last_ts, TaskRun.started_at))) * 86400).label("idle_s")
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(TaskRun.id, TaskRun.task_id, TaskRun.agent_slug, idle_s)
+            .where(TaskRun.status == "running"))).all()
     # 排除并发池此刻正在管理的 run（它们有自己的超时兜底，不该被巡检抢着收）。
     # _running 存的是 run_queue.id，与 task_runs.id 不同域；这里按「静默阈值」隔离已足够：
     # 池内在跑的 run 持续写日志、idle_s 很小，天然不会命中。故仅按 idle 阈值判定。
-    orphans = [r for r in rows if (r["idle_s"] or 0) > idle]
+    orphans = [r for r in rows if (r.idle_s or 0) > idle]
     if not orphans:
         return 0
     affected: set[int] = set()
     for r in orphans:
-        rid = r["id"]
-        tid = r["task_id"]
+        rid = r.id
+        tid = r.task_id
         # 任务已收尾 → 这条 run 是其成果，落 succeeded；否则确属被中断孤儿，落 killed。
-        db = await get_connection()
-        try:
-            trow = await (await db.execute(
-                "SELECT status FROM tasks WHERE id=?", (tid,))).fetchone()
-            tstatus = trow["status"] if trow else ""
-        finally:
-            await db.close()
+        async with get_session_factory()() as session:
+            tstatus = (await session.execute(
+                select(Task.status).where(Task.id == tid))).scalar_one_or_none() or ""
         final_status = "succeeded" if tstatus in ("done", "reviewing") else "killed"
         try:
             # finalize_run 内部 _finish_run 无条件落终态；但巡检要幂等且不覆盖已定终态，
@@ -1102,14 +1076,10 @@ async def sweep_orphan_task_runs(idle_sec: int | None = None) -> int:
         from progress import maybe_advance_parent
         for tid in affected:
             try:
-                trow_finished = False
-                db = await get_connection()
-                try:
-                    tr = await (await db.execute(
-                        "SELECT status FROM tasks WHERE id=?", (tid,))).fetchone()
-                    trow_finished = bool(tr and tr["status"] in ("done", "reviewing"))
-                finally:
-                    await db.close()
+                async with get_session_factory()() as session:
+                    tstatus = (await session.execute(
+                        select(Task.status).where(Task.id == tid))).scalar_one_or_none()
+                trow_finished = tstatus in ("done", "reviewing")
                 if not trow_finished:
                     await log_activity(tid, "task_failed", "system", "",
                                        {"note": "运行期孤儿巡检：卡「执行中」且长时间静默的记录已回收"
