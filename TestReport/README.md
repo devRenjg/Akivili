@@ -39,10 +39,43 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 ```
 
 - **GitHub Actions**（`.github/workflows/ci.yml`）：push 到 master + 所有 PR 自动跑
-  `run_ci_suite.py`，**PR 必须绿**。runner 用 `windows-latest`（与开发环境一致）。
+  `run_ci_suite.py`。runner 用 `windows-latest`（与开发环境一致）。
+  > 注：目前**未开分支保护**——CI 红了在 Actions 页面可见，但不强制拦截合入。
 - probe 清单只在 `run_ci_suite.py` 的 `GATE` 里维护一处——新增 probe 时同步加入。
 - 门禁**不含**需真实 CLI 的 `run_collab_scenario.py` / `run_codex_cli_smoke.py`（人工按需单跑）。
 - 实测：**40/40 项、1125 断言、~48s 全绿**（2026-07-28）。
+
+## 全套测试 vs CI 门禁
+
+**门禁是全套的子集**，不是两套东西。全套 = 仓库里所有测试脚本；门禁 = 其中能在
+干净环境自动复现、被挑进 CI 每次自动跑的那批。
+
+```
+全套 43 个 run_*.py
+├── run_ci_suite.py            ← 不是测试，是「调度器」(按 GATE 清单跑其余 40 个、收退出码)
+├── 40 个 → 进 CI 门禁 ✅       (39 隔离 probe + run_qa_suite 主套件)
+└── 2 个 → 不进门禁 ❌
+      ├── run_collab_scenario.py   (需真实 claude/codex CLI + LLM)
+      └── run_codex_cli_smoke.py   (需真实 Codex CLI)
+```
+
+|  | 全套测试集合 | CI 40 门禁 |
+|---|---|---|
+| **范围** | 所有 `run_*.py`（43 个） | 其中挑进 `GATE` 的 40 个 |
+| **触发** | 人工挑着单跑 / 本地 `run_ci_suite` 一键 | GitHub 每次 push/PR **自动** |
+| **含真实 CLI 测试** | 含（2 个） | **不含**（CI 无 CLI/无 API key，跑不了） |
+| **保障对象** | 逻辑正确 + 与真实外部世界的集成 | 逻辑正确（鉴权/CRUD/ORM 等价/调度/回收…） |
+
+**为什么分两层**（本质都是保障测试，分界在「能否在真空里复现」）：
+
+- **进门禁**的 40 个：不碰外部依赖、纯逻辑，任何干净环境可复现 → 适合自动门禁。
+  改一行代码撞坏 → CI 立刻红。
+- **留人工**的 2 个：要真启动 claude/codex CLI、真调 LLM，依赖网络/凭证/CLI 安装，
+  自动化跑不稳也跑不了 → 人工按需单跑（如换 provider 后验真实协同）。
+
+这是业界 CI 通行分界：能在真空复现的（单元/集成）进自动门禁；必须接真实外部世界的
+（端到端）留人工。**新增测试时**：无外部依赖 → 记得加进 `run_ci_suite.py` 的 `GATE`；
+依赖真实 CLI/LLM → 保持门禁外，并在下方矩阵用 `*` 标注。
 
 ## 测试矩阵
 
