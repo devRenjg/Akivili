@@ -7,6 +7,12 @@
     from models import Base, Project, Task, ...
 """
 from .base import Base
+from .engine import (
+    dispose_engine,
+    get_engine,
+    get_session_factory,
+    ping,
+)
 from .tables import (
     Activity,
     AgentProfile,
@@ -30,6 +36,12 @@ from .tables import (
 
 __all__ = [
     "Base",
+    # engine / session（S3.2）
+    "get_engine",
+    "get_session_factory",
+    "dispose_engine",
+    "ping",
+    # 表模型（S3.1）
     "Activity",
     "AgentProfile",
     "AgentSkill",
