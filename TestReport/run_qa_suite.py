@@ -171,14 +171,16 @@ def setup_isolated_config(tmp: Path) -> dict[str, Path]:
 
 
 async def bootstrap_backend(paths: dict[str, Path]):
-    import database  # noqa: PLC0415
     import auth as auth_mod  # noqa: PLC0415
     import agents as agents_mod  # noqa: PLC0415
     import skills as skills_mod  # noqa: PLC0415
     import memory as memory_mod  # noqa: PLC0415
     import main  # noqa: PLC0415
+    from db_migrate import run_migrations  # noqa: PLC0415
 
-    await database.init_db()
+    # 与生产 main._startup 一致：schema/建表唯一走 Alembic 迁移（001 基线含全部历史补列 +
+    # 002 数据规整）。S3.6 已下线 init_db 建表职责，此处不再调 init_db。
+    await asyncio.to_thread(run_migrations)
     await auth_mod.seed_admin()
     memory_mod.ensure_memory_dir()
     skills_mod.ensure_skills_dir()

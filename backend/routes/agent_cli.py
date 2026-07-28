@@ -4,36 +4,43 @@
 """
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import select, update as sa_update
 
-from database import get_connection
 import collab
 from activity import log_activity
+from models import (
+    AgentProfile,
+    Conversation,
+    Message,
+    ProjectAgent,
+    RunQueue,
+    Task,
+    TaskRun,
+    get_session_factory,
+    now_expr,
+)
 
 router = APIRouter(prefix="/api/agent-cli", tags=["agent-cli"])
 
 
 async def _task_project(task_id: int):
-    db = await get_connection()
-    try:
-        row = await (await db.execute(
-            "SELECT id, project_id, title FROM tasks WHERE id=?", (task_id,))).fetchone()
-        return dict(row) if row else None
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        row = (await session.execute(
+            select(Task.id, Task.project_id, Task.title).where(Task.id == task_id))).first()
+        return {"id": row.id, "project_id": row.project_id, "title": row.title} if row else None
 
 
 async def _running_run_id(task_id: int, agent_slug: str) -> int | None:
     """反查「该 task+slug 当前正在跑的 task_run.id」——用于给 CLI 成员经 jian 回调落的
     message 补 run_id（子进程回调只有 task_id/slug，拿不到 run_id）。同一 task+slug 同时
     只会有一个 running run（enqueue 去重保证），唯一性可靠；查不到返回 None（留空不报错）。"""
-    db = await get_connection()
-    try:
-        row = await (await db.execute(
-            "SELECT id FROM task_runs WHERE task_id=? AND agent_slug=? AND status='running' "
-            "ORDER BY id DESC LIMIT 1", (task_id, agent_slug))).fetchone()
-        return row["id"] if row else None
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        row = (await session.execute(
+            select(TaskRun.id)
+            .where(TaskRun.task_id == task_id, TaskRun.agent_slug == agent_slug,
+                   TaskRun.status == "running")
+            .order_by(TaskRun.id.desc()).limit(1))).first()
+        return row.id if row else None
 
 
 async def _resolve_member(project_id: int, ref: str) -> str:
@@ -41,17 +48,16 @@ async def _resolve_member(project_id: int, ref: str) -> str:
     ref = (ref or "").strip()
     if not ref:
         return ""
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(
-            """SELECT pa.slug, pa.name, p.nickname AS nickname
-               FROM project_agents pa LEFT JOIN agent_profiles p ON p.slug = pa.slug
-               WHERE pa.project_id=?""", (project_id,))).fetchall()
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(ProjectAgent.slug, ProjectAgent.name,
+                   AgentProfile.nickname.label("nickname"))
+            .select_from(ProjectAgent)
+            .outerjoin(AgentProfile, AgentProfile.slug == ProjectAgent.slug)
+            .where(ProjectAgent.project_id == project_id))).all()
     for r in rows:
-        if ref in (r["slug"], r["name"], r["nickname"] or ""):
-            return r["slug"]
+        if ref in (r.slug, r.name, r.nickname or ""):
+            return r.slug
     return ""
 
 
@@ -60,18 +66,17 @@ async def _display_name(project_id: int, slug: str) -> str:
     用于活动/发言文案，避免暴露英文 slug。"""
     if not slug:
         return slug
-    db = await get_connection()
-    try:
-        r = await (await db.execute(
-            """SELECT pa.name, p.nickname AS nickname FROM project_agents pa
-               LEFT JOIN agent_profiles p ON p.slug = pa.slug
-               WHERE pa.project_id=? AND pa.slug=? LIMIT 1""", (project_id, slug))).fetchone()
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        r = (await session.execute(
+            select(ProjectAgent.name, AgentProfile.nickname.label("nickname"))
+            .select_from(ProjectAgent)
+            .outerjoin(AgentProfile, AgentProfile.slug == ProjectAgent.slug)
+            .where(ProjectAgent.project_id == project_id, ProjectAgent.slug == slug)
+            .limit(1))).first()
     if not r:
         return slug
-    nick = (r["nickname"] or "").strip()
-    name = r["name"] or slug
+    nick = (r.nickname or "").strip()
+    name = r.name or slug
     return f"{nick}（{name}）" if nick else name
 
 
@@ -98,26 +103,24 @@ async def create_subtask(req: SubtaskReq):
     owner = await _resolve_member(pid, req.owner_slug) or req.agent_slug
     delegate = req.assign and owner != req.agent_slug
     status = "in_progress" if delegate else "done"
-    db = await get_connection()
-    try:
-        conv = await db.execute(
-            "INSERT INTO conversations (project_id, title) VALUES (?,?)", (pid, req.title.strip()))
-        cur = await db.execute(
-            """INSERT INTO tasks (project_id, title, assignee_slug, conversation_id, parent_task_id, status)
-               VALUES (?,?,?,?,?,?)""",
-            (pid, req.title.strip(), owner, conv.lastrowid, req.task_id, status))
-        sub_id = cur.lastrowid
+    # 产出归因：自产出的正文挂到「建卡人在父任务下当前 running 的 run」（委派指令非产出，不归因）
+    body_run_id = None if delegate else await _running_run_id(req.task_id, req.agent_slug)
+    async with get_session_factory()() as session:
+        conv = Conversation(project_id=pid, title=req.title.strip())
+        session.add(conv)
+        await session.flush()   # 取 conv.id（对齐旧 lastrowid）
+        sub = Task(project_id=pid, title=req.title.strip(), assignee_slug=owner,
+                   conversation_id=conv.id, parent_task_id=req.task_id, status=status)
+        session.add(sub)
+        await session.flush()   # 取 sub.id
+        sub_id = sub.id
         if req.body.strip():
             # 自产出(assistant)：作者=建卡的 agent；委派(user 指令)：作者留空（相当于负责人下达）
             body_author = "" if delegate else req.agent_slug
-            # 产出归因：自产出的正文挂到「建卡人在父任务下当前 running 的 run」（委派指令非产出，不归因）
-            body_run_id = None if delegate else await _running_run_id(req.task_id, req.agent_slug)
-            await db.execute(
-                "INSERT INTO messages (conversation_id, role, content, author_slug, run_id) VALUES (?,?,?,?,?)",
-                (conv.lastrowid, "assistant" if not delegate else "user", req.body.strip(), body_author, body_run_id))
-        await db.commit()
-    finally:
-        await db.close()
+            session.add(Message(
+                conversation_id=conv.id, role="assistant" if not delegate else "user",
+                content=req.body.strip(), author_slug=body_author, run_id=body_run_id))
+        await session.commit()
     owner_disp = await _display_name(pid, owner)
     note = (f"委派子任务给 {owner_disp}：{req.title.strip()}" if delegate
             else f"创建子任务并完成：{req.title.strip()}")
@@ -146,20 +149,18 @@ async def add_comment(req: CommentReq):
         raise HTTPException(404, "任务不存在")
     run_id = None   # 本条发言归属的 run（作因果链的 source_run_id）
     msg_id = None   # 本条发言的 message.id（作因果链的 source_message_id）
-    db = await get_connection()
-    try:
-        conv = await (await db.execute(
-            "SELECT conversation_id FROM tasks WHERE id=?", (req.task_id,))).fetchone()
-        if conv and conv["conversation_id"]:
+    async with get_session_factory()() as session:
+        conv = (await session.execute(
+            select(Task.conversation_id).where(Task.id == req.task_id))).first()
+        if conv and conv.conversation_id:
             # 产出归因：挂到该成员在本任务当前 running 的 run（拿不到留空）
             run_id = await _running_run_id(req.task_id, req.agent_slug)
-            mcur = await db.execute(
-                "INSERT INTO messages (conversation_id, role, content, author_slug, run_id) VALUES (?,?,?,?,?)",
-                (conv["conversation_id"], "assistant", req.body.strip(), req.agent_slug, run_id))
-            msg_id = mcur.lastrowid
-            await db.commit()
-    finally:
-        await db.close()
+            msg = Message(conversation_id=conv.conversation_id, role="assistant",
+                          content=req.body.strip(), author_slug=req.agent_slug, run_id=run_id)
+            session.add(msg)
+            await session.flush()   # 取 msg.id（对齐旧 lastrowid）
+            msg_id = msg.id
+            await session.commit()
     # 解析发言里的 @，继续协同（实时查负责人，团队变动即时生效）
     # 因果链：被 @ 出的下游 run 记录 source=本条发言（run_id + message_id）
     leader = await collab.get_leader_slug(parent["project_id"])
@@ -188,14 +189,11 @@ async def set_status(req: StatusReq):
     if req.status not in STATUSES:
         raise HTTPException(400, f"非法状态：{req.status}")
 
-    db = await get_connection()
-    try:
-        row = await (await db.execute(
-            "SELECT status, parent_task_id FROM tasks WHERE id=?", (req.task_id,))).fetchone()
-        old_status = row["status"] if row else ""
-        is_subtask = bool(row["parent_task_id"]) if row else False
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        row = (await session.execute(
+            select(Task.status, Task.parent_task_id).where(Task.id == req.task_id))).first()
+        old_status = row.status if row else ""
+        is_subtask = bool(row.parent_task_id) if row else False
 
     target = req.status
     downgraded = False
@@ -209,13 +207,10 @@ async def set_status(req: StatusReq):
         target = "reviewing"
         downgraded = True
 
-    db = await get_connection()
-    try:
-        await db.execute("UPDATE tasks SET status=?, updated_at=datetime('now') WHERE id=?",
-                         (target, req.task_id))
-        await db.commit()
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        await session.execute(sa_update(Task).where(Task.id == req.task_id).values(
+            status=target, updated_at=now_expr()))
+        await session.commit()
     if old_status != target:
         note = "执行完成，进入验证中，等待人工验收（Agent 不能直接标记完成）" if downgraded else ""
         await log_activity(req.task_id, "status_changed", "agent", req.agent_slug,
@@ -225,15 +220,14 @@ async def set_status(req: StatusReq):
     # 需排除自己，否则会被算成 pending 而阻止父任务收尾。
     if is_subtask and target == "done":
         import progress as _progress
-        db = await get_connection()
-        try:
-            own = await (await db.execute(
-                "SELECT id FROM run_queue WHERE task_id=? AND agent_slug=? AND status='running' "
-                "ORDER BY id DESC LIMIT 1", (req.task_id, req.agent_slug))).fetchone()
-        finally:
-            await db.close()
+        async with get_session_factory()() as session:
+            own = (await session.execute(
+                select(RunQueue.id)
+                .where(RunQueue.task_id == req.task_id, RunQueue.agent_slug == req.agent_slug,
+                       RunQueue.status == "running")
+                .order_by(RunQueue.id.desc()).limit(1))).first()
         await _progress.on_execution_complete(
-            req.task_id, exclude_run_id=own["id"] if own else None)
+            req.task_id, exclude_run_id=own.id if own else None)
     return {"ok": True, "status": target,
             **({"note": "任务需人工验收，已置为 reviewing（验证中），不能由 Agent 直接完成"} if downgraded else {})}
 

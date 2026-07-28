@@ -11,9 +11,18 @@
 """
 import asyncio
 
-from database import get_connection
-from memory import read_memory, upsert_managed_section
+from sqlalchemy import distinct, or_, select
+
 from config import is_test_project
+from memory import read_memory, upsert_managed_section
+from models import (
+    AgentProfile,
+    Message,
+    ProjectAgent,
+    Task,
+    TaskRun,
+    get_session_factory,
+)
 
 # 单角色 Know-how 条目上限，超过则触发压缩合并
 KNOWHOW_MAX = 30
@@ -32,68 +41,71 @@ async def _participants(task_id: int) -> list[dict]:
     与下游 _task_context 取产出的口径（同样按 messages）一致，无产出者在 _reflect_one 里
     context 为空自动跳过（返回 0）。去重返回 [{slug, name, provider_id}]。
     """
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         # 本任务 + 其子任务的所有 id
-        rows = await (await db.execute(
-            "SELECT id FROM tasks WHERE id=? OR parent_task_id=?", (task_id, task_id))).fetchall()
-        task_ids = [r["id"] for r in rows]
+        rows = (await session.execute(
+            select(Task.id).where(or_(Task.id == task_id, Task.parent_task_id == task_id)))).all()
+        task_ids = [r.id for r in rows]
         if not task_ids:
             return []
-        ph = ",".join("?" for _ in task_ids)
-        runs = await (await db.execute(
-            f"SELECT DISTINCT agent_slug FROM task_runs WHERE task_id IN ({ph}) AND agent_slug<>''",
-            task_ids)).fetchall()
+        runs = (await session.execute(
+            select(distinct(TaskRun.agent_slug))
+            .where(TaskRun.task_id.in_(task_ids), TaskRun.agent_slug != ""))).all()
         # 有本人 assistant 发言的成员（含直接建卡型产出，无 run）
-        says = await (await db.execute(
-            f"""SELECT DISTINCT m.author_slug FROM messages m
-                JOIN tasks tk ON tk.conversation_id=m.conversation_id
-                WHERE tk.id IN ({ph}) AND m.role='assistant' AND m.author_slug<>''""",
-            task_ids)).fetchall()
+        says = (await session.execute(
+            select(distinct(Message.author_slug))
+            .select_from(Message)
+            .join(Task, Task.conversation_id == Message.conversation_id)
+            .where(Task.id.in_(task_ids), Message.role == "assistant",
+                   Message.author_slug != ""))).all()
         slugs = list(dict.fromkeys(  # 保序去重：run 优先，再补发言型
-            [r["agent_slug"] for r in runs] + [r["author_slug"] for r in says]))
+            [r[0] for r in runs] + [r[0] for r in says]))
         if not slugs:
             return []
         # 取项目内这些角色的展示名 + 生效模型
-        prow = await (await db.execute("SELECT project_id FROM tasks WHERE id=?", (task_id,))).fetchone()
-        project_id = prow["project_id"] if prow else 0
+        prow = (await session.execute(
+            select(Task.project_id).where(Task.id == task_id))).first()
+        project_id = prow.project_id if prow else 0
         out = []
         for slug in slugs:
-            a = await (await db.execute(
-                """SELECT pa.slug, pa.name, pa.persona, p.provider_id AS provider_id, p.nickname AS nickname
-                   FROM project_agents pa LEFT JOIN agent_profiles p ON p.slug=pa.slug
-                   WHERE pa.project_id=? AND pa.slug=? LIMIT 1""", (project_id, slug))).fetchone()
-            if a and a["provider_id"]:
-                out.append(dict(a))
+            a = (await session.execute(
+                select(ProjectAgent.slug, ProjectAgent.name, ProjectAgent.persona,
+                       AgentProfile.provider_id.label("provider_id"),
+                       AgentProfile.nickname.label("nickname"))
+                .select_from(ProjectAgent)
+                .outerjoin(AgentProfile, AgentProfile.slug == ProjectAgent.slug)
+                .where(ProjectAgent.project_id == project_id, ProjectAgent.slug == slug)
+                .limit(1))).first()
+            if a and a.provider_id:
+                out.append({"slug": a.slug, "name": a.name, "persona": a.persona,
+                            "provider_id": a.provider_id, "nickname": a.nickname})
         return out
-    finally:
-        await db.close()
 
 
 async def _task_context(task_id: int, slug: str) -> str:
     """给某角色复盘用的上下文：任务标题/描述 + 本任务及子任务里该角色的发言/产出。"""
-    db = await get_connection()
-    try:
-        t = await (await db.execute(
-            "SELECT title, description, conversation_id FROM tasks WHERE id=?", (task_id,))).fetchone()
+    async with get_session_factory()() as session:
+        t = (await session.execute(
+            select(Task.title, Task.description, Task.conversation_id)
+            .where(Task.id == task_id))).first()
         if not t:
             return ""
-        parts = [f"任务：{t['title']}"]
-        if t["description"]:
-            parts.append(f"任务描述：{t['description']}")
+        parts = [f"任务：{t.title}"]
+        if t.description:
+            parts.append(f"任务描述：{t.description}")
         # 该角色在本任务 + 子任务里的发言（真实产出）
-        rows = await (await db.execute(
-            """SELECT m.content FROM messages m
-               JOIN tasks tk ON tk.conversation_id=m.conversation_id
-               WHERE (tk.id=? OR tk.parent_task_id=?) AND m.role='assistant'
-                     AND (m.author_slug=? OR m.author_slug='')
-               ORDER BY m.id""", (task_id, task_id, slug))).fetchall()
-        says = [r["content"].strip() for r in rows if (r["content"] or "").strip()]
+        rows = (await session.execute(
+            select(Message.content)
+            .select_from(Message)
+            .join(Task, Task.conversation_id == Message.conversation_id)
+            .where(or_(Task.id == task_id, Task.parent_task_id == task_id),
+                   Message.role == "assistant",
+                   or_(Message.author_slug == slug, Message.author_slug == ""))
+            .order_by(Message.id))).all()
+        says = [r.content.strip() for r in rows if (r.content or "").strip()]
         if says:
             parts.append("你在本任务中的产出/发言：\n" + "\n---\n".join(s[:1500] for s in says))
         return "\n\n".join(parts)
-    finally:
-        await db.close()
 
 
 def _extract_bullets(section_body: str) -> list[str]:
@@ -230,12 +242,10 @@ async def reflect_on_task_done(task_id: int) -> None:
     """任务进入 done 时调用：所有真正参与执行的角色各自复盘、沉淀 Know-how。
     fire-and-forget 友好——异常吞掉，绝不影响任务状态流转。测试项目跳过。"""
     try:
-        db = await get_connection()
-        try:
-            t = await (await db.execute("SELECT title FROM tasks WHERE id=?", (task_id,))).fetchone()
-        finally:
-            await db.close()
-        if not t or is_test_project(t["title"] or ""):
+        async with get_session_factory()() as session:
+            t = (await session.execute(
+                select(Task.title).where(Task.id == task_id))).first()
+        if not t or is_test_project(t.title or ""):
             return
         members = await _participants(task_id)
         if not members:

@@ -6,9 +6,11 @@ Skill = 能力说明/规范/操作要领的纯文本，运行时（P4）注入�
 import re
 from pathlib import Path
 
+from sqlalchemy import func, select, update as sa_update
+
 from agents import parse_frontmatter
 from config import load_settings
-from database import get_connection
+from models import Skill, get_session_factory
 
 _SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -106,36 +108,30 @@ def _parse_downloadable(meta: dict) -> int:
 async def rescan() -> dict:
     skills, skipped = scan_from_disk(load_settings().skills_dir)
     inserted = updated = 0
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         for s in skills:
-            ex = await (await db.execute("SELECT id FROM skills WHERE slug=?", (s["slug"],))).fetchone()
+            ex = (await session.execute(
+                select(Skill.id).where(Skill.slug == s["slug"]))).first()
             if ex:
-                await db.execute(
-                    "UPDATE skills SET name=?, description=?, source_path=?, body=?, is_dir=?, downloadable=? WHERE slug=?",
-                    (s["name"], s["description"], s["source_path"], s["body"],
-                     s.get("is_dir", 0), s.get("downloadable", 1), s["slug"]))
+                await session.execute(
+                    sa_update(Skill).where(Skill.slug == s["slug"]).values(
+                        name=s["name"], description=s["description"],
+                        source_path=s["source_path"], body=s["body"],
+                        is_dir=s.get("is_dir", 0), downloadable=s.get("downloadable", 1)))
                 updated += 1
             else:
-                await db.execute(
-                    "INSERT INTO skills (slug, name, description, source_path, body, is_dir, downloadable) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    (s["slug"], s["name"], s["description"], s["source_path"], s["body"],
-                     s.get("is_dir", 0), s.get("downloadable", 1)))
+                session.add(Skill(
+                    slug=s["slug"], name=s["name"], description=s["description"],
+                    source_path=s["source_path"], body=s["body"],
+                    is_dir=s.get("is_dir", 0), downloadable=s.get("downloadable", 1)))
                 inserted += 1
-        await db.commit()
-    finally:
-        await db.close()
+        await session.commit()
     return {"inserted": inserted, "updated": updated, "skipped": skipped, "total": inserted + updated}
 
 
 async def count_skills() -> int:
-    db = await get_connection()
-    try:
-        row = await (await db.execute("SELECT COUNT(*) FROM skills")).fetchone()
-        return row[0] if row else 0
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        return (await session.execute(select(func.count()).select_from(Skill))).scalar_one()
 
 
 def save_skill_file(slug: str, name: str, description: str, body: str) -> None:

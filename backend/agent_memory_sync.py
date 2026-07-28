@@ -6,45 +6,53 @@ Skill（名称+描述+何时调用）。两段都从 DB 真实状态实时重建
 
 触发点：加入项目 / 移除 / 配 Skills 后调用 sync_agent_memory(slug)。
 """
+from sqlalchemy import select
+
 from config import is_test_project
-from database import get_connection
 from memory import upsert_managed_section
+from models import AgentSkill, Project, ProjectAgent, Skill, get_session_factory
 
 
-async def _workspace_body(db, slug: str) -> str:
-    cur = await db.execute(
-        """SELECT p.title, p.local_path
-           FROM project_agents pa JOIN projects p ON p.id = pa.project_id
-           WHERE pa.slug = ? ORDER BY p.title""", (slug,))
-    rows = await cur.fetchall()
+async def _workspace_body(session, slug: str) -> str:
+    # ORM：project_agents JOIN projects，取该 slug 所在项目的标题+路径（S3.4）
+    result = await session.execute(
+        select(Project.title, Project.local_path)
+        .join(ProjectAgent, ProjectAgent.project_id == Project.id)
+        .where(ProjectAgent.slug == slug)
+        .order_by(Project.title)
+    )
+    rows = result.all()
     # 测试项目不进入 Agent 记忆的工作区段落
-    rows = [r for r in rows if not is_test_project(r["title"])]
+    rows = [r for r in rows if not is_test_project(r.title)]
     if not rows:
         return ""
     lines = ["## 🗂️ 工作区（系统维护，请遵守）", "",
              "你在以下项目中工作。**只能在对应项目的本地路径内操作文件，不得越界到其他目录**："]
     for r in rows:
-        lines.append(f"- **{r['title']}** → `{r['local_path']}`")
+        lines.append(f"- **{r.title}** → `{r.local_path}`")
     lines.append("")
     lines.append("开始任何任务前，先确认当前任务属于哪个项目，并把操作限定在该项目路径内。")
     return "\n".join(lines)
 
 
-async def _skills_body(db, slug: str) -> str:
-    cur = await db.execute(
-        """SELECT s.name, s.description, s.body
-           FROM agent_skills a JOIN skills s ON s.slug = a.skill_slug
-           WHERE a.agent_slug = ? ORDER BY s.name""", (slug,))
-    rows = await cur.fetchall()
+async def _skills_body(session, slug: str) -> str:
+    # ORM：agent_skills JOIN skills，取该 agent 启用的 Skill 名称/描述/正文（S3.4）
+    result = await session.execute(
+        select(Skill.name, Skill.description, Skill.body)
+        .join(AgentSkill, AgentSkill.skill_slug == Skill.slug)
+        .where(AgentSkill.agent_slug == slug)
+        .order_by(Skill.name)
+    )
+    rows = result.all()
     if not rows:
         return ""
     lines = ["## 🧩 可用 Skills（系统维护）", "",
              "你已被赋予以下 Skill。遇到对应场景时，**主动调用对应 Skill 的能力指令**来完成工作："]
     for r in rows:
-        desc = r["description"] or "（无描述）"
-        lines.append(f"- **{r['name']}**：{desc}")
+        desc = r.description or "（无描述）"
+        lines.append(f"- **{r.name}**：{desc}")
         # 取正文首行作为“何时/如何使用”的提示，避免把整段塞进记忆
-        first = next((ln.strip() for ln in (r["body"] or "").splitlines() if ln.strip()), "")
+        first = next((ln.strip() for ln in (r.body or "").splitlines() if ln.strip()), "")
         if first:
             lines.append(f"  - 使用要领：{first}")
     lines.append("")
@@ -54,11 +62,8 @@ async def _skills_body(db, slug: str) -> str:
 
 async def sync_agent_memory(slug: str) -> None:
     """重建该 Agent 记忆里的“工作区”和“可用 Skills”受管段落。"""
-    db = await get_connection()
-    try:
-        ws = await _workspace_body(db, slug)
-        sk = await _skills_body(db, slug)
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        ws = await _workspace_body(session, slug)
+        sk = await _skills_body(session, slug)
     upsert_managed_section(slug, "workspace", ws)
     upsert_managed_section(slug, "skills", sk)

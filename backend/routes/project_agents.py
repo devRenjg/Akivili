@@ -9,11 +9,23 @@ from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 import projects as projects_mod
-from database import get_connection
+from sqlalchemy import delete as sa_delete, literal_column, select, update as sa_update
+
 from agent_memory_sync import sync_agent_memory
 from auth import require_admin
+from models import AgentProfile, AgentTemplate, ProjectAgent, get_session_factory
 
 router = APIRouter(prefix="/api/projects", tags=["project-agents"])
+
+# project_agents 物理列序（对齐 001 基线），SELECT pa.* → dict 保持键集合/顺序
+_PA_COLS = (
+    "id", "project_id", "template_id", "slug", "name", "emoji", "color",
+    "persona", "provider_id", "enabled", "created_at", "is_leader",
+)
+
+
+def _pa_dict(pa: ProjectAgent) -> dict:
+    return {c: getattr(pa, c) for c in _PA_COLS}
 
 
 async def _ensure_project(pid: int):
@@ -45,43 +57,49 @@ class UpdateAgentRequest(BaseModel):
 @router.get("/{pid}/agents")
 async def list_project_agents(pid: int):
     await _ensure_project(pid)
-    db = await get_connection()
-    try:
-        cur = await db.execute(
-            """SELECT pa.*, p.nickname AS nickname, p.avatar AS avatar,
-               (SELECT COUNT(DISTINCT tr.task_id) FROM task_runs tr JOIN tasks tk ON tk.id = tr.task_id
-                WHERE tr.agent_slug = pa.slug AND tr.status = 'succeeded' AND tk.status = 'done'
-                  AND (tk.parent_task_id IS NULL OR EXISTS
-                       (SELECT 1 FROM tasks pt WHERE pt.id = tk.parent_task_id))) AS solved_tasks
-               FROM project_agents pa
-               LEFT JOIN agent_profiles p ON p.slug = pa.slug
-               WHERE pa.project_id=? ORDER BY pa.is_leader DESC, pa.id""", (pid,))
-        return {"agents": [dict(r) for r in await cur.fetchall()]}
-    finally:
-        await db.close()
+    # solved_tasks 相关子查询：逐字保留原 SQL 语义（嵌套 EXISTS + DISTINCT count），
+    # 用 literal_column 承载原始标量子查询、绑定当前行 project_agents.slug，
+    # 避免翻译嵌套逻辑出偏差。（text() 不支持 .label，故用 literal_column）
+    solved = literal_column(
+        "(SELECT COUNT(DISTINCT tr.task_id) FROM task_runs tr JOIN tasks tk ON tk.id = tr.task_id "
+        "WHERE tr.agent_slug = project_agents.slug AND tr.status = 'succeeded' AND tk.status = 'done' "
+        "AND (tk.parent_task_id IS NULL OR EXISTS "
+        "(SELECT 1 FROM tasks pt WHERE pt.id = tk.parent_task_id)))"
+    )
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(ProjectAgent,
+                   AgentProfile.nickname.label("nickname"),
+                   AgentProfile.avatar.label("avatar"),
+                   solved.label("solved_tasks"))
+            .select_from(ProjectAgent)
+            .outerjoin(AgentProfile, AgentProfile.slug == ProjectAgent.slug)
+            .where(ProjectAgent.project_id == pid)
+            .order_by(ProjectAgent.is_leader.desc(), ProjectAgent.id))).all()
+        agents = []
+        for pa, nickname, avatar, solved_tasks in rows:
+            d = _pa_dict(pa)
+            d["nickname"] = nickname
+            d["avatar"] = avatar
+            d["solved_tasks"] = solved_tasks
+            agents.append(d)
+        return {"agents": agents}
 
 
 @router.post("/{pid}/agents/import", dependencies=[Depends(require_admin)])
 async def import_agent(pid: int, req: ImportAgentRequest):
     await _ensure_project(pid)
-    db = await get_connection()
-    try:
-        tpl = await (await db.execute(
-            "SELECT * FROM agent_templates WHERE id=?", (req.template_id,))).fetchone()
+    async with get_session_factory()() as session:
+        tpl = (await session.execute(
+            select(AgentTemplate).where(AgentTemplate.id == req.template_id))).scalar_one_or_none()
         if not tpl:
             raise HTTPException(404, "模版不存在")
-        cur = await db.execute(
-            """INSERT INTO project_agents
-               (project_id, template_id, slug, name, emoji, color, persona)
-               VALUES (?,?,?,?,?,?,?)""",
-            (pid, tpl["id"], tpl["slug"], tpl["name"], tpl["emoji"], tpl["color"], tpl["body"]),
-        )
-        await db.commit()
-        row = await (await db.execute(
-            "SELECT * FROM project_agents WHERE id=?", (cur.lastrowid,))).fetchone()
-        result = dict(row)
-    finally:
-        await db.close()
+        pa = ProjectAgent(project_id=pid, template_id=tpl.id, slug=tpl.slug, name=tpl.name,
+                          emoji=tpl.emoji, color=tpl.color, persona=tpl.body)
+        session.add(pa)
+        await session.commit()
+        await session.refresh(pa)
+        result = _pa_dict(pa)
     await sync_agent_memory(result["slug"])   # 把工作区写进该 Agent 记忆
     return result
 
@@ -93,23 +111,17 @@ async def create_agent(pid: int, req: CreateAgentRequest):
         raise HTTPException(400, "Agent 名称不能为空")
     # 自建 Agent 的记忆 slug：custom-<项目>-<安全化名称>-<行号>，保证全局唯一且合法
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", req.name.strip()).strip("-") or "agent"
-    db = await get_connection()
-    try:
-        cur = await db.execute(
-            """INSERT INTO project_agents
-               (project_id, template_id, slug, name, emoji, color, persona, provider_id)
-               VALUES (?, NULL, ?,?,?,?,?,?)""",
-            (pid, "", req.name.strip(), req.emoji, req.color, req.persona, req.provider_id),
-        )
-        aid = cur.lastrowid
-        slug = f"custom-{pid}-{safe}-{aid}"
-        await db.execute("UPDATE project_agents SET slug=? WHERE id=?", (slug, aid))
-        await db.commit()
-        row = await (await db.execute(
-            "SELECT * FROM project_agents WHERE id=?", (cur.lastrowid,))).fetchone()
-        result = dict(row)
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        pa = ProjectAgent(project_id=pid, template_id=None, slug="", name=req.name.strip(),
+                          emoji=req.emoji, color=req.color, persona=req.persona,
+                          provider_id=req.provider_id)
+        session.add(pa)
+        await session.flush()   # 取 pa.id（对齐旧 lastrowid），再用它拼 slug
+        aid = pa.id
+        pa.slug = f"custom-{pid}-{safe}-{aid}"
+        await session.commit()
+        await session.refresh(pa)
+        result = _pa_dict(pa)
     await sync_agent_memory(result["slug"])
     return result
 
@@ -121,38 +133,33 @@ async def update_agent(pid: int, agent_id: int, req: UpdateAgentRequest):
     sets = {k: v for k, v in req.model_dump().items() if k in allowed and v is not None}
     if not sets:
         raise HTTPException(400, "无可更新字段")
-    cols = ", ".join(f"{k}=?" for k in sets)
-    db = await get_connection()
-    try:
-        cur = await db.execute(
-            f"UPDATE project_agents SET {cols} WHERE id=? AND project_id=?",
-            (*sets.values(), agent_id, pid),
-        )
-        await db.commit()
-        if cur.rowcount == 0:
+    async with get_session_factory()() as session:
+        result = await session.execute(
+            sa_update(ProjectAgent)
+            .where(ProjectAgent.id == agent_id, ProjectAgent.project_id == pid)
+            .values(**sets))
+        await session.commit()
+        if result.rowcount == 0:
             raise HTTPException(404, "该项目下不存在此 Agent")
-        row = await (await db.execute(
-            "SELECT * FROM project_agents WHERE id=?", (agent_id,))).fetchone()
-        return dict(row)
-    finally:
-        await db.close()
+        pa = (await session.execute(
+            select(ProjectAgent).where(ProjectAgent.id == agent_id))).scalar_one()
+        return _pa_dict(pa)
 
 
 @router.delete("/{pid}/agents/{agent_id}", dependencies=[Depends(require_admin)])
 async def remove_agent(pid: int, agent_id: int):
     await _ensure_project(pid)
-    db = await get_connection()
-    try:
-        row = await (await db.execute(
-            "SELECT slug FROM project_agents WHERE id=? AND project_id=?", (agent_id, pid))).fetchone()
-        cur = await db.execute(
-            "DELETE FROM project_agents WHERE id=? AND project_id=?", (agent_id, pid))
-        await db.commit()
-        if cur.rowcount == 0:
+    async with get_session_factory()() as session:
+        row = (await session.execute(
+            select(ProjectAgent.slug)
+            .where(ProjectAgent.id == agent_id, ProjectAgent.project_id == pid))).first()
+        result = await session.execute(
+            sa_delete(ProjectAgent)
+            .where(ProjectAgent.id == agent_id, ProjectAgent.project_id == pid))
+        await session.commit()
+        if result.rowcount == 0:
             raise HTTPException(404, "该项目下不存在此 Agent")
-        slug = row["slug"]
-    finally:
-        await db.close()
+        slug = row.slug
     await sync_agent_memory(slug)   # 从剩余项目重建工作区段落
     return {"ok": True}
 
@@ -161,15 +168,16 @@ async def remove_agent(pid: int, agent_id: int):
 async def set_leader(pid: int, agent_id: int):
     """把某成员设为团队总负责人（Team Leader）；自动取消原负责人。每项目至多一个。"""
     await _ensure_project(pid)
-    db = await get_connection()
-    try:
-        exists = await (await db.execute(
-            "SELECT id FROM project_agents WHERE id=? AND project_id=?", (agent_id, pid))).fetchone()
+    async with get_session_factory()() as session:
+        exists = (await session.execute(
+            select(ProjectAgent.id)
+            .where(ProjectAgent.id == agent_id, ProjectAgent.project_id == pid))).first()
         if not exists:
             raise HTTPException(404, "该项目下不存在此 Agent")
-        await db.execute("UPDATE project_agents SET is_leader=0 WHERE project_id=?", (pid,))
-        await db.execute("UPDATE project_agents SET is_leader=1 WHERE id=?", (agent_id,))
-        await db.commit()
+        # 先清本项目所有负责人标记，再设当前为负责人（每项目至多一个）
+        await session.execute(
+            sa_update(ProjectAgent).where(ProjectAgent.project_id == pid).values(is_leader=0))
+        await session.execute(
+            sa_update(ProjectAgent).where(ProjectAgent.id == agent_id).values(is_leader=1))
+        await session.commit()
         return {"ok": True}
-    finally:
-        await db.close()

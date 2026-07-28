@@ -100,7 +100,7 @@ def run_probe(tmp: Path) -> Probe:
                 _export_schema(empty_db) == baseline,
                 "18 tables byte-for-byte" if _export_schema(empty_db) == baseline else "SCHEMA DIFF")
     probe.check("empty DB table count == 18", _table_count(empty_db) == 18, f"{_table_count(empty_db)} tables")
-    probe.check("alembic_version stamped to 001", _version(empty_db) == "001", f"v={_version(empty_db)}")
+    probe.check("alembic_version stamped to head(002)", _version(empty_db) == "002", f"v={_version(empty_db)}")
     jm = sqlite3.connect(empty_db).execute("PRAGMA journal_mode").fetchone()[0]
     probe.check("migration path leaves DB in WAL", str(jm).lower() == "wal", f"journal_mode={jm}")
     action2 = db_migrate.run_migrations()
@@ -120,10 +120,32 @@ def run_probe(tmp: Path) -> Probe:
     probe.check("legacy DB run_migrations action=stamp", action3 == "stamp", f"got {action3}")
     probe.check("legacy DB NOT recreated (still 2 tables)", _table_count(legacy_db) == 2,
                 f"{_table_count(legacy_db)} tables")
-    probe.check("legacy DB stamped to 001", _version(legacy_db) == "001", f"v={_version(legacy_db)}")
+    probe.check("legacy DB stamped to head(002)", _version(legacy_db) == "002", f"v={_version(legacy_db)}")
     kept = sqlite3.connect(legacy_db).execute("SELECT title FROM projects").fetchone()
     probe.check("legacy DB data preserved", bool(kept) and kept[0] == "legacy-keep",
                 f"projects.title={kept[0] if kept else None}")
+
+    # --- Check 6 (S3.6): 002 数据规整——planning→backlog / archived→done ---
+    # 走 upgrade 链精确验证 002.upgrade 的数据逻辑：upgrade 到 001(仅建表) → 插废弃状态行
+    # → upgrade 到 002(跑数据规整) → 校验。（stamp 只打版本、不执行迁移体，故不能靠 stamp 验。）
+    from alembic import command as _command  # noqa: PLC0415
+    norm_db = str(tmp / "normalize.db")
+    os.environ["ALEMBIC_DB_PATH"] = norm_db
+    cfg_n = db_migrate._alembic_config()
+    _command.upgrade(cfg_n, "001")   # 只到 001（建表，未跑 002）
+    ndb = sqlite3.connect(norm_db)
+    ndb.execute("INSERT INTO tasks (project_id, title, status) VALUES (1,'旧规划态','planning')")
+    ndb.execute("INSERT INTO tasks (project_id, title, status) VALUES (1,'旧归档态','archived')")
+    ndb.execute("INSERT INTO tasks (project_id, title, status) VALUES (1,'正常态','in_progress')")
+    ndb.commit()
+    ndb.close()
+    _command.upgrade(cfg_n, "002")   # 跑 002 数据规整
+    ndb = sqlite3.connect(norm_db)
+    st = {t: s for t, s in ndb.execute("SELECT title, status FROM tasks").fetchall()}
+    ndb.close()
+    probe.check("002: planning→backlog", st.get("旧规划态") == "backlog", f"got {st.get('旧规划态')}")
+    probe.check("002: archived→done", st.get("旧归档态") == "done", f"got {st.get('旧归档态')}")
+    probe.check("002: 其它状态不动", st.get("正常态") == "in_progress", f"got {st.get('正常态')}")
 
     # --- Check 4: 往返 upgrade → downgrade base → upgrade 无损 ---
     from alembic import command  # noqa: PLC0415

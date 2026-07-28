@@ -11,8 +11,9 @@ import os
 import secrets
 
 from fastapi import Request, HTTPException
+from sqlalchemy import select
 
-from database import get_connection
+from models import User, get_session_factory
 
 COOKIE_NAME = "akivili_token"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 天
@@ -38,31 +39,25 @@ def verify_password(password: str, hashed: str, salt: str) -> bool:
 
 async def seed_admin() -> None:
     """首次启动播种管理员；已存在则跳过。"""
-    db = await get_connection()
-    try:
-        cur = await db.execute("SELECT id FROM users WHERE username=?", (SEED_ADMIN_USERNAME,))
-        if await cur.fetchone():
+    async with get_session_factory()() as session:
+        exists = (await session.execute(
+            select(User.id).where(User.username == SEED_ADMIN_USERNAME))).first()
+        if exists:
             return
         hashed, salt = hash_password(SEED_ADMIN_PASSWORD)
-        await db.execute(
-            "INSERT INTO users (username, password_hash, password_salt, role) VALUES (?,?,?, 'admin')",
-            (SEED_ADMIN_USERNAME, hashed, salt))
-        await db.commit()
-    finally:
-        await db.close()
+        session.add(User(username=SEED_ADMIN_USERNAME, password_hash=hashed,
+                         password_salt=salt, role="admin"))
+        await session.commit()
 
 
 async def _user_from_token(request: Request) -> dict | None:
     token = request.cookies.get(COOKIE_NAME)
     if not token:
         return None
-    db = await get_connection()
-    try:
-        row = await (await db.execute(
-            "SELECT id, username, role FROM users WHERE token=?", (token,))).fetchone()
-    finally:
-        await db.close()
-    return {"id": row["id"], "username": row["username"], "role": row["role"]} if row else None
+    async with get_session_factory()() as session:
+        row = (await session.execute(
+            select(User.id, User.username, User.role).where(User.token == token))).first()
+    return {"id": row.id, "username": row.username, "role": row.role} if row else None
 
 
 async def current_user(request: Request) -> dict | None:

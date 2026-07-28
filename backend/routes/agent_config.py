@@ -6,9 +6,11 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
-from database import get_connection
+from sqlalchemy import select
+
 from agent_memory_sync import sync_agent_memory
 from auth import require_admin
+from models import AgentProfile, AgentSkill, get_session_factory, now_expr, upsert
 
 router = APIRouter(prefix="/api/agent-config", tags=["agent-config"])
 
@@ -16,35 +18,31 @@ router = APIRouter(prefix="/api/agent-config", tags=["agent-config"])
 @router.get("/{slug}")
 async def get_config(slug: str):
     """返回某 Agent 的接入模型、启用 skills、昵称、头像。"""
-    db = await get_connection()
-    try:
-        prof = await (await db.execute(
-            "SELECT provider_id, nickname, avatar FROM agent_profiles WHERE slug=?", (slug,))).fetchone()
-        rows = await (await db.execute(
-            "SELECT skill_slug FROM agent_skills WHERE agent_slug=?", (slug,))).fetchall()
+    async with get_session_factory()() as session:
+        prof = (await session.execute(
+            select(AgentProfile.provider_id, AgentProfile.nickname, AgentProfile.avatar)
+            .where(AgentProfile.slug == slug))).first()
+        rows = (await session.execute(
+            select(AgentSkill.skill_slug).where(AgentSkill.agent_slug == slug))).all()
         return {
             "slug": slug,
-            "provider_id": prof["provider_id"] if prof else "",
-            "nickname": prof["nickname"] if prof else "",
-            "avatar": prof["avatar"] if prof else "",
-            "skill_slugs": [r["skill_slug"] for r in rows],
+            "provider_id": prof.provider_id if prof else "",
+            "nickname": prof.nickname if prof else "",
+            "avatar": prof.avatar if prof else "",
+            "skill_slugs": [r.skill_slug for r in rows],
         }
-    finally:
-        await db.close()
 
 
 @router.get("/taken/list")
 async def taken(exclude: str = ""):
     """已被占用的头像与昵称（供编辑资料时过滤/查重）。exclude=当前 slug（排除自己）。"""
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(
-            "SELECT slug, nickname, avatar FROM agent_profiles WHERE slug != ?", (exclude,))).fetchall()
-        avatars = sorted({r["avatar"] for r in rows if r["avatar"]})
-        nicknames = sorted({r["nickname"] for r in rows if r["nickname"]})
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(AgentProfile.slug, AgentProfile.nickname, AgentProfile.avatar)
+            .where(AgentProfile.slug != exclude))).all()
+        avatars = sorted({r.avatar for r in rows if r.avatar})
+        nicknames = sorted({r.nickname for r in rows if r.nickname})
         return {"avatars": avatars, "nicknames": nicknames}
-    finally:
-        await db.close()
 
 
 class SetProfileRequest(BaseModel):
@@ -58,24 +56,21 @@ async def set_profile(slug: str, req: SetProfileRequest):
     from fastapi import HTTPException
     nickname = req.nickname.strip()[:40]
     avatar = req.avatar.strip()
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         if nickname:
-            dup = await (await db.execute(
-                "SELECT slug FROM agent_profiles WHERE nickname=? AND slug!=?", (nickname, slug))).fetchone()
+            dup = (await session.execute(
+                select(AgentProfile.slug)
+                .where(AgentProfile.nickname == nickname, AgentProfile.slug != slug))).first()
             if dup:
                 raise HTTPException(409, f"昵称「{nickname}」已被占用，请换一个")
-        await db.execute(
-            """INSERT INTO agent_profiles (slug, nickname, avatar, updated_at)
-               VALUES (?, ?, ?, datetime('now'))
-               ON CONFLICT(slug) DO UPDATE SET nickname=excluded.nickname,
-                                               avatar=excluded.avatar,
-                                               updated_at=datetime('now')""",
-            (slug, nickname, avatar))
-        await db.commit()
+        # upsert：冲突(slug)则更新 nickname/avatar/updated_at（对齐旧 ON CONFLICT DO UPDATE）
+        await session.execute(upsert(
+            AgentProfile, ["slug"],
+            insert_values={"slug": slug, "nickname": nickname, "avatar": avatar,
+                           "updated_at": now_expr()},
+            update_values={"nickname": nickname, "avatar": avatar, "updated_at": now_expr()}))
+        await session.commit()
         return {"ok": True}
-    finally:
-        await db.close()
 
 
 class SetModelRequest(BaseModel):
@@ -84,18 +79,15 @@ class SetModelRequest(BaseModel):
 
 @router.put("/{slug}/model", dependencies=[Depends(require_admin)])
 async def set_model(slug: str, req: SetModelRequest):
-    db = await get_connection()
-    try:
-        await db.execute(
-            """INSERT INTO agent_profiles (slug, provider_id, updated_at)
-               VALUES (?, ?, datetime('now'))
-               ON CONFLICT(slug) DO UPDATE SET provider_id=excluded.provider_id,
-                                               updated_at=datetime('now')""",
-            (slug, req.provider_id))
-        await db.commit()
+    async with get_session_factory()() as session:
+        # upsert：冲突(slug)则更新 provider_id/updated_at
+        await session.execute(upsert(
+            AgentProfile, ["slug"],
+            insert_values={"slug": slug, "provider_id": req.provider_id,
+                           "updated_at": now_expr()},
+            update_values={"provider_id": req.provider_id, "updated_at": now_expr()}))
+        await session.commit()
         return {"ok": True}
-    finally:
-        await db.close()
 
 
 class SetSkillsRequest(BaseModel):
@@ -105,14 +97,11 @@ class SetSkillsRequest(BaseModel):
 @router.put("/{slug}/skills", dependencies=[Depends(require_admin)])
 async def set_skills(slug: str, req: SetSkillsRequest):
     """重写该 Agent 启用的 Skill 集合。"""
-    db = await get_connection()
-    try:
-        await db.execute("DELETE FROM agent_skills WHERE agent_slug=?", (slug,))
+    from sqlalchemy import delete as sa_delete
+    async with get_session_factory()() as session:
+        await session.execute(sa_delete(AgentSkill).where(AgentSkill.agent_slug == slug))
         for ss in dict.fromkeys(req.skill_slugs):   # 去重保序
-            await db.execute(
-                "INSERT INTO agent_skills (agent_slug, skill_slug) VALUES (?,?)", (slug, ss))
-        await db.commit()
-    finally:
-        await db.close()
+            session.add(AgentSkill(agent_slug=slug, skill_slug=ss))
+        await session.commit()
     await sync_agent_memory(slug)   # 把 Skills 使用说明写进该 Agent 记忆
     return {"ok": True}
