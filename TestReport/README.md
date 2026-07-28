@@ -29,6 +29,21 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 # 保留临时目录排查：加 --keep
 ```
 
+### CI 门禁（一键全量）
+
+```bash
+# 跑全部 40 项门禁（39 隔离 probe + QA 主套件），任一失败即非零退出
+python TestReport/run_ci_suite.py
+python TestReport/run_ci_suite.py --list          # 只列清单不跑
+python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
+```
+
+- **GitHub Actions**（`.github/workflows/ci.yml`）：push 到 master + 所有 PR 自动跑
+  `run_ci_suite.py`，**PR 必须绿**。runner 用 `windows-latest`（与开发环境一致）。
+- probe 清单只在 `run_ci_suite.py` 的 `GATE` 里维护一处——新增 probe 时同步加入。
+- 门禁**不含**需真实 CLI 的 `run_collab_scenario.py` / `run_codex_cli_smoke.py`（人工按需单跑）。
+- 实测：**40/40 项、1125 断言、~48s 全绿**（2026-07-28）。
+
 ## 测试矩阵
 
 > 实测通过数截至 2026-07-08。`*` = 需真实 CLI 供应商，非隔离桩。
