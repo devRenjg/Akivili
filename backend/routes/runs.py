@@ -7,14 +7,44 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 import projects as projects_mod
-from database import get_connection
+from sqlalchemy import distinct, func, select, update as sa_update
+
 from executor import runner
 from auth import require_admin
+from models import (
+    AgentProfile,
+    Message,
+    Project,
+    ProjectAgent,
+    RunEvent,
+    RunLog,
+    RunQueue,
+    Task,
+    TaskRun,
+    get_session_factory,
+    now_expr,
+)
 from timeutil import to_beijing
 from redact import redact_secrets
 import collab
 
 router = APIRouter(prefix="/api", tags=["runs"])
+
+# task_runs 物理列序（对齐 001 基线），SELECT * → dict 保持键集合/顺序
+_TASK_RUN_COLS = (
+    "id", "task_id", "conversation_id", "agent_slug", "status", "provider_id",
+    "pid", "started_at", "ended_at", "fail_reason",
+)
+# project_agents 物理列序（_load_task_and_agent 的 SELECT * 用）
+_PA_COLS = (
+    "id", "project_id", "template_id", "slug", "name", "emoji", "color",
+    "persona", "provider_id", "enabled", "created_at", "is_leader",
+)
+# tasks 物理列序（_load_task_and_agent / auto_dispatch 的 SELECT t.* 用）
+_TASK_COLS = (
+    "id", "project_id", "title", "description", "status", "assignee_slug",
+    "conversation_id", "order_idx", "created_at", "updated_at", "priority", "parent_task_id",
+)
 
 
 class DispatchRequest(BaseModel):
@@ -24,30 +54,31 @@ class DispatchRequest(BaseModel):
 
 async def _load_task_and_agent(task_id: int, override_slug: str):
     """取任务（含项目路径）与负责 Agent（含 persona + 生效 provider_id）。"""
-    db = await get_connection()
-    try:
-        task = await (await db.execute(
-            """SELECT t.*, p.local_path AS project_dir
-               FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id=?""", (task_id,))).fetchone()
-        if not task:
+    async with get_session_factory()() as session:
+        trow = (await session.execute(
+            select(Task, Project.local_path.label("project_dir"))
+            .join(Project, Project.id == Task.project_id)
+            .where(Task.id == task_id))).first()
+        if not trow:
             return None, None
-        task = dict(task)
+        t_obj, project_dir = trow
+        task = {c: getattr(t_obj, c) for c in _TASK_COLS}
+        task["project_dir"] = project_dir
         slug = override_slug or task["assignee_slug"]
         if not slug:
             return task, None
-        agent = await (await db.execute(
-            "SELECT * FROM project_agents WHERE project_id=? AND slug=? LIMIT 1",
-            (task["project_id"], slug))).fetchone()
-        if not agent:
+        pa = (await session.execute(
+            select(ProjectAgent)
+            .where(ProjectAgent.project_id == task["project_id"], ProjectAgent.slug == slug)
+            .limit(1))).scalar_one_or_none()
+        if not pa:
             return task, None
-        agent = dict(agent)
+        agent = {c: getattr(pa, c) for c in _PA_COLS}
         # 生效 provider：按 slug 从 agent_profiles 取（跨项目共享的接入模型）
-        prof = await (await db.execute(
-            "SELECT provider_id FROM agent_profiles WHERE slug=?", (slug,))).fetchone()
-        agent["provider_id_effective"] = prof["provider_id"] if prof else ""
+        prof = (await session.execute(
+            select(AgentProfile.provider_id).where(AgentProfile.slug == slug))).first()
+        agent["provider_id_effective"] = prof.provider_id if prof else ""
         return task, agent
-    finally:
-        await db.close()
 
 
 @router.post("/tasks/{task_id}/dispatch")
@@ -115,20 +146,17 @@ async def _reactivate_on_redispatch(task_id: int, parent_id, status: str) -> Non
     targets = []
     if status in ("done", "reviewing"):
         targets.append(task_id)
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         if parent_id:
-            prow = await (await db.execute(
-                "SELECT status FROM tasks WHERE id=?", (parent_id,))).fetchone()
-            if prow and prow["status"] in ("done", "reviewing"):
+            prow = (await session.execute(
+                select(Task.status).where(Task.id == parent_id))).first()
+            if prow and prow.status in ("done", "reviewing"):
                 targets.append(parent_id)
         for tid in targets:
-            await db.execute(
-                "UPDATE tasks SET status='in_progress', updated_at=datetime('now') WHERE id=?", (tid,))
+            await session.execute(sa_update(Task).where(Task.id == tid).values(
+                status="in_progress", updated_at=now_expr()))
         if targets:
-            await db.commit()
-    finally:
-        await db.close()
+            await session.commit()
     for tid in targets:
         await log_activity(tid, "status_changed", "system", "",
                            {"to": "in_progress", "note": "重新触发执行，回到进行中"})
@@ -138,13 +166,11 @@ async def _first_mentioned_slug(project_id: int, text: str) -> str:
     """从任务描述里解析首个 @ 成员，按项目成员名匹配，返回其 slug。"""
     if not text or "@" not in text:
         return ""
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(
-            "SELECT slug, name FROM project_agents WHERE project_id=?", (project_id,))).fetchall()
-    finally:
-        await db.close()
-    members = [(r["slug"], r["name"]) for r in rows]
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(ProjectAgent.slug, ProjectAgent.name)
+            .where(ProjectAgent.project_id == project_id))).all()
+    members = [(r.slug, r.name) for r in rows]
     # 按名字长度降序匹配，避免短名误命中
     members.sort(key=lambda x: len(x[1]), reverse=True)
     import re
@@ -159,16 +185,16 @@ async def _first_mentioned_slug(project_id: int, text: str) -> str:
 @router.post("/tasks/{task_id}/auto-dispatch", dependencies=[Depends(require_admin)])
 async def auto_dispatch(task_id: int):
     """拖到「进行中」触发：唤醒该任务的负责人 Owner 统筹（对结果负责、拉人协调）。"""
-    db = await get_connection()
-    try:
-        task = await (await db.execute(
-            """SELECT t.*, p.local_path AS project_dir
-               FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=?""", (task_id,))).fetchone()
-        if not task:
+    async with get_session_factory()() as session:
+        trow = (await session.execute(
+            select(Task, Project.local_path.label("project_dir"))
+            .join(Project, Project.id == Task.project_id)
+            .where(Task.id == task_id))).first()
+        if not trow:
             raise HTTPException(404, "任务不存在")
-        task = dict(task)
-    finally:
-        await db.close()
+        t_obj, project_dir = trow
+        task = {c: getattr(t_obj, c) for c in _TASK_COLS}
+        task["project_dir"] = project_dir
 
     # 重跑即时回写：若该任务已 done/reviewing（重新触发执行），立即把它——以及其父任务
     # （若已 done/reviewing）——回写 in_progress，不等 3 秒轮询聚合，消除「先显已完成、隔几秒才变进行中」的滞后。
@@ -222,60 +248,59 @@ async def kill(req: KillRequest):
 
 @router.get("/tasks/{task_id}/messages")
 async def get_messages(task_id: int):
-    db = await get_connection()
-    try:
-        task = await (await db.execute("SELECT conversation_id FROM tasks WHERE id=?", (task_id,))).fetchone()
+    async with get_session_factory()() as session:
+        task = (await session.execute(
+            select(Task.conversation_id).where(Task.id == task_id))).first()
         if not task:
             raise HTTPException(404, "任务不存在")
-        rows = await (await db.execute(
-            "SELECT role, content, created_at FROM messages WHERE conversation_id=? ORDER BY id",
-            (task["conversation_id"],))).fetchall()
-        return {"messages": [{**dict(r), "created_at": to_beijing(r["created_at"])} for r in rows]}
-    finally:
-        await db.close()
+        rows = (await session.execute(
+            select(Message.role, Message.content, Message.created_at)
+            .where(Message.conversation_id == task.conversation_id)
+            .order_by(Message.id))).all()
+        return {"messages": [{"role": r.role, "content": r.content,
+                              "created_at": to_beijing(r.created_at)} for r in rows]}
 
 
 @router.get("/tasks/{task_id}/runs")
 async def get_runs(task_id: int):
     """任务的执行历史列表。每条附一行 summary（命令缩略版）供执行日志区紧凑展示。"""
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(
-            "SELECT * FROM task_runs WHERE task_id=? ORDER BY id DESC", (task_id,))).fetchall()
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(TaskRun).where(TaskRun.task_id == task_id)
+            .order_by(TaskRun.id.desc()))).scalars().all()
         out = []
         for r in rows:
-            d = dict(r)
+            d = {c: getattr(r, c) for c in _TASK_RUN_COLS}
             for col in ("started_at", "ended_at"):
-                if col in d:
-                    d[col] = to_beijing(d[col])
-            d["summary"] = await _run_summary(db, r["id"])
+                d[col] = to_beijing(d[col])
+            d["summary"] = await _run_summary(session, r.id)
             out.append(d)
         return {"runs": out}
-    finally:
-        await db.close()
 
 
-async def _run_summary(db, run_id: int) -> str:
+async def _run_summary(session, run_id: int) -> str:
     """一行运行摘要：取这次会话开始的几句话（Agent 的开场发言/文本），而非工具命令。
 
     优先该 run 的首条助手文本（stdout / thinking）；都没有时才回退到首个工具动作。
     """
     # 首条会话文本（助手流式发言优先，其次思考）——即"会话开始的前几句话"
-    trow = await (await db.execute(
-        "SELECT content FROM run_logs WHERE run_id=? AND channel IN ('stdout','thinking') "
-        "ORDER BY id LIMIT 1", (run_id,))).fetchone()
-    if trow and (trow["content"] or "").strip():
-        s = trow["content"].strip().replace("\n", " ")
+    trow = (await session.execute(
+        select(RunLog.content)
+        .where(RunLog.run_id == run_id, RunLog.channel.in_(("stdout", "thinking")))
+        .order_by(RunLog.id).limit(1))).first()
+    if trow and (trow.content or "").strip():
+        s = trow.content.strip().replace("\n", " ")
         return redact_secrets(s[:80])
     # 回退：首个工具动作（无任何文本时）
-    tool = await (await db.execute(
-        "SELECT tool, tool_input FROM run_logs WHERE run_id=? AND channel='tool' ORDER BY id LIMIT 1",
-        (run_id,))).fetchone()
+    tool = (await session.execute(
+        select(RunLog.tool, RunLog.tool_input)
+        .where(RunLog.run_id == run_id, RunLog.channel == "tool")
+        .order_by(RunLog.id).limit(1))).first()
     if tool:
         import json as _json
-        name = tool["tool"] or "工具"
+        name = tool.tool or "工具"
         try:
-            inp = _json.loads(tool["tool_input"]) if tool["tool_input"] else {}
+            inp = _json.loads(tool.tool_input) if tool.tool_input else {}
         except (ValueError, TypeError):
             inp = {}
         key = ""
@@ -291,13 +316,12 @@ async def _run_summary(db, run_id: int) -> str:
 @router.get("/runs/{run_id}/logs")
 async def get_logs(run_id: int):
     """精简日志（右侧执行日志区用）：只回 ts/channel/content，向后兼容旧调用。"""
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(
-            "SELECT ts, channel, content FROM run_logs WHERE run_id=? ORDER BY id", (run_id,))).fetchall()
-        return {"logs": [{**dict(r), "ts": to_beijing(r["ts"])} for r in rows]}
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(RunLog.ts, RunLog.channel, RunLog.content)
+            .where(RunLog.run_id == run_id).order_by(RunLog.id))).all()
+        return {"logs": [{"ts": to_beijing(r.ts), "channel": r.channel, "content": r.content}
+                         for r in rows]}
 
 
 @router.get("/runs/{run_id}/transcript")
@@ -308,45 +332,42 @@ async def get_transcript(run_id: int):
     所有对外文本（content/tool_input/tool_output）统一脱敏后返回。
     """
     import json as _json
-    db = await get_connection()
-    try:
-        run = await (await db.execute(
-            "SELECT id, task_id, agent_slug, status, provider_id, started_at, ended_at "
-            "FROM task_runs WHERE id=?", (run_id,))).fetchone()
-        rows = await (await db.execute(
-            "SELECT id, ts, channel, content, tool, tool_input, tool_output "
-            "FROM run_logs WHERE run_id=? ORDER BY id", (run_id,))).fetchall()
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        run = (await session.execute(
+            select(TaskRun.id, TaskRun.task_id, TaskRun.agent_slug, TaskRun.status,
+                   TaskRun.provider_id, TaskRun.started_at, TaskRun.ended_at)
+            .where(TaskRun.id == run_id))).first()
+        rows = (await session.execute(
+            select(RunLog.id, RunLog.ts, RunLog.channel, RunLog.content,
+                   RunLog.tool, RunLog.tool_input, RunLog.tool_output)
+            .where(RunLog.run_id == run_id).order_by(RunLog.id))).all()
 
     items = []
     for r in rows:
-        d = dict(r)
         ti = {}
-        if d.get("tool_input"):
+        if r.tool_input:
             try:
-                ti = _json.loads(d["tool_input"])
+                ti = _json.loads(r.tool_input)
             except (ValueError, TypeError):
-                ti = {"_raw": d["tool_input"]}
+                ti = {"_raw": r.tool_input}
         # 脱敏 tool_input 各字段值
         if isinstance(ti, dict):
             ti = {k: (redact_secrets(v) if isinstance(v, str) else v) for k, v in ti.items()}
         items.append({
-            "seq": d["id"],
-            "ts": to_beijing(d["ts"]),
-            "channel": d["channel"],
-            "content": redact_secrets(d.get("content") or ""),
-            "tool": d.get("tool") or "",
+            "seq": r.id,
+            "ts": to_beijing(r.ts),
+            "channel": r.channel,
+            "content": redact_secrets(r.content or ""),
+            "tool": r.tool or "",
             "tool_input": ti,
-            "tool_output": redact_secrets(d.get("tool_output") or ""),
+            "tool_output": redact_secrets(r.tool_output or ""),
         })
 
     meta = {}
     if run:
-        m = dict(run)
         # 把内部 provider_id（hash）解析成人类可读的「供应商名 · 模型」
         prov_label = ""
-        pid_str = m["provider_id"] or ""
+        pid_str = run.provider_id or ""
         if pid_str:
             from config import load_settings
             for p in load_settings().providers:
@@ -356,11 +377,11 @@ async def get_transcript(run_id: int):
             if not prov_label:
                 prov_label = "（供应商已删除）"
         meta = {
-            "run_id": m["id"], "task_id": m["task_id"], "agent_slug": m["agent_slug"],
-            "agent_display": (await collab.resolve_agent_displays([m["agent_slug"]])).get(
-                m["agent_slug"], m["agent_slug"]),
-            "status": m["status"], "provider_id": pid_str, "provider_label": prov_label,
-            "started_at": to_beijing(m["started_at"]), "ended_at": to_beijing(m["ended_at"]),
+            "run_id": run.id, "task_id": run.task_id, "agent_slug": run.agent_slug,
+            "agent_display": (await collab.resolve_agent_displays([run.agent_slug])).get(
+                run.agent_slug, run.agent_slug),
+            "status": run.status, "provider_id": pid_str, "provider_label": prov_label,
+            "started_at": to_beijing(run.started_at), "ended_at": to_beijing(run.ended_at),
         }
     return {"meta": meta, "items": items}
 
@@ -383,59 +404,57 @@ async def get_lineage(task_id: int):
     每个 run_queue 项 + 关联 task_run（经 P1-1 的 task_run_id）+ 耗时 + fail_reason
     + 因果源（P1-3 source_run_id/message_id）+ run_events 调度流水（P2-1），
     并聚合链路级耗时。替代此前需人工跨 5 张表拼时间线的排查方式。"""
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         # 本任务 + 子任务全集
-        trows = await (await db.execute(
-            "SELECT id, title, status, parent_task_id FROM tasks WHERE id=? OR parent_task_id=?",
-            (task_id, task_id))).fetchall()
+        trows = (await session.execute(
+            select(Task.id, Task.title, Task.status, Task.parent_task_id)
+            .where((Task.id == task_id) | (Task.parent_task_id == task_id)))).all()
         if not trows:
             raise HTTPException(404, "任务不存在")
-        tids = [r["id"] for r in trows]
-        ph = ",".join("?" for _ in tids)
+        tids = [r.id for r in trows]
         # run_queue 项（含关联 task_run 的执行信息，经 task_run_id 打通）
-        qrows = await (await db.execute(
-            f"""SELECT q.id AS rq_id, q.task_id, q.agent_slug, q.trigger, q.is_leader,
-                       q.status AS queue_status, q.attempts, q.created_at AS enqueued_at,
-                       q.task_run_id, q.source_run_id, q.source_message_id,
-                       tr.status AS run_status, tr.fail_reason,
-                       tr.started_at, tr.ended_at
-                FROM run_queue q LEFT JOIN task_runs tr ON tr.id = q.task_run_id
-                WHERE q.task_id IN ({ph}) ORDER BY q.id""", tids)).fetchall()
+        qrows = (await session.execute(
+            select(RunQueue.id.label("rq_id"), RunQueue.task_id, RunQueue.agent_slug,
+                   RunQueue.trigger, RunQueue.is_leader,
+                   RunQueue.status.label("queue_status"), RunQueue.attempts,
+                   RunQueue.created_at.label("enqueued_at"),
+                   RunQueue.task_run_id, RunQueue.source_run_id, RunQueue.source_message_id,
+                   TaskRun.status.label("run_status"), TaskRun.fail_reason,
+                   TaskRun.started_at, TaskRun.ended_at)
+            .select_from(RunQueue)
+            .outerjoin(TaskRun, TaskRun.id == RunQueue.task_run_id)
+            .where(RunQueue.task_id.in_(tids)).order_by(RunQueue.id))).all()
         # run_events 调度流水（按 run_queue 分组）
-        erows = await (await db.execute(
-            f"SELECT run_queue_id, event, detail, ts FROM run_events "
-            f"WHERE task_id IN ({ph}) ORDER BY id", tids)).fetchall()
-    finally:
-        await db.close()
+        erows = (await session.execute(
+            select(RunEvent.run_queue_id, RunEvent.event, RunEvent.detail, RunEvent.ts)
+            .where(RunEvent.task_id.in_(tids)).order_by(RunEvent.id))).all()
 
     events_by_rq: dict = {}
     for e in erows:
-        events_by_rq.setdefault(e["run_queue_id"], []).append(
-            {"event": e["event"], "detail": e["detail"], "ts": to_beijing(e["ts"])})
+        events_by_rq.setdefault(e.run_queue_id, []).append(
+            {"event": e.event, "detail": e.detail, "ts": to_beijing(e.ts)})
 
     # 统一展示名：slug → 「昵称（角色名）」，杜绝前端露 slug
-    displays = await collab.resolve_agent_displays([q["agent_slug"] for q in qrows])
+    displays = await collab.resolve_agent_displays([q.agent_slug for q in qrows])
 
     chain = []
     total_run_seconds = 0.0
     for q in qrows:
-        d = dict(q)
-        dur = _dur_seconds(d.get("started_at"), d.get("ended_at"))
+        dur = _dur_seconds(q.started_at, q.ended_at)
         if dur:
             total_run_seconds += dur
         chain.append({
-            "run_queue_id": d["rq_id"], "task_id": d["task_id"], "agent_slug": d["agent_slug"],
-            "agent_display": displays.get(d["agent_slug"], d["agent_slug"]),
-            "trigger": d["trigger"], "is_leader": bool(d["is_leader"]),
-            "queue_status": d["queue_status"], "attempts": d["attempts"],
-            "enqueued_at": to_beijing(d["enqueued_at"]),
-            "task_run_id": d["task_run_id"], "run_status": d["run_status"],
-            "fail_reason": d["fail_reason"] or "",
-            "started_at": to_beijing(d["started_at"]), "ended_at": to_beijing(d["ended_at"]),
+            "run_queue_id": q.rq_id, "task_id": q.task_id, "agent_slug": q.agent_slug,
+            "agent_display": displays.get(q.agent_slug, q.agent_slug),
+            "trigger": q.trigger, "is_leader": bool(q.is_leader),
+            "queue_status": q.queue_status, "attempts": q.attempts,
+            "enqueued_at": to_beijing(q.enqueued_at),
+            "task_run_id": q.task_run_id, "run_status": q.run_status,
+            "fail_reason": q.fail_reason or "",
+            "started_at": to_beijing(q.started_at), "ended_at": to_beijing(q.ended_at),
             "duration_seconds": dur,
-            "source_run_id": d["source_run_id"], "source_message_id": d["source_message_id"],
-            "events": events_by_rq.get(d["rq_id"], []),
+            "source_run_id": q.source_run_id, "source_message_id": q.source_message_id,
+            "events": events_by_rq.get(q.rq_id, []),
         })
 
     return {
@@ -463,23 +482,27 @@ async def rate_limit_metrics(hours: int = 24):
     """
     hours = max(1, min(int(hours), 720))   # 1h~30d
     since = f"-{hours} hours"
-    db = await get_connection()
-    try:
-        total = (await (await db.execute(
-            "SELECT COUNT(*) c FROM task_runs WHERE ended_at IS NOT NULL "
-            "AND ended_at >= datetime('now', ?)", (since,))).fetchone())["c"]
-        failed = (await (await db.execute(
-            "SELECT COUNT(*) c FROM task_runs WHERE status='failed' AND ended_at IS NOT NULL "
-            "AND ended_at >= datetime('now', ?)", (since,))).fetchone())["c"]
-        rl = (await (await db.execute(
-            "SELECT COUNT(*) c FROM task_runs WHERE fail_reason='rate_limited' AND ended_at IS NOT NULL "
-            "AND ended_at >= datetime('now', ?)", (since,))).fetchone())["c"]
-        dist_rows = await (await db.execute(
-            "SELECT COALESCE(NULLIF(fail_reason,''),'(none)') fr, COUNT(*) c FROM task_runs "
-            "WHERE status='failed' AND ended_at IS NOT NULL AND ended_at >= datetime('now', ?) "
-            "GROUP BY fr ORDER BY c DESC", (since,))).fetchall()
-    finally:
-        await db.close()
+    # 窗口下界：datetime('now', '-N hours')（SQLite 相对时间算术，与旧 SQL 一致；
+    # S4 迁 PG 时这类相对时间是方言点，届时改 now()-interval）
+    window = func.datetime(now_expr(), since)
+    async with get_session_factory()() as session:
+        total = (await session.execute(
+            select(func.count()).select_from(TaskRun)
+            .where(TaskRun.ended_at.is_not(None), TaskRun.ended_at >= window))).scalar_one()
+        failed = (await session.execute(
+            select(func.count()).select_from(TaskRun)
+            .where(TaskRun.status == "failed", TaskRun.ended_at.is_not(None),
+                   TaskRun.ended_at >= window))).scalar_one()
+        rl = (await session.execute(
+            select(func.count()).select_from(TaskRun)
+            .where(TaskRun.fail_reason == "rate_limited", TaskRun.ended_at.is_not(None),
+                   TaskRun.ended_at >= window))).scalar_one()
+        fr_col = func.coalesce(func.nullif(TaskRun.fail_reason, ""), "(none)").label("fr")
+        dist_rows = (await session.execute(
+            select(fr_col, func.count().label("c"))
+            .where(TaskRun.status == "failed", TaskRun.ended_at.is_not(None),
+                   TaskRun.ended_at >= window)
+            .group_by(fr_col).order_by(func.count().desc()))).all()
     return {
         "window_hours": hours,
         "total_runs": total,
@@ -487,7 +510,7 @@ async def rate_limit_metrics(hours: int = 24):
         "rate_limited_runs": rl,
         "rate_limit_hit_rate": round(rl / total, 4) if total else 0.0,
         "rate_limit_fail_share": round(rl / failed, 4) if failed else 0.0,
-        "by_fail_reason": {r["fr"]: r["c"] for r in dist_rows},
+        "by_fail_reason": {r.fr: r.c for r in dist_rows},
     }
 
 
@@ -507,76 +530,76 @@ async def agents_overview(days: int = 30):
     """
     days = max(1, min(int(days), 365))
     since = f"-{days} days"
-    db = await get_connection()
-    try:
+    window = func.datetime(now_expr(), since)   # datetime('now','-N days')，同 rate_limit_metrics
+    async with get_session_factory()() as session:
         # 累计 stats：限定 started_at 落在最近 days 天内
-        total_runs = (await (await db.execute(
-            "SELECT COUNT(*) c FROM task_runs "
-            "WHERE started_at IS NOT NULL AND started_at >= datetime('now', ?)",
-            (since,))).fetchone())["c"]
-        failed_runs = (await (await db.execute(
-            "SELECT COUNT(*) c FROM task_runs "
-            "WHERE status='failed' AND started_at IS NOT NULL AND started_at >= datetime('now', ?)",
-            (since,))).fetchone())["c"]
-        distinct_agents = (await (await db.execute(
-            "SELECT COUNT(DISTINCT agent_slug) c FROM task_runs "
-            "WHERE started_at IS NOT NULL AND started_at >= datetime('now', ?)",
-            (since,))).fetchone())["c"]
-        # 累计运行总时长：已结束 run 的 (ended_at - started_at) 求和（秒）
-        total_seconds = (await (await db.execute(
-            "SELECT COALESCE(SUM((julianday(ended_at) - julianday(started_at)) * 86400), 0) s "
-            "FROM task_runs WHERE ended_at IS NOT NULL AND started_at IS NOT NULL "
-            "AND started_at >= datetime('now', ?)", (since,))).fetchone())["s"]
+        total_runs = (await session.execute(
+            select(func.count()).select_from(TaskRun)
+            .where(TaskRun.started_at.is_not(None), TaskRun.started_at >= window))).scalar_one()
+        failed_runs = (await session.execute(
+            select(func.count()).select_from(TaskRun)
+            .where(TaskRun.status == "failed", TaskRun.started_at.is_not(None),
+                   TaskRun.started_at >= window))).scalar_one()
+        distinct_agents = (await session.execute(
+            select(func.count(distinct(TaskRun.agent_slug)))
+            .where(TaskRun.started_at.is_not(None), TaskRun.started_at >= window))).scalar_one()
+        # 累计运行总时长：已结束 run 的 (ended_at - started_at) 求和（秒）；
+        # julianday 差是 SQLite 方言（同 dialect.elapsed_seconds_sql），S4 迁 PG 改 EXTRACT EPOCH
+        total_seconds = (await session.execute(
+            select(func.coalesce(
+                func.sum((func.julianday(TaskRun.ended_at) - func.julianday(TaskRun.started_at)) * 86400),
+                0))
+            .where(TaskRun.ended_at.is_not(None), TaskRun.started_at.is_not(None),
+                   TaskRun.started_at >= window))).scalar_one()
 
         # 正在运行：task_runs.status='running' → 关联任务、项目
-        run_rows = await (await db.execute(
-            """SELECT tr.id AS task_run_id, tr.agent_slug, tr.task_id, tr.started_at,
-                      t.title AS task_title, t.parent_task_id,
-                      t.project_id, p.title AS project_title
-               FROM task_runs tr
-               LEFT JOIN tasks t ON t.id = tr.task_id
-               LEFT JOIN projects p ON p.id = t.project_id
-               WHERE tr.status='running'
-               ORDER BY tr.started_at""")).fetchall()
+        run_rows = (await session.execute(
+            select(TaskRun.id.label("task_run_id"), TaskRun.agent_slug, TaskRun.task_id,
+                   TaskRun.started_at, Task.title.label("task_title"), Task.parent_task_id,
+                   Task.project_id, Project.title.label("project_title"))
+            .select_from(TaskRun)
+            .outerjoin(Task, Task.id == TaskRun.task_id)
+            .outerjoin(Project, Project.id == Task.project_id)
+            .where(TaskRun.status == "running")
+            .order_by(TaskRun.started_at))).all()
 
         # 在岗成员花名册：启用中的 (project_id, slug)，附项目名 + 角色名 + is_leader
-        roster_rows = await (await db.execute(
-            """SELECT pa.project_id, pa.slug, pa.name, pa.is_leader,
-                      p.title AS project_title
-               FROM project_agents pa
-               LEFT JOIN projects p ON p.id = pa.project_id
-               WHERE pa.enabled=1
-               ORDER BY pa.project_id, pa.is_leader DESC, pa.slug""")).fetchall()
-    finally:
-        await db.close()
+        roster_rows = (await session.execute(
+            select(ProjectAgent.project_id, ProjectAgent.slug, ProjectAgent.name,
+                   ProjectAgent.is_leader, Project.title.label("project_title"))
+            .select_from(ProjectAgent)
+            .outerjoin(Project, Project.id == ProjectAgent.project_id)
+            .where(ProjectAgent.enabled == 1)
+            .order_by(ProjectAgent.project_id, ProjectAgent.is_leader.desc(),
+                      ProjectAgent.slug))).all()
 
-    slugs = list({r["agent_slug"] for r in run_rows} | {r["slug"] for r in roster_rows})
+    slugs = list({r.agent_slug for r in run_rows} | {r.slug for r in roster_rows})
     displays = await collab.resolve_agent_displays(slugs)
 
     running = []
     busy_keys = set()   # (project_id, slug) 正在忙的在岗实例
     for r in run_rows:
-        busy_keys.add((r["project_id"], r["agent_slug"]))
+        busy_keys.add((r.project_id, r.agent_slug))
         running.append({
-            "task_run_id": r["task_run_id"],
-            "agent_slug": r["agent_slug"],
-            "agent_display": displays.get(r["agent_slug"], r["agent_slug"]),
-            "project_id": r["project_id"], "project_title": r["project_title"],
-            "task_id": r["task_id"], "task_title": r["task_title"],
-            "is_subtask": r["parent_task_id"] is not None,
-            "parent_task_id": r["parent_task_id"],
-            "started_at": to_beijing(r["started_at"]),
+            "task_run_id": r.task_run_id,
+            "agent_slug": r.agent_slug,
+            "agent_display": displays.get(r.agent_slug, r.agent_slug),
+            "project_id": r.project_id, "project_title": r.project_title,
+            "task_id": r.task_id, "task_title": r.task_title,
+            "is_subtask": r.parent_task_id is not None,
+            "parent_task_id": r.parent_task_id,
+            "started_at": to_beijing(r.started_at),
         })
 
     idle = []
     for r in roster_rows:
-        if (r["project_id"], r["slug"]) in busy_keys:
+        if (r.project_id, r.slug) in busy_keys:
             continue
         idle.append({
-            "agent_slug": r["slug"],
-            "agent_display": displays.get(r["slug"], r["slug"]),
-            "project_id": r["project_id"], "project_title": r["project_title"],
-            "is_leader": bool(r["is_leader"]),
+            "agent_slug": r.slug,
+            "agent_display": displays.get(r.slug, r.slug),
+            "project_id": r.project_id, "project_title": r.project_title,
+            "is_leader": bool(r.is_leader),
         })
 
     return {
