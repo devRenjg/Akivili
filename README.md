@@ -225,6 +225,15 @@ JianAgency/
 
 ## 版本记录
 
+### 数据底座对标 Multica · S3 ORM + SQL 收敛 + 方言隔离 — 2026-07-28
+- 🔧 **手写 SQL 全量迁 SQLAlchemy 2.0 async ORM（能力 `foundation-data-layer`，OpenSpec change `2026-07-24-foundation-db-alignment`，回滚锚点 C）**
+  - **背景**：S2 后 schema 已版本化，但业务层仍是 ~241 处手写 `db.execute("SQL")`（散落 15 个数据文件），字符串拼接、`datetime('now')` 等 SQLite 方言硬编码遍布，是「双引擎（S4）→ PostgreSQL 默认化（S5）」的最大障碍。S3 把数据访问收敛到 ORM 一层、方言收敛到 helper 一层。
+  - **S3.1–3.3 地基**：`backend/models/` 建 ORM 层——18 个 `Mapped[]` 模型逐列对齐 001 基线（`schema parity probe 604/604` 逐字段校验）；统一 async engine + `async_sessionmaker`（连接调优逐条对齐 S1 的 WAL/busy_timeout/foreign_keys）；方言 helper `dialect.py`（`now_expr()`/`elapsed_seconds_sql()`/`insert_or_ignore()`/`upsert()`）。
+  - **S3.4/3.5 迁移**：数据访问层 **11 批**逐文件迁移（agent_memory_sync/auth/projects/activity/skills/agents/agent_config/agent_cli/project_agents/reflect/progress/tasks/runs/runner/collab），**每文件一隔离 probe 一提交一回归**，保留 dict/list[dict] 返回契约。时间语义不变（存储仍 UTC，`to_beijing` 展示转换不动）；相对时间窗口/julianday 时长聚合作为 SQLite 方言点集中标注、留 S4 迁 PG。
+  - **S3.6 建表职责唯一化**：`database.py` 下线 `SCHEMA` 常量 + `init_db()` + `_migrate()`（~300 行冗余，自 001 起生产已 Alembic-first），仅留 `get_connection()` 连接工厂。原 `_migrate` 两条数据规整（planning→backlog / archived→done）落成 Alembic **002** 数据迁移。**建表真相源唯一为 Alembic**。
+  - **无行为变更**：纯内部重构，接口/数据/时间语义零改动。ORM 引擎池与遗留 `get_connection`（测试 seed 用）在 WAL 下共存已验证安全。
+  - 验证：**S3.V 验收——手写 SQL 归零**（业务/路由/执行层零 `get_connection`、零裸 SQL 字面量、零 `text(SQL)` 混入；残留仅 PRAGMA/迁移 DDL/`ping` 的 `SELECT 1`）+ **方言集中**（`now_expr()` 29 处，julianday/相对时间 5 处标注点边界清晰）+ **回归 35 probe 合计 1059 PASS / 0 FAIL + E2E QA 31/31**。回滚锚点 C。
+
 ### 数据底座对标 Multica · S2 迁移框架 Alembic — 2026-07-27
 - 🔧 **Schema 版本化（能力 `foundation-data-layer`，OpenSpec change `2026-07-24-foundation-db-alignment`，回滚锚点 B）**
   - **背景**：schema 此前由 `database.py` 的 `SCHEMA` 常量（18 表）+ `_migrate()` 手工 `ALTER` 补列管理，无版本号、无法回滚、无法可重放重建。S2 引入 Alembic 把 schema 升级为「版本化、可回滚、可重放」的工程化管理，**结构零改动**——把当前 18 表原样固化成 `001_baseline`，只搬家不改表。是平滑重启等被阻塞 change 的地基（它们的 `run_queue`/`task_runs` 加列将改用 Alembic 迁移，不再手工兜底）。
