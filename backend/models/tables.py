@@ -20,7 +20,12 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
 
-# datetime('now') 默认值的统一字面量（S3.1 原样保留基线写法；S3.3 收敛为 func.now()）
+# server_default 的时间字面量：**保持 001 基线的 DDL 原文**（datetime('now')）。
+# 这是「建表默认值」，由 001 迁移冻结、必须与库结构逐字节一致，不走 func.now()——
+# 若改为 func.now() 会让 create_all 的 DDL 偏离基线（parity 探针会拦截）。
+# 运行期 INSERT/UPDATE 写「当前时间」的收敛是另一回事：S3.4 用 dialect.now_expr()
+# （= func.now()，SQLite 下编译为 CURRENT_TIMESTAMP，与 datetime('now') 同格式同 UTC）。
+# 二者分属「DDL 默认值」与「运行期取值表达式」，刻意分离。见 dialect.py。
 _NOW = text("(datetime('now'))")
 # 自增主键表的 __table_args__（SQLite AUTOINCREMENT：禁止 rowid 复用，对齐基线）
 _AUTOINC = {"sqlite_autoincrement": True}

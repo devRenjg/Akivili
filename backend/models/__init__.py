@@ -7,6 +7,11 @@
     from models import Base, Project, Task, ...
 """
 from .base import Base
+from .dialect import (
+    elapsed_seconds_sql,
+    insert_or_ignore,
+    now_expr,
+)
 from .engine import (
     dispose_engine,
     get_engine,
@@ -41,6 +46,10 @@ __all__ = [
     "get_session_factory",
     "dispose_engine",
     "ping",
+    # 方言 helper（S3.3）
+    "now_expr",
+    "elapsed_seconds_sql",
+    "insert_or_ignore",
     # 表模型（S3.1）
     "Activity",
     "AgentProfile",
