@@ -15,7 +15,9 @@ from executor.codex import CodexBackend
 
 
 async def main() -> int:
-    tmp = Path(tempfile.mkdtemp(prefix="akivili-codex-smoke-", dir=r"C:\tmp"))
+    import os as _os
+    _tmpdir = r"C:\tmp" if _os.path.isdir(r"C:\tmp") else None  # 本地用 C:\tmp；无此目录回退系统默认
+    tmp = Path(tempfile.mkdtemp(prefix="akivili-codex-smoke-", dir=_tmpdir))
     (tmp / "README.md").write_text("# Codex CLI smoke workspace\n", encoding="utf-8")
     target = tmp / "CODEX_CLI_OK.txt"
     prompt = (

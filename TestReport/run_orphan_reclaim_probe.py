@@ -176,7 +176,9 @@ async def amain() -> int:
     parser.add_argument("--keep", action="store_true", help="keep temporary directory")
     args = parser.parse_args()
 
-    tmp = Path(tempfile.mkdtemp(prefix="akivili-orphan-", dir=r"C:\tmp"))
+    import os as _os
+    _tmpdir = r"C:\tmp" if _os.path.isdir(r"C:\tmp") else None  # 本地用 C:\tmp；CI/无此目录回退系统默认
+    tmp = Path(tempfile.mkdtemp(prefix="akivili-orphan-", dir=_tmpdir))
     paths = setup_isolated_config(tmp)
     await bootstrap_backend(paths)
     try:

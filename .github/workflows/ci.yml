@@ -14,6 +14,9 @@ jobs:
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
+      # CI runner 的共享 I/O 比本地慢，给 SQLite 写锁竞争更充裕的等待窗口
+      # （WAL 并发探针的 expected_bt 断言读同一变量，保持一致）。
+      AKIVILI_DB_BUSY_TIMEOUT_MS: "30000"
     steps:
       - uses: actions/checkout@v4
 

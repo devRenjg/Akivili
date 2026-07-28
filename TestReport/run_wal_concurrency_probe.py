@@ -78,16 +78,22 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
     probe.check("run_migrations leaves DB in WAL", str(jm2).lower() == "wal", f"got {jm2}")
 
     # --- Check 3: concurrent writers never hit "database is locked" ---
+    # 建表**一次**（在并发前），让本测度量「并发 INSERT」——即生产真实写模式；
+    # 而非「并发 CREATE TABLE」（DDL 取 schema 级锁，竞争远高于行写，是测试假象、非生产风险）。
     WORKERS, ROUNDS = 12, 40
     errors: list[str] = []
+    _c0 = await get_connection()
+    try:
+        await _c0.execute("CREATE TABLE IF NOT EXISTS _wal_probe("
+                          "id INTEGER PRIMARY KEY AUTOINCREMENT, wid INT, seq INT)")
+        await _c0.commit()
+    finally:
+        await _c0.close()
 
     async def writer(wid: int) -> None:
         for i in range(ROUNDS):
             c = await get_connection()
             try:
-                await c.execute(
-                    "CREATE TABLE IF NOT EXISTS _wal_probe("
-                    "id INTEGER PRIMARY KEY AUTOINCREMENT, wid INT, seq INT)")
                 await c.execute("INSERT INTO _wal_probe(wid, seq) VALUES (?,?)", (wid, i))
                 await c.commit()
             except Exception as e:  # noqa: BLE001

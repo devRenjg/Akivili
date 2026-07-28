@@ -275,7 +275,8 @@ def run_scenario(keep: bool) -> int:
             provider_ids[kind] = p["id"]
     default_id = provider_ids.get("claude")
 
-    tmp = Path(tempfile.mkdtemp(prefix="akivili-scenario-", dir=r"C:\tmp"))
+    _tmpdir = r"C:\tmp" if os.path.isdir(r"C:\tmp") else None  # 本地用 C:\tmp；无此目录回退系统默认
+    tmp = Path(tempfile.mkdtemp(prefix="akivili-scenario-", dir=_tmpdir))
     port = _free_port()
     base = f"http://127.0.0.1:{port}"
     cfg_path, db_path_p, project_dir_p = _write_isolated_config(tmp, port, iso_providers, default_id)

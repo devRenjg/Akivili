@@ -216,8 +216,10 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
         events.clear()
         t_mix = await make_task(pid, "__conc_mixed__")
 
-        # Custom per-run delays: backend slow, others fast.
-        delays = {"qa-backend-developer": 0.8, "qa-frontend-developer": 0.05, "qa-tester": 0.05}
+        # Custom per-run delays: backend slow, others fast. 慢/快差距拉大到 1.5s vs 0.05s，
+        # 让 CI 上「逐个 claim(每轮 sleep 0.05s)造成的启动错峰」远小于执行时长差——
+        # 即便 backend 先被 claim，1.5s 执行也必然晚于 0.05s 的快 Agent 完成。
+        delays = {"qa-backend-developer": 1.5, "qa-frontend-developer": 0.05, "qa-tester": 0.05}
 
         async def mixed_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
             slug = agent_obj["slug"]
@@ -238,7 +240,7 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
             await collab.enqueue_run(t_mix, slug, "work", "qa", is_leader=False)
 
         loop_task = asyncio.create_task(collab._loop())
-        for _ in range(100):
+        for _ in range(240):   # 上限 12s，容纳 backend 1.5s 执行 + CI 调度抖动
             await asyncio.sleep(0.05)
             if len(events) >= 3:
                 break

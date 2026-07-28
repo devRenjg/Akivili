@@ -744,7 +744,8 @@ async def amain() -> int:
     args = parser.parse_args()
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = Path(tempfile.mkdtemp(prefix="akivili-qa-", dir=r"C:\tmp"))
+    _tmpdir = r"C:\tmp" if _os.path.isdir(r"C:\tmp") else None  # 本地用 C:\tmp；CI/无此目录回退系统默认
+    tmp = Path(tempfile.mkdtemp(prefix="akivili-qa-", dir=_tmpdir))
     paths = setup_isolated_config(tmp)
     state = await run_suite(paths, include_live=args.live)
 
