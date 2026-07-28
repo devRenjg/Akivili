@@ -41,18 +41,20 @@
 - [ ] S3.1 引入 `sqlalchemy[asyncio]` 依赖；建 `backend/models/` 定义全部表的 ORM 模型（对齐 001 基线，逐表）
 - [ ] S3.2 建统一 async session 工厂，桥接 S1 的连接调优（WAL/busy_timeout 在 engine 层配置）
 - [ ] S3.3 方言 helper 收敛：`datetime('now')`（41 处）统一为 ORM 时间表达式 / 单一 helper；`AUTOINCREMENT`（17 处）改由 ORM 主键策略表达；占位符统一
-- [ ] S3.4 按表分批迁移手写 SQL 到 ORM（每表一提交，独立回归）：
-  - [ ] S3.4a `database.py`（37）
-  - [ ] S3.4b `collab.py`（36）
-  - [ ] S3.4c `routes/runs.py`（28）
-  - [ ] S3.4d `progress.py`（21）
-  - [ ] S3.4e `routes/tasks.py`（20）
-  - [ ] S3.4f `executor/runner.py`（17）
-  - [ ] S3.4g `routes/agents.py`（16）
-  - [ ] S3.4h `routes/project_agents.py`（14）
-  - [ ] S3.4i `routes/agent_cli.py`（12）
-  - [ ] S3.4j 其余文件（`agent_config.py` 8 / `reflect.py` 8 / `activity.py` 7 / `skills.py` 6 / `projects.py` 6 / `skills(root).py` 4 等）
-- [ ] S3.5 每批迁移后校验：该表相关接口行为与迁移前逐一对照（读结果一致、写副作用一致）
+- [x] S3.4 按文件分批迁移手写 SQL 到 ORM（每文件一提交 + 一隔离 probe，独立回归）。**数据访问层全部迁离手写 SQL；审计：业务/路由层零 `get_connection` 引用、零裸 SELECT/INSERT/UPDATE/DELETE 字面量**：
+  - [x] S3.4 批1 `agent_memory_sync.py`（probe 9/9）
+  - [x] S3.4 批2 `auth.py` / `projects.py` / `activity.py`（probe 23/23）
+  - [x] S3.4 批3 `skills.py` / `routes/skills.py` / `routes/auth.py`（probe 18/18）
+  - [x] S3.4 批4 `agents.py` / `routes/agent_config.py`（probe 15/15）
+  - [x] S3.4 批5 `routes/agent_cli.py` / `routes/project_agents.py`（probe 24/24）
+  - [x] S3.4 批6 `routes/agents.py` / `reflect.py`（probe 28/28）
+  - [x] S3.4 批7 `progress.py`（probe 17/17，commit e319812）
+  - [x] S3.4 批8 `routes/tasks.py`（probe 27/27，commit 5c05ce7）
+  - [x] S3.4 批9 `routes/runs.py`（probe 27/27，commit 57c74de；新方言点 datetime('now',?) 窗口 + julianday SUM）
+  - [x] S3.4 批10 `executor/runner.py`（probe 20/20，commit 25f85c0）
+  - [x] S3.4 批11 `collab.py`（probe 32/32，commit fdbb744；_claim_one 优先级+FIFO+退避、两层 reclaim、julianday idle sweep）
+  - [~] `database.py`（41）**改判为基础设施，非数据访问**：全部为 `init_db`(DDL/PRAGMA) / `_migrate`(ALTER/PRAGMA table_info) / `get_connection`(PRAGMA 工厂)，无一条数据查询，无法「迁成 ORM select」。归 S3.6 下线，不属 S3.4 迁移面。`models/engine.py` 3 处为 ORM 自身 PRAGMA 监听器，永不迁移。
+- [x] S3.5 每批迁移后校验：每文件一隔离 probe，逐一对照读结果/写副作用与迁移前等价（含金样对照与 TestClient 真实接口）；每批跑全量回归（schema parity 604 + engine 8 + dialect 7 + batch1-11 + S1 8 + S2 15）+ E2E QA 31/31，全绿方提交
 - [ ] S3.6 下线 `init_db()` 建表职责：`database.py` 的 SCHEMA 常量与 001 基线已漂移（缺 `agent_templates.tags`），S3 起 ORM 按 001 读写，凡只走 init_db 建库（不先 Alembic）的路径会崩。根治：移除 SCHEMA 常量 + init_db 建表逻辑，建表唯一走 Alembic（生产 main._startup 已先跑迁移，下线无行为变更）。独立提交、独立验收。见记忆 init-db-schema-stale-vs-alembic
 - [ ] **S3.V 验收**：`grep` 手写 SQL 归零（或仅剩迁移文件）；方言用法集中在 helper/ORM 一层；init_db 建表职责已下线（S3.6）；S0.2 回归全绿；关键接口逐一自测通过 → **提交，回滚锚点 C**
 
