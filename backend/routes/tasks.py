@@ -5,8 +5,11 @@ from auth import require_admin
 from pydantic import BaseModel
 
 import projects as projects_mod
-from database import get_connection
+from sqlalchemy import delete as sa_delete, distinct, literal_column, select, update as sa_update
+from sqlalchemy.orm import aliased
+
 from activity import log_activity, timeline
+from models import Conversation, Task, TaskRun, get_session_factory, now_expr
 from timeutil import to_beijing
 
 router = APIRouter(prefix="/api/projects", tags=["tasks"])
@@ -14,6 +17,16 @@ router = APIRouter(prefix="/api/projects", tags=["tasks"])
 # 看板状态（有序）+ 中文标签
 STATUSES = ["backlog", "in_progress", "reviewing", "done", "blocked"]
 PRIORITIES = ["urgent", "high", "medium", "low", "none"]
+
+# tasks 物理列序（对齐 001 基线），SELECT t.* → dict 保持键集合/顺序
+_TASK_COLS = (
+    "id", "project_id", "title", "description", "status", "assignee_slug",
+    "conversation_id", "order_idx", "created_at", "updated_at", "priority", "parent_task_id",
+)
+
+
+def _task_dict(t: Task) -> dict:
+    return {c: getattr(t, c) for c in _TASK_COLS}
 
 
 class CreateTaskRequest(BaseModel):
@@ -39,29 +52,49 @@ async def _ensure_project(pid: int):
 @router.get("/{pid}/tasks")
 async def list_tasks(pid: int):
     await _ensure_project(pid)
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(
-            """SELECT t.*,
-                      (SELECT status FROM task_runs r WHERE r.task_id=t.id ORDER BY r.id DESC LIMIT 1) AS run_status,
-                      (SELECT content FROM messages m WHERE m.conversation_id=t.conversation_id AND m.role='assistant'
-                         ORDER BY m.id DESC LIMIT 1) AS last_result,
-                      (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=t.conversation_id) AS msg_count,
-                      (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id=t.id) AS sub_total,
-                      (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id=t.id AND c.status='done') AS sub_done
-               FROM tasks t WHERE t.project_id=? AND t.parent_task_id IS NULL
-               ORDER BY t.created_at DESC, t.id DESC""", (pid,))).fetchall()
-        tasks = [dict(r) for r in rows]
+    # 5 个相关子查询逐字保留原 SQL（绑定当前行 tasks 列），用 literal_column 承载。
+    run_status = literal_column(
+        "(SELECT status FROM task_runs r WHERE r.task_id=tasks.id ORDER BY r.id DESC LIMIT 1)")
+    last_result = literal_column(
+        "(SELECT content FROM messages m WHERE m.conversation_id=tasks.conversation_id "
+        "AND m.role='assistant' ORDER BY m.id DESC LIMIT 1)")
+    msg_count = literal_column(
+        "(SELECT COUNT(*) FROM messages m WHERE m.conversation_id=tasks.conversation_id)")
+    sub_total = literal_column(
+        "(SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id=tasks.id)")
+    sub_done = literal_column(
+        "(SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id=tasks.id AND c.status='done')")
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(Task,
+                   run_status.label("run_status"), last_result.label("last_result"),
+                   msg_count.label("msg_count"), sub_total.label("sub_total"),
+                   sub_done.label("sub_done"))
+            .where(Task.project_id == pid, Task.parent_task_id.is_(None))
+            .order_by(Task.created_at.desc(), Task.id.desc()))).all()
+        tasks = []
+        for t, rs, lr, mc, st, sd in rows:
+            d = _task_dict(t)
+            d.update(run_status=rs, last_result=lr, msg_count=mc, sub_total=st, sub_done=sd)
+            tasks.append(d)
         # 取每个顶层任务的子任务（看板卡片下方嵌套小卡展示）
-        sub_rows = await (await db.execute(
-            """SELECT c.id, c.title, c.status, c.priority, c.assignee_slug, c.parent_task_id,
-                      (SELECT status FROM task_runs r WHERE r.task_id=c.id ORDER BY r.id DESC LIMIT 1) AS run_status,
-                      (SELECT COUNT(*) FROM run_queue q WHERE q.task_id=c.id AND q.status IN ('queued','running')) AS active_run
-               FROM tasks c WHERE c.project_id=? AND c.parent_task_id IS NOT NULL
-               ORDER BY c.order_idx, c.id""", (pid,))).fetchall()
+        sub_run_status = literal_column(
+            "(SELECT status FROM task_runs r WHERE r.task_id=tasks.id ORDER BY r.id DESC LIMIT 1)")
+        active_run = literal_column(
+            "(SELECT COUNT(*) FROM run_queue q WHERE q.task_id=tasks.id "
+            "AND q.status IN ('queued','running'))")
+        sub_rows = (await session.execute(
+            select(Task.id, Task.title, Task.status, Task.priority, Task.assignee_slug,
+                   Task.parent_task_id,
+                   sub_run_status.label("run_status"), active_run.label("active_run"))
+            .where(Task.project_id == pid, Task.parent_task_id.is_not(None))
+            .order_by(Task.order_idx, Task.id))).all()
         subs_by_parent: dict = {}
         for sr in sub_rows:
-            subs_by_parent.setdefault(sr["parent_task_id"], []).append(dict(sr))
+            subs_by_parent.setdefault(sr.parent_task_id, []).append({
+                "id": sr.id, "title": sr.title, "status": sr.status, "priority": sr.priority,
+                "assignee_slug": sr.assignee_slug, "parent_task_id": sr.parent_task_id,
+                "run_status": sr.run_status, "active_run": sr.active_run})
         for t in tasks:
             for col in ("created_at", "updated_at"):
                 if col in t:
@@ -70,8 +103,6 @@ async def list_tasks(pid: int):
         # 按状态分组，便于看板渲染
         board = {s: [t for t in tasks if t["status"] == s] for s in STATUSES}
         return {"tasks": tasks, "board": board}
-    finally:
-        await db.close()
 
 
 @router.post("/{pid}/tasks", dependencies=[Depends(require_admin)])
@@ -79,23 +110,20 @@ async def create_task(pid: int, req: CreateTaskRequest, user: dict = Depends(req
     await _ensure_project(pid)
     if not req.title.strip():
         raise HTTPException(400, "任务标题不能为空")
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         # 建关联对话 Thread
-        conv = await db.execute(
-            "INSERT INTO conversations (project_id, title) VALUES (?,?)", (pid, req.title.strip()))
-        conv_id = conv.lastrowid
-        cur = await db.execute(
-            """INSERT INTO tasks (project_id, title, description, assignee_slug, conversation_id, priority, parent_task_id, status)
-               VALUES (?,?,?,?,?,?,?, 'backlog')""",
-            (pid, req.title.strip(), req.description, req.assignee_slug, conv_id,
-             req.priority if req.priority in PRIORITIES else "none", req.parent_task_id))
-        await db.commit()
-        tid = cur.lastrowid
-        row = await (await db.execute("SELECT * FROM tasks WHERE id=?", (tid,))).fetchone()
-        result = dict(row)
-    finally:
-        await db.close()
+        conv = Conversation(project_id=pid, title=req.title.strip())
+        session.add(conv)
+        await session.flush()   # 取 conv.id（对齐旧 lastrowid）
+        task = Task(project_id=pid, title=req.title.strip(), description=req.description,
+                    assignee_slug=req.assignee_slug, conversation_id=conv.id,
+                    priority=req.priority if req.priority in PRIORITIES else "none",
+                    parent_task_id=req.parent_task_id, status="backlog")
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        tid = task.id
+        result = _task_dict(task)
     await log_activity(tid, "created", "user", user.get("username", ""), {"title": req.title.strip()})
     return result
 
@@ -106,24 +134,20 @@ async def update_task(pid: int, task_id: int, req: UpdateTaskRequest, user: dict
     sets = {k: v for k, v in req.model_dump().items() if v is not None}
     if not sets:
         raise HTTPException(400, "无可更新字段")
-    db = await get_connection()
-    try:
-        old = await (await db.execute("SELECT priority FROM tasks WHERE id=? AND project_id=?",
-                                      (task_id, pid))).fetchone()
-        cols = ", ".join(f"{k}=?" for k in sets)
-        cur = await db.execute(
-            f"UPDATE tasks SET {cols}, updated_at=datetime('now') WHERE id=? AND project_id=?",
-            (*sets.values(), task_id, pid))
-        await db.commit()
-        if cur.rowcount == 0:
+    async with get_session_factory()() as session:
+        old = (await session.execute(
+            select(Task.priority).where(Task.id == task_id, Task.project_id == pid))).first()
+        result_upd = await session.execute(
+            sa_update(Task).where(Task.id == task_id, Task.project_id == pid)
+            .values(**sets, updated_at=now_expr()))
+        await session.commit()
+        if result_upd.rowcount == 0:
             raise HTTPException(404, "任务不存在")
-        row = await (await db.execute("SELECT * FROM tasks WHERE id=?", (task_id,))).fetchone()
-        result = dict(row)
-    finally:
-        await db.close()
-    if "priority" in sets and old and old["priority"] != sets["priority"]:
+        task = (await session.execute(select(Task).where(Task.id == task_id))).scalar_one()
+        result = _task_dict(task)
+    if "priority" in sets and old and old.priority != sets["priority"]:
         await log_activity(task_id, "priority_changed", "user", user.get("username", ""),
-                           {"from": old["priority"], "to": sets["priority"]})
+                           {"from": old.priority, "to": sets["priority"]})
     return result
 
 
@@ -146,19 +170,16 @@ async def set_status(pid: int, task_id: int, req: StatusRequest, user: dict = De
             raise HTTPException(
                 409, f"还有 {len(pending)} 个子任务未完成（{names}），父任务不能标记完成。"
                      f"请等子任务全部完成并由负责人汇总后再收尾，或 force 强制。")
-    db = await get_connection()
-    try:
-        old = await (await db.execute("SELECT status FROM tasks WHERE id=? AND project_id=?",
-                                      (task_id, pid))).fetchone()
-        cur = await db.execute(
-            "UPDATE tasks SET status=?, updated_at=datetime('now') WHERE id=? AND project_id=?",
-            (req.status, task_id, pid))
-        await db.commit()
-        if cur.rowcount == 0:
+    async with get_session_factory()() as session:
+        old = (await session.execute(
+            select(Task.status).where(Task.id == task_id, Task.project_id == pid))).first()
+        result_upd = await session.execute(
+            sa_update(Task).where(Task.id == task_id, Task.project_id == pid)
+            .values(status=req.status, updated_at=now_expr()))
+        await session.commit()
+        if result_upd.rowcount == 0:
             raise HTTPException(404, "任务不存在")
-        old_status = old["status"] if old else ""
-    finally:
-        await db.close()
+        old_status = old.status if old else ""
     if old_status != req.status:
         await log_activity(task_id, "status_changed", "user", user.get("username", ""),
                            {"from": old_status, "to": req.status})
@@ -180,26 +201,24 @@ async def delete_task(pid: int, task_id: int):
     从参与过执行的成员记忆里精准剔除对应条目。清理失败不影响删除主流程。
     """
     await _ensure_project(pid)
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         # 本任务 + 其子任务的 id 集合（先收集，供删库与清记忆共用）
-        srows = await (await db.execute(
-            "SELECT id FROM tasks WHERE parent_task_id=? AND project_id=?", (task_id, pid))).fetchall()
-        all_ids = [task_id] + [r["id"] for r in srows]
+        srows = (await session.execute(
+            select(Task.id).where(Task.parent_task_id == task_id, Task.project_id == pid))).all()
+        all_ids = [task_id] + [r.id for r in srows]
         # 这些任务里真正跑过 run 的成员 slug（有 run = 有记忆沉淀），删库前查出（task_runs 会级联删）
-        ph = ",".join("?" for _ in all_ids)
-        arows = await (await db.execute(
-            f"SELECT DISTINCT agent_slug FROM task_runs WHERE task_id IN ({ph}) AND agent_slug<>''",
-            all_ids)).fetchall()
-        slugs = [r["agent_slug"] for r in arows]
+        arows = (await session.execute(
+            select(distinct(TaskRun.agent_slug))
+            .where(TaskRun.task_id.in_(all_ids), TaskRun.agent_slug != ""))).all()
+        slugs = [r[0] for r in arows]
         # 级联删除子任务 + 本任务（task_runs/run_logs 经外键 ON DELETE CASCADE 一并清）
-        await db.execute("DELETE FROM tasks WHERE parent_task_id=? AND project_id=?", (task_id, pid))
-        cur = await db.execute("DELETE FROM tasks WHERE id=? AND project_id=?", (task_id, pid))
-        await db.commit()
-        if cur.rowcount == 0:
+        await session.execute(
+            sa_delete(Task).where(Task.parent_task_id == task_id, Task.project_id == pid))
+        result_del = await session.execute(
+            sa_delete(Task).where(Task.id == task_id, Task.project_id == pid))
+        await session.commit()
+        if result_del.rowcount == 0:
             raise HTTPException(404, "任务不存在")
-    finally:
-        await db.close()
 
     # 清各成员记忆里属于这些任务的条目（任务没了，沉淀也失效）
     purged = 0
@@ -229,37 +248,38 @@ async def get_progress(pid: int, task_id: int):
 @router.get("/{pid}/tasks/{task_id}/subtasks")
 async def list_subtasks(pid: int, task_id: int):
     await _ensure_project(pid)
-    db = await get_connection()
-    try:
-        rows = await (await db.execute(
-            "SELECT * FROM tasks WHERE parent_task_id=? ORDER BY order_idx, id", (task_id,))).fetchall()
-        return {"subtasks": [dict(r) for r in rows]}
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(Task).where(Task.parent_task_id == task_id)
+            .order_by(Task.order_idx, Task.id))).scalars().all()
+        return {"subtasks": [_task_dict(t) for t in rows]}
 
 
 @router.get("/{pid}/tasks/{task_id}")
 async def get_task(pid: int, task_id: int):
     """单个任务详情（顶层或子任务通用）——子任务详情页靠它加载，看板列表只含顶层任务。"""
     await _ensure_project(pid)
-    db = await get_connection()
-    try:
-        row = await (await db.execute(
-            """SELECT t.*,
-                      (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id=t.id) AS sub_total,
-                      (SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id=t.id AND c.status='done') AS sub_done,
-                      pt.title AS parent_title
-               FROM tasks t LEFT JOIN tasks pt ON pt.id = t.parent_task_id
-               WHERE t.id=? AND t.project_id=?""", (task_id, pid))).fetchone()
+    sub_total = literal_column(
+        "(SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id=tasks.id)")
+    sub_done = literal_column(
+        "(SELECT COUNT(*) FROM tasks c WHERE c.parent_task_id=tasks.id AND c.status='done')")
+    parent = aliased(Task)   # 自 LEFT JOIN 取父任务标题
+    async with get_session_factory()() as session:
+        row = (await session.execute(
+            select(Task, sub_total.label("sub_total"), sub_done.label("sub_done"),
+                   parent.title.label("parent_title"))
+            .select_from(Task)
+            .outerjoin(parent, parent.id == Task.parent_task_id)
+            .where(Task.id == task_id, Task.project_id == pid))).first()
         if not row:
             raise HTTPException(404, "任务不存在")
-        d = dict(row)
+        t, st, sd, parent_title = row
+        d = _task_dict(t)
+        d.update(sub_total=st, sub_done=sd, parent_title=parent_title)
         for col in ("created_at", "updated_at"):
             if col in d:
                 d[col] = to_beijing(d[col])
         return d
-    finally:
-        await db.close()
 
 
 class SubtaskRequest(BaseModel):
@@ -274,29 +294,26 @@ async def create_subtask(pid: int, task_id: int, req: SubtaskRequest, user: dict
     await _ensure_project(pid)
     if not req.title.strip():
         raise HTTPException(400, "子任务标题不能为空")
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         # 只允许在顶层任务下建子任务：子任务不能再有子任务（避免多层派生）
-        parent = await (await db.execute(
-            "SELECT parent_task_id FROM tasks WHERE id=? AND project_id=?", (task_id, pid))).fetchone()
+        parent = (await session.execute(
+            select(Task.parent_task_id)
+            .where(Task.id == task_id, Task.project_id == pid))).first()
         if not parent:
             raise HTTPException(404, "父任务不存在")
-        if parent["parent_task_id"] is not None:
+        if parent.parent_task_id is not None:
             raise HTTPException(400, "子任务下不能再创建子任务")
         prio = req.priority if req.priority in PRIORITIES else "none"
-        conv = await db.execute(
-            "INSERT INTO conversations (project_id, title) VALUES (?,?)", (pid, req.title.strip()))
-        cur = await db.execute(
-            """INSERT INTO tasks (project_id, title, description, assignee_slug, conversation_id,
-                                  parent_task_id, priority, status)
-               VALUES (?,?,?,?,?,?,?, 'backlog')""",
-            (pid, req.title.strip(), req.description.strip(), req.assignee_slug,
-             conv.lastrowid, task_id, prio))
-        await db.commit()
-        row = await (await db.execute("SELECT * FROM tasks WHERE id=?", (cur.lastrowid,))).fetchone()
-        result = dict(row)
-    finally:
-        await db.close()
+        conv = Conversation(project_id=pid, title=req.title.strip())
+        session.add(conv)
+        await session.flush()   # 取 conv.id
+        sub = Task(project_id=pid, title=req.title.strip(), description=req.description.strip(),
+                   assignee_slug=req.assignee_slug, conversation_id=conv.id,
+                   parent_task_id=task_id, priority=prio, status="backlog")
+        session.add(sub)
+        await session.commit()
+        await session.refresh(sub)
+        result = _task_dict(sub)
     await log_activity(task_id, "commented", "user", user.get("username", ""),
                        {"note": f"新增子任务：{req.title.strip()}"})
     return result
