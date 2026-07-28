@@ -5,12 +5,31 @@ import uuid
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
+from sqlalchemy import distinct, func, literal_column, or_, select, update as sa_update
+
 from auth import require_admin
 
 import agents as agents_mod
-from database import get_connection
+from models import (
+    AgentProfile,
+    AgentSkill,
+    AgentTemplate,
+    Project,
+    ProjectAgent,
+    Skill,
+    get_session_factory,
+    insert_or_ignore,
+    now_expr,
+    upsert,
+)
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
+
+# agent_templates 物理列序（对齐 001 基线），SELECT t.* → dict 保持键集合/顺序
+_TEMPLATE_COLS = (
+    "id", "slug", "name", "division", "description", "emoji", "color",
+    "source_path", "body", "imported_at", "tags", "origin",
+)
 
 
 class CreateTalentRequest(BaseModel):
@@ -39,109 +58,116 @@ class RenameDivisionRequest(BaseModel):
 async def list_templates(division: str = "", q: str = ""):
     """模版列表。支持按 division 与关键词 q（匹配 name/description）过滤。不含 body。
     默认按「已加入的项目数」降序排（热门人才在前），其次分类、名字。"""
-    sql = ("SELECT t.id, t.slug, t.name, t.division, t.description, t.emoji, t.color, "
-           "t.origin, "
-           "p.nickname AS nickname, p.avatar AS avatar, "
-           "(SELECT COUNT(DISTINCT pa.project_id) FROM project_agents pa WHERE pa.slug = t.slug) AS project_count, "
-           # 已解决任务数：该身份(slug)在「已完成(done)」任务里有过成功执行(succeeded run)，按任务去重。
-           # 排除：① 已删除的任务卡片（JOIN tasks 天然排除）；② 孤儿子任务——父任务已被删、
-           # 子任务残留的不算（要求顶层任务，或其父任务仍存在）。
-           "(SELECT COUNT(DISTINCT tr.task_id) FROM task_runs tr JOIN tasks tk ON tk.id = tr.task_id "
-           " WHERE tr.agent_slug = t.slug AND tr.status = 'succeeded' AND tk.status = 'done' "
-           " AND (tk.parent_task_id IS NULL OR EXISTS "
-           "      (SELECT 1 FROM tasks pt WHERE pt.id = tk.parent_task_id))) AS solved_tasks "
-           "FROM agent_templates t LEFT JOIN agent_profiles p ON p.slug = t.slug WHERE 1=1")
-    params: list = []
+    # 两个相关子查询逐字保留原 SQL（绑定当前行 agent_templates.slug），
+    # 用 literal_column 承载，避免翻译嵌套逻辑出偏差（与 project_agents 同款）。
+    project_count = literal_column(
+        "(SELECT COUNT(DISTINCT pa.project_id) FROM project_agents pa "
+        "WHERE pa.slug = agent_templates.slug)")
+    # 已解决任务数：该身份(slug)在「已完成(done)」任务里有过成功执行(succeeded run)，按任务去重。
+    # 排除：① 已删除的任务卡片（JOIN tasks 天然排除）；② 孤儿子任务——父任务已被删、
+    # 子任务残留的不算（要求顶层任务，或其父任务仍存在）。
+    solved_tasks = literal_column(
+        "(SELECT COUNT(DISTINCT tr.task_id) FROM task_runs tr JOIN tasks tk ON tk.id = tr.task_id "
+        " WHERE tr.agent_slug = agent_templates.slug AND tr.status = 'succeeded' AND tk.status = 'done' "
+        " AND (tk.parent_task_id IS NULL OR EXISTS "
+        "      (SELECT 1 FROM tasks pt WHERE pt.id = tk.parent_task_id)))")
+    stmt = select(
+        AgentTemplate.id, AgentTemplate.slug, AgentTemplate.name, AgentTemplate.division,
+        AgentTemplate.description, AgentTemplate.emoji, AgentTemplate.color, AgentTemplate.origin,
+        AgentProfile.nickname.label("nickname"), AgentProfile.avatar.label("avatar"),
+        project_count.label("project_count"), solved_tasks.label("solved_tasks"),
+    ).select_from(AgentTemplate).outerjoin(
+        AgentProfile, AgentProfile.slug == AgentTemplate.slug)
     if division:
-        sql += " AND t.division = ?"
-        params.append(division)
+        stmt = stmt.where(AgentTemplate.division == division)
     if q:
-        sql += " AND (t.name LIKE ? OR t.description LIKE ?)"
-        params.extend([f"%{q}%", f"%{q}%"])
+        like = f"%{q}%"
+        stmt = stmt.where(or_(AgentTemplate.name.like(like), AgentTemplate.description.like(like)))
     # 排序：项目数优先；项目数相同看已完成任务数（越多越靠前）；再按分类、名字兜底。
-    sql += " ORDER BY project_count DESC, solved_tasks DESC, t.division, t.name"
-    db = await get_connection()
-    try:
-        cur = await db.execute(sql, params)
-        rows = await cur.fetchall()
-        return {"templates": [dict(r) for r in rows], "count": len(rows)}
-    finally:
-        await db.close()
+    stmt = stmt.order_by(
+        literal_column("project_count").desc(), literal_column("solved_tasks").desc(),
+        AgentTemplate.division, AgentTemplate.name)
+    _cols = ("id", "slug", "name", "division", "description", "emoji", "color", "origin",
+             "nickname", "avatar", "project_count", "solved_tasks")
+    async with get_session_factory()() as session:
+        rows = (await session.execute(stmt)).all()
+        templates = [{c: getattr(r, c) for c in _cols} for r in rows]
+        return {"templates": templates, "count": len(templates)}
 
 
 @router.get("/divisions")
 async def list_divisions():
     """分类列表 + 各自数量。"""
-    db = await get_connection()
-    try:
-        cur = await db.execute(
-            "SELECT division, COUNT(*) AS n FROM agent_templates "
-            "GROUP BY division ORDER BY division")
-        rows = await cur.fetchall()
-        return {"divisions": [dict(r) for r in rows]}
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(AgentTemplate.division, func.count().label("n"))
+            .group_by(AgentTemplate.division)
+            .order_by(AgentTemplate.division))).all()
+        return {"divisions": [{"division": r.division, "n": r.n} for r in rows]}
 
 
 @router.get("/templates/{template_id}")
 async def get_template(template_id: int):
     """模版详情，含人格正文 body。"""
-    db = await get_connection()
-    try:
-        cur = await db.execute(
-            """SELECT t.*, p.nickname AS nickname, p.avatar AS avatar
-               FROM agent_templates t LEFT JOIN agent_profiles p ON p.slug = t.slug
-               WHERE t.id = ?""", (template_id,))
-        row = await cur.fetchone()
+    async with get_session_factory()() as session:
+        row = (await session.execute(
+            select(AgentTemplate,
+                   AgentProfile.nickname.label("nickname"),
+                   AgentProfile.avatar.label("avatar"))
+            .select_from(AgentTemplate)
+            .outerjoin(AgentProfile, AgentProfile.slug == AgentTemplate.slug)
+            .where(AgentTemplate.id == template_id))).first()
         if not row:
             raise HTTPException(404, "模版不存在")
-        data = dict(row)
+        tpl, nickname, avatar = row
+        data = {c: getattr(tpl, c) for c in _TEMPLATE_COLS}
+        data["nickname"] = nickname
+        data["avatar"] = avatar
         # 该人才（按 slug）已集成的 Skills，带上 Skill 名称/描述用于界面展示。
-        skill_rows = await (await db.execute(
-            """SELECT s.slug, s.name, s.description
-               FROM agent_skills a JOIN skills s ON s.slug = a.skill_slug
-               WHERE a.agent_slug = ? ORDER BY s.name""", (data["slug"],))).fetchall()
-        data["skills"] = [dict(r) for r in skill_rows]
+        skill_rows = (await session.execute(
+            select(Skill.slug, Skill.name, Skill.description)
+            .join(AgentSkill, AgentSkill.skill_slug == Skill.slug)
+            .where(AgentSkill.agent_slug == data["slug"])
+            .order_by(Skill.name))).all()
+        data["skills"] = [{"slug": r.slug, "name": r.name, "description": r.description}
+                          for r in skill_rows]
         return data
-    finally:
-        await db.close()
 
 
 @router.get("/templates/{template_id}/projects")
 async def template_projects(template_id: int):
     """该人才已加入的项目 + 仍可邀请加入的项目（按 slug）。"""
-    db = await get_connection()
-    try:
-        t = await (await db.execute("SELECT slug FROM agent_templates WHERE id=?", (template_id,))).fetchone()
+    async with get_session_factory()() as session:
+        t = (await session.execute(
+            select(AgentTemplate.slug).where(AgentTemplate.id == template_id))).first()
         if not t:
             raise HTTPException(404, "模版不存在")
-        slug = t["slug"]
-        joined = await (await db.execute(
-            """SELECT DISTINCT p.id, p.title FROM project_agents pa
-               JOIN projects p ON p.id = pa.project_id
-               WHERE pa.slug=? ORDER BY p.id""", (slug,))).fetchall()
-        joined_ids = {r["id"] for r in joined}
-        all_p = await (await db.execute("SELECT id, title FROM projects ORDER BY id")).fetchall()
-        joinable = [dict(r) for r in all_p if r["id"] not in joined_ids]
-        return {"joined": [dict(r) for r in joined], "joinable": joinable}
-    finally:
-        await db.close()
+        slug = t.slug
+        joined = (await session.execute(
+            select(distinct(Project.id).label("id"), Project.title)
+            .select_from(ProjectAgent)
+            .join(Project, Project.id == ProjectAgent.project_id)
+            .where(ProjectAgent.slug == slug)
+            .order_by(Project.id))).all()
+        joined_ids = {r.id for r in joined}
+        all_p = (await session.execute(
+            select(Project.id, Project.title).order_by(Project.id))).all()
+        joinable = [{"id": r.id, "title": r.title} for r in all_p if r.id not in joined_ids]
+        return {"joined": [{"id": r.id, "title": r.title} for r in joined], "joinable": joinable}
 
 
 @router.put("/templates/{template_id}/division", dependencies=[Depends(require_admin)])
 async def set_talent_division(template_id: int, req: SetDivisionRequest):
     """改变某个人才的分类（空=归入「其他」）。"""
     div = req.division.strip()
-    db = await get_connection()
-    try:
-        row = await (await db.execute(
-            "SELECT id FROM agent_templates WHERE id=?", (template_id,))).fetchone()
+    async with get_session_factory()() as session:
+        row = (await session.execute(
+            select(AgentTemplate.id).where(AgentTemplate.id == template_id))).first()
         if not row:
             raise HTTPException(404, "人才不存在")
-        await db.execute("UPDATE agent_templates SET division=? WHERE id=?", (div, template_id))
-        await db.commit()
-    finally:
-        await db.close()
+        await session.execute(
+            sa_update(AgentTemplate).where(AgentTemplate.id == template_id).values(division=div))
+        await session.commit()
     return {"ok": True, "division": div}
 
 
@@ -154,14 +180,11 @@ async def rename_division(req: RenameDivisionRequest):
         raise HTTPException(400, "原分类名不能为空")
     if not new:
         raise HTTPException(400, "新分类名不能为空")
-    db = await get_connection()
-    try:
-        cur = await db.execute(
-            "UPDATE agent_templates SET division=? WHERE division=?", (new, old))
-        await db.commit()
-        affected = cur.rowcount
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        result = await session.execute(
+            sa_update(AgentTemplate).where(AgentTemplate.division == old).values(division=new))
+        await session.commit()
+        affected = result.rowcount
     return {"ok": True, "affected": affected}
 
 
@@ -171,14 +194,11 @@ async def delete_division(name: str):
     old = (name or "").strip()
     if not old:
         raise HTTPException(400, "分类名不能为空")
-    db = await get_connection()
-    try:
-        cur = await db.execute(
-            "UPDATE agent_templates SET division='' WHERE division=?", (old,))
-        await db.commit()
-        affected = cur.rowcount
-    finally:
-        await db.close()
+    async with get_session_factory()() as session:
+        result = await session.execute(
+            sa_update(AgentTemplate).where(AgentTemplate.division == old).values(division=""))
+        await session.commit()
+        affected = result.rowcount
     return {"ok": True, "affected": affected}
 
 
@@ -205,40 +225,34 @@ async def create_talent(req: CreateTalentRequest):
     slug = f"manual-{_slugify(name)}-{uuid.uuid4().hex[:8]}"
     nickname = req.nickname.strip()[:40]
 
-    db = await get_connection()
-    try:
+    async with get_session_factory()() as session:
         # 昵称唯一（与 agent_config.set_profile 口径一致）
         if nickname:
-            dup = await (await db.execute(
-                "SELECT slug FROM agent_profiles WHERE nickname=?", (nickname,))).fetchone()
+            dup = (await session.execute(
+                select(AgentProfile.slug).where(AgentProfile.nickname == nickname))).first()
             if dup:
                 raise HTTPException(409, f"昵称「{nickname}」已被占用，请换一个")
-        await db.execute(
-            """INSERT INTO agent_templates
-               (slug, name, division, description, emoji, color, source_path, body, origin)
-               VALUES (?,?,?,?,?,?,?,?, 'manual')""",
-            (slug, name, req.division.strip(), req.description.strip(),
-             req.emoji.strip(), req.color.strip(), "", req.body))
+        tpl = AgentTemplate(
+            slug=slug, name=name, division=req.division.strip(),
+            description=req.description.strip(), emoji=req.emoji.strip(),
+            color=req.color.strip(), source_path="", body=req.body, origin="manual")
+        session.add(tpl)
         # agent_profiles：昵称/头像/模型（有任一非空才写）
         if nickname or req.avatar.strip() or req.provider_id.strip():
-            await db.execute(
-                """INSERT INTO agent_profiles (slug, provider_id, nickname, avatar, updated_at)
-                   VALUES (?,?,?,?, datetime('now'))
-                   ON CONFLICT(slug) DO UPDATE SET
-                     provider_id=excluded.provider_id, nickname=excluded.nickname,
-                     avatar=excluded.avatar, updated_at=datetime('now')""",
-                (slug, req.provider_id.strip(), nickname, req.avatar.strip()))
+            await session.execute(upsert(
+                AgentProfile, ["slug"],
+                insert_values={"slug": slug, "provider_id": req.provider_id.strip(),
+                               "nickname": nickname, "avatar": req.avatar.strip(),
+                               "updated_at": now_expr()},
+                update_values={"provider_id": req.provider_id.strip(), "nickname": nickname,
+                               "avatar": req.avatar.strip(), "updated_at": now_expr()}))
         # agent_skills：绑定 Skills（按 slug 跨项目共享）
         for ss in dict.fromkeys(s for s in req.skill_slugs if s.strip()):
-            await db.execute(
-                "INSERT OR IGNORE INTO agent_skills (agent_slug, skill_slug) VALUES (?,?)",
-                (slug, ss))
-        row = await (await db.execute(
-            "SELECT id FROM agent_templates WHERE slug=?", (slug,))).fetchone()
-        await db.commit()
-        new_id = row["id"] if row else None
-    finally:
-        await db.close()
+            await session.execute(insert_or_ignore(AgentSkill).values(
+                agent_slug=slug, skill_slug=ss))
+        await session.flush()   # 取 tpl.id（对齐旧 SELECT id WHERE slug）
+        new_id = tpl.id
+        await session.commit()
     # 把绑定的 Skills 使用说明写进该 Agent 记忆（与项目内配 Skills 行为一致）
     if req.skill_slugs:
         try:
