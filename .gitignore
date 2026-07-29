@@ -64,3 +64,4 @@ Resume/
 backend/wk_stats*.txt
 backend/wk_tasks.txt
 backend/wk_shots/
+*.dump
