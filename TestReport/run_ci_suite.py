@@ -30,18 +30,19 @@ except Exception:
 HERE = Path(__file__).resolve().parent
 BACKEND = HERE.parent / "backend"
 
-# —— 门禁清单：40 项（39 隔离 probe + QA 主套件）。注释标注覆盖域，与 TestReport/README.md 对齐。——
+# —— 门禁清单：39 项（38 隔离 probe + QA 主套件）。注释标注覆盖域，与 TestReport/README.md 对齐。——
+# S5 全仓零 sqlite：退役 run_wal_concurrency_probe（WAL 语义随 sqlite 消亡）→ 补 run_pg_concurrency_probe；
+#                    退役 run_orm_engine_probe（测 PRAGMA/busy_timeout，PG 无对应物）。净 40→39。
 # 排除（真实 CLI，非隔离桩）：run_collab_scenario.py / run_codex_cli_smoke.py
 GATE = [
     # 主套件
     "run_qa_suite.py",                    # 平台主回归：登录/鉴权/脱敏/路径穿越/CRUD/看板/任务/Agent 配置
-    # 数据底座 S1/S2
-    "run_wal_concurrency_probe.py",       # S1：WAL/busy_timeout + 并发写零 locked + 连接收口
-    "run_migration_probe.py",             # S2/S3.6：Alembic 建库逐字节对齐 + stamp 幂等 + 002 数据规整
+    # 数据底座 S2/S5：并发正确性 + 迁移
+    "run_pg_concurrency_probe.py",        # S5：PG 并发正确性——异行零丢失 / 同行行锁串行 / enqueue 去重（替 S1 WAL 探针）
+    "run_migration_probe.py",             # S2/S3.6：PG Alembic 建 18 表 + stamp 幂等 + 002 数据规整 + 往返
     # 数据底座 S3：ORM 地基
-    "run_orm_schema_parity_probe.py",     # 18 ORM 模型逐字段对齐 001 基线
-    "run_orm_engine_probe.py",            # async engine/session 调优对齐 S1
-    "run_dialect_helper_probe.py",        # now_expr/方言 helper 编译与等价
+    "run_orm_schema_parity_probe.py",     # ORM 模型声明 ↔ 迁移后 PG 实际 schema 逐字段对齐
+    "run_dialect_helper_probe.py",        # now_expr/方言 helper PG 编译与运行期等价
     # 数据底座 S3.4：逐文件迁移等价性
     "run_s34_memory_sync_probe.py",       # 批1 agent_memory_sync
     "run_s34_batch2_probe.py",            # 批2 auth/projects/activity
@@ -81,7 +82,7 @@ GATE = [
 ]
 
 # 长跑/压力类：--exclude-slow 时跳过（快速门用）
-SLOW = {"run_concurrency_probe.py", "run_wal_concurrency_probe.py"}
+SLOW = {"run_concurrency_probe.py", "run_pg_concurrency_probe.py"}
 
 _COUNT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
 _PASSFAIL_RE = re.compile(r"PASS\s*=\s*(\d+)\s+FAIL\s*=\s*(\d+)")
@@ -116,7 +117,10 @@ def main() -> int:
         print("\n排除（真实 CLI，非门禁）：run_collab_scenario.py, run_codex_cli_smoke.py")
         return 0
 
-    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    # AKIVILI_TEST_NULLPOOL=1：探针跨 asyncio.run() 事件循环，PG engine 用 NullPool 规避
+    # asyncpg 池连接的 loop 绑定问题（见 models/engine.py）。仅测试设，生产不设。
+    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
+               AKIVILI_TEST_NULLPOOL="1")
     results = []   # (name, ok, passed, total, secs)
     t0 = time.perf_counter()
     print(f"=== CI 回归门禁：{len(gate)} 项（cwd={BACKEND}）===\n")

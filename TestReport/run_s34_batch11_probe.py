@@ -34,8 +34,9 @@ def check(name, cond, detail=""):
 
 
 def _isolate(tmp):
+    from run_qa_suite import isolated_pg_db_url  # noqa: PLC0415
     cfg = {
-        "db_path": os.path.join(tmp, "batch11.db"),
+        "db_url": isolated_pg_db_url(),   # S5：PG 隔离库（替代 sqlite db_path）
         "agent_library_dir": os.path.join(tmp, "agents"),
         "skills_dir": os.path.join(tmp, "skills"),
         "memory_dir": os.path.join(tmp, "mem"),
@@ -134,10 +135,10 @@ async def _run():
     async with SF() as s:
         # 一个未来退避的 queued 行（不应被领取）
         await s.execute(text("INSERT INTO run_queue (id,task_id,agent_slug,status,next_retry_at) "
-                             "VALUES (900,600,'dev','queued',datetime('now','+1 hour'))"))
+                             "VALUES (900,600,'dev','queued',to_char((now() AT TIME ZONE 'UTC') + interval '+1 hour', 'YYYY-MM-DD HH24:MI:SS'))"))
         # 一个已到点的 queued 行（应被领取）
         await s.execute(text("INSERT INTO run_queue (id,task_id,agent_slug,status,next_retry_at) "
-                             "VALUES (901,600,'dev','queued',datetime('now','-1 minute'))"))
+                             "VALUES (901,600,'dev','queued',to_char((now() AT TIME ZONE 'UTC') + interval '-1 minute', 'YYYY-MM-DD HH24:MI:SS'))"))
         await s.commit()
     c = await collab._claim_one()
     check("_claim_one 跳过退避窗口内、领到已到点行", c and c["id"] == 901, str(c and c["id"]))
@@ -203,12 +204,12 @@ async def _run_orphans():
     async with SF() as s:
         # 静默 1 小时的 running（started_at 1h 前、无日志）→ 应被扫到
         await s.execute(text("INSERT INTO task_runs (id,task_id,agent_slug,status,started_at) "
-                             "VALUES (820,701,'dev','running',datetime('now','-1 hour'))"))
+                             "VALUES (820,701,'dev','running',to_char((now() AT TIME ZONE 'UTC') + interval '-1 hour', 'YYYY-MM-DD HH24:MI:SS'))"))
         # 刚活动的 running（现在有日志）→ 不该被扫到
         await s.execute(text("INSERT INTO task_runs (id,task_id,agent_slug,status,started_at) "
-                             "VALUES (821,701,'dev','running',datetime('now','-1 hour'))"))
+                             "VALUES (821,701,'dev','running',to_char((now() AT TIME ZONE 'UTC') + interval '-1 hour', 'YYYY-MM-DD HH24:MI:SS'))"))
         await s.execute(text("INSERT INTO run_logs (run_id,channel,content,ts) "
-                             "VALUES (821,'stdout','刚刚还在输出',datetime('now'))"))
+                             "VALUES (821,'stdout','刚刚还在输出',to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))"))
         await s.commit()
     swept = await collab.sweep_orphan_task_runs(idle_sec=1800)   # 30 分钟阈值
     check("sweep 回收 1 条(仅静默超阈的 820)", swept == 1, str(swept))

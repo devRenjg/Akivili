@@ -9,9 +9,8 @@
    把老库一次性纳入 Alembic 管理。等价于 S2.6 的手工 `alembic stamp 001`，
    但内建为兜底，避免"忘了先 stamp 就 upgrade"导致撞表已存在、启动崩溃。
 
-迁移用同步 driver（与运行期异步 driver 解耦）：sqlite 走 pysqlite、PostgreSQL 走
-psycopg v3（asyncpg 纯异步跑不了 Alembic 同步引擎）。迁移 URL 由 config.migration_db_url()
-单一构造，见 openspec s2-plan / 决策 2 / S4.1。
+数据底座 S5：PG 单引擎。迁移用同步 psycopg v3 driver（asyncpg 纯异步跑不了 Alembic
+同步引擎）；迁移 URL 由 config.migration_db_url() 单一构造。见 openspec s2-plan / S5。
 """
 import os
 

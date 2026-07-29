@@ -125,9 +125,11 @@ async def _stage_bc(check, sf, collab, runner, runs, pid, tid, paid,
 
 
 async def main():
-    url = os.environ.get("AKIVILI_DB_URL", "")
+    # S5：运行期已硬默认 PG，直接看 config 实际生效的 db_url（不再要求显式设 env）。
+    from config import load_settings
+    url = load_settings().db_url
     if "postgresql" not in url:
-        raise SystemExit(f"AKIVILI_DB_URL 必须指向 PG：当前 {url!r}")
+        raise SystemExit(f"运行期 db_url 必须是 PG：当前 {url!r}")
 
     from sqlalchemy import select, func, text, delete as sa_delete
     from models import (get_session_factory, now_expr, now_offset, elapsed_seconds,

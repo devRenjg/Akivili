@@ -32,7 +32,7 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 ### CI 门禁（一键全量）
 
 ```bash
-# 跑全部 40 项门禁（39 隔离 probe + QA 主套件），任一失败即非零退出
+# 跑全部 39 项门禁（38 隔离 probe + QA 主套件），任一失败即非零退出
 python TestReport/run_ci_suite.py
 python TestReport/run_ci_suite.py --list          # 只列清单不跑
 python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
@@ -43,7 +43,7 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
   > 注：目前**未开分支保护**——CI 红了在 Actions 页面可见，但不强制拦截合入。
 - probe 清单只在 `run_ci_suite.py` 的 `GATE` 里维护一处——新增 probe 时同步加入。
 - 门禁**不含**需真实 CLI 的 `run_collab_scenario.py` / `run_codex_cli_smoke.py`（人工按需单跑）。
-- 实测：**40/40 项、1125 断言、~48s 全绿**（2026-07-28）。
+- 实测：**39/39 项、581 断言、~97s 全绿**（跑在 PostgreSQL 单引擎；2026-07-24 S5）。
 
 ## 全套测试 vs CI 门禁
 
@@ -51,37 +51,44 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 干净环境自动复现、被挑进 CI 每次自动跑的那批。
 
 ```
-全套 45 个 run_*.py
-├── run_ci_suite.py            ← 不是测试，是「调度器」(按 GATE 清单跑其余 40 个、收退出码)
-├── 40 个 → 进 CI 门禁 ✅       (39 隔离 probe + run_qa_suite 主套件)
+全套 44 个 run_*.py
+├── run_ci_suite.py            ← 不是测试，是「调度器」(按 GATE 清单跑其余 39 个、收退出码)
+├── 39 个 → 进 CI 门禁 ✅       (38 隔离 probe + run_qa_suite 主套件)
 └── 4 个 → 不进门禁 ❌
       ├── run_collab_scenario.py   (需真实 claude/codex CLI + LLM)
       ├── run_codex_cli_smoke.py   (需真实 Codex CLI)
       ├── run_pg_e2e_probe.py      (需真实 PostgreSQL；数据底座 S4.6)
-      └── run_pg_sqlite_consistency_probe.py  (需真实 PostgreSQL；数据底座 S4.5)
+      └── run_pg_sqlite_consistency_probe.py  (需真实 PostgreSQL；数据底座 S4.5，一次性迁移一致性核验)
 ```
 
-|  | 全套测试集合 | CI 40 门禁 |
+|  | 全套测试集合 | CI 39 门禁 |
 |---|---|---|
-| **范围** | 所有 `run_*.py`（45 个） | 其中挑进 `GATE` 的 40 个 |
+| **范围** | 所有 `run_*.py`（44 个） | 其中挑进 `GATE` 的 39 个 |
 | **触发** | 人工挑着单跑 / 本地 `run_ci_suite` 一键 | GitHub 每次 push/PR **自动** |
-| **含真实外部依赖测试** | 含（4 个：2 CLI + 2 PG） | **不含**（CI 无 CLI/无 PG，跑不了） |
+| **含真实外部依赖测试** | 含（4 个：2 CLI + 2 PG 专项） | 全部需 PG（S5 起门禁探针跑在 PostgreSQL 单引擎） |
 | **保障对象** | 逻辑正确 + 与真实外部世界的集成 | 逻辑正确（鉴权/CRUD/ORM 等价/调度/回收…） |
 
-**为什么分两层**（本质都是保障测试，分界在「能否在真空里复现」）：
+**为什么分两层**（S5 起分界在「是否确定性可自动跑」——需真实 CLI/LLM 或一次性核验的留人工）：
 
-- **进门禁**的 40 个：不碰外部依赖、纯逻辑，任何干净环境可复现 → 适合自动门禁。
-  改一行代码撞坏 → CI 立刻红。
-- **留人工**的 2 个：要真启动 claude/codex CLI、真调 LLM，依赖网络/凭证/CLI 安装，
-  自动化跑不稳也跑不了 → 人工按需单跑（如换 provider 后验真实协同）。
+- **进门禁**的 39 个：确定性桩测试，不接真实 CLI/LLM。S5 全仓零 sqlite 后，这批统一跑在
+  **PostgreSQL 单引擎**上（每个探针用 `isolated_pg_db_url()` 建独立隔离库，跑完 atexit 删库），
+  无 sqlite 回退。改一行代码撞坏 → 门禁立刻红。
+- **留门禁外**的 4 个：2 个要真启动 claude/codex CLI、真调 LLM（依赖网络/凭证/CLI 安装，
+  自动化跑不稳）；2 个是数据底座 S4 的一次性 PG 迁移一致性/端到端核验（`run_pg_e2e` /
+  `run_pg_sqlite_consistency`，迁移窗口人工单跑）。
 
-这是业界 CI 通行分界：能在真空复现的（单元/集成）进自动门禁；必须接真实外部世界的
-（端到端）留人工。**新增测试时**：无外部依赖 → 记得加进 `run_ci_suite.py` 的 `GATE`；
-依赖真实 CLI/LLM → 保持门禁外，并在下方矩阵用 `*` 标注。
+**新增测试时**：确定性桩 → 加进 `run_ci_suite.py` 的 `GATE`（会跑在 PG 隔离库上）；
+依赖真实 CLI/LLM 或一次性核验 → 保持门禁外，并在下方矩阵用 `*` 标注。
+
+> ⚠️ **GitHub Actions 待收口（S5 Phase 3）**：`.github/workflows/ci.yml` 目前仍是
+> `windows-latest` + SQLite 假设，尚未挂 PostgreSQL service——门禁探针已全量依赖 PG，故
+> **CI 在补上 PG service 前无法在 GitHub 上跑绿**（本地 `run_ci_suite.py` 对着 PG 容器已 39/39）。
+> GitHub `services:` 容器仅 Linux runner 支持，收口需定 runner OS（windows→ubuntu）或 Windows 装 PG，
+> 属 Phase 3 割接决策，见根 README「数据底座 S5」。
 
 ## 测试矩阵
 
-> 实测通过数截至 2026-07-08。`*` = 需真实 CLI 供应商，非隔离桩。
+> 门禁实测通过数截至 2026-07-24（S5 全仓零 sqlite，39/39 跑在 PG）；部分业务探针计数为历史值。`*` = 需真实 CLI 供应商或一次性核验，非门禁隔离桩。
 
 ### 端到端主套件
 | 脚本 | 实测 | 覆盖 |
@@ -101,8 +108,10 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 | `run_timeout_and_qa_probe.py` | 14/14 | 静默超时(A) + 宽限保成果(B) + 硬墙钟(C)、超时收尾验收路由 |
 | `run_subtask_autocomplete_probe.py` | 6/6 | 子任务执行完自动进 done、全子完成→父任务 reviewing、失败任务不推进 |
 | `run_reactivate_probe.py` | 5/5 | 重跑子任务时父任务状态即时回写 in_progress |
-| `run_wal_concurrency_probe.py` | 8/8 | 数据底座 S1 回归护栏：get_connection 开 WAL/busy_timeout(config)/foreign_keys、init_db 建库即 WAL、12写者×40轮=480 并发写零 `database is locked`、aiosqlite.connect 仅剩 database.py 2 处(init+工厂)防旁路复活 |
-| `run_migration_probe.py` | 15/15 | 数据底座 S2 回归护栏：空库 alembic upgrade 逐字节重建基线18表、版本 stamp 到001、二次 upgrade 幂等、迁移路径置 WAL、存量库(有表无version)自动 stamp 不重建不丢数据、upgrade→downgrade base→upgrade 往返无损 |
+| `run_pg_concurrency_probe.py` | 4/4 | 数据底座 S5 并发正确性护栏（替退役的 S1 WAL 探针）：12写者×40轮=480 并发写不同行零丢失、20 并发原子 `UPDATE n=n+1` 行锁串行无丢更新（对照组 read-modify-write 观测丢 19/20，反证行锁必要）、10 并发 enqueue_run 同(task,agent)去重（应用层 SELECT-then-INSERT，无 DB 唯一约束——命中 count>1 会告警 TOCTOU 隐患但不判失败） |
+| `run_migration_probe.py` | 15/15 | 数据底座 S2/S5 回归护栏（PG）：空库 alembic upgrade 建满18表、版本 stamp 到 head(002)、二次 upgrade 幂等(noop)、存量库(有表无version)自动 stamp 不重建不丢数据、002 数据规整(planning→backlog/archived→done/其它不动)、upgrade→downgrade base→upgrade 往返表数无损（改造中抓出并修复 001 downgrade 缺 PG 分支的真实缺陷：手写 _DROP_ORDER 违反 FK 依赖，PG 强制 FK 下 DependentObjectsStillExist；改为 drop_all 按依赖拓扑删） |
+| `run_orm_schema_parity_probe.py` | 75/75 | 数据底座 S3/S5（PG）：ORM 模型**声明**（Base.metadata 内省）↔ 迁移链建出的 **PG 实际 schema**（information_schema/Inspector）逐表逐列对齐——表集合、列名集、主键、外键(含 on_delete)、唯一约束。防迁移/模型/002 任一侧静默漂移 |
+| `run_dialect_helper_probe.py` | 7/7 | 数据底座 S3.3/S5（PG-only）：方言 helper PG 分支正确——now_expr 编译为 to_char(UTC 秒级 text)、运行期写入格式 `YYYY-MM-DD HH:MM:SS` 与旧 datetime('now') 同形、timeutil.to_beijing 可解析(+8h)、elapsed_seconds PG 分支(EXTRACT EPOCH)算≈5秒、now_offset PG interval 形、insert_or_ignore PG on_conflict_do_nothing 幂等 |
 | `run_collab_scenario.py` `*` | 12 断言 | 真实 CLI 端到端协同场景（claude-cli/codex-cli 供应商） |
 
 ### 记忆与反思（Agent 成长）
@@ -135,7 +144,9 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 | `run_pg_sqlite_consistency_probe.py` `*` | 37/37 | 数据底座 S4.5：SQLite⇄PG **逐行逐列全量一致性**校验（表集合+逐表行数+每行每列值，NUL 剔除/悬空外键排除同口径，主键唯一性保证无错位）。搬迁后跑，无 `AKIVILI_DB_URL` 指向 PG 时明确退出 |
 | `run_pg_e2e_probe.py` `*` | 22/22 | 数据底座 S4.6：直连迁移后真实 PG 库跑端到端全链路（存量读 + 建项目/Agent/任务/enqueue/finalize/活动流 + 4 处方言查询 now_expr/now_offset/elapsed_seconds + 级联清理闭环），验证平台可运行在 PostgreSQL 上 |
 
-> 运行前置：`AKIVILI_DB_URL=postgresql+asyncpg://…` 指向已建库+已迁移的 PG（见根 README「数据底座 S4」）。这两个探针依赖真实 PG 容器，与 `*` CLI 探针同理留门禁外。
+> 运行前置：`AKIVILI_DB_URL=postgresql+asyncpg://…` 指向已建库+已迁移的 PG（见根 README「数据底座 S4」）。
+> 注：S5 后**所有门禁探针都跑在 PG 上**，故「需 PG」已非留门禁外的理由；这两个是 S4 搬迁的**一次性核验**
+> （逐行迁移一致性 / 迁移后端到端），只在迁移窗口人工单跑、不进每次 CI，故留门禁外。
 
 ### 工具（非测试）
 | 脚本 | 说明 |

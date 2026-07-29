@@ -115,7 +115,9 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
     async def fake_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
         slug = agent_obj["slug"]
         run_id_seq["n"] += 1
-        rid = f"run-{run_id_seq['n']}-{slug}"
+        # run_id = task_runs.id（INTEGER），与生产一致。整数计数器本身即唯一，
+        # kill 追踪按值比较（len(killed)），int key 同样有效；PG 下字符串会 DataError。
+        rid = run_id_seq["n"]
         yield ExecEvent("system", "", {"run_id": rid})
         active["count"] += 1
         active["peak"] = max(active["peak"], active["count"])
@@ -224,7 +226,8 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
         async def mixed_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
             slug = agent_obj["slug"]
             run_id_seq["n"] += 1
-            yield ExecEvent("system", "", {"run_id": f"run-{run_id_seq['n']}-{slug}"})
+            # run_id = task_runs.id（INTEGER），与生产一致；PG 下字符串会 DataError。
+            yield ExecEvent("system", "", {"run_id": run_id_seq["n"]})
             active["count"] += 1
             active["peak"] = max(active["peak"], active["count"])
             try:

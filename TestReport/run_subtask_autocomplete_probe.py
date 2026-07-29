@@ -99,7 +99,9 @@ async def run_probe(paths):
 
     async def fake_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
         slug = agent_obj["slug"]
-        yield ExecEvent("system", "", {"run_id": f"r-{task_obj['id']}-{slug}"})
+        # run_id = task_runs.id（INTEGER），与生产一致；此处每次 _run_one 针对不同 task，
+        # task_obj['id'] 即唯一整数。PG 严格类型下字符串 run_id 会触发 DataError。
+        yield ExecEvent("system", "", {"run_id": task_obj["id"]})
         if slug in behavior["fail_slugs"]:
             yield ExecEvent("error", "模拟失败")
             yield ExecEvent("done")

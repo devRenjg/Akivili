@@ -14,9 +14,10 @@ jobs:
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
-      # CI runner 的共享 I/O 比本地慢，给 SQLite 写锁竞争更充裕的等待窗口
-      # （WAL 并发探针的 expected_bt 断言读同一变量，保持一致）。
-      AKIVILI_DB_BUSY_TIMEOUT_MS: "30000"
+    # ⚠️ S5 全仓零 sqlite 后，门禁探针全量依赖 PostgreSQL——本 workflow 尚未挂 PG service，
+    #    在补上前 CI 无法跑绿（本地对着 PG 容器已 39/39）。GitHub services 容器仅 Linux runner
+    #    支持，收口需将 runner 从 windows-latest 切到 ubuntu 并加 postgres:16 service + 迁移步骤，
+    #    或在 Windows runner 上装 PG。属 S5 Phase 3 割接项，见 TestReport/README.md「GitHub Actions 待收口」。
     steps:
       - uses: actions/checkout@v4
 
@@ -30,5 +31,5 @@ jobs:
       - name: Install backend deps
         run: pip install -r backend/requirements.txt
 
-      - name: Run regression gate (40 probes + QA suite)
+      - name: Run regression gate (39 probes + QA suite; requires PostgreSQL — see note above)
         run: python TestReport/run_ci_suite.py

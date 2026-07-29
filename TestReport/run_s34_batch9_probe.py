@@ -33,8 +33,9 @@ def check(name, cond, detail=""):
 
 
 def _isolate(tmp):
+    from run_qa_suite import isolated_pg_db_url  # noqa: PLC0415
     cfg = {
-        "db_path": os.path.join(tmp, "batch9.db"),
+        "db_url": isolated_pg_db_url(),   # S5：PG 隔离库（替代 sqlite db_path）
         "agent_library_dir": os.path.join(tmp, "agents"),
         "skills_dir": os.path.join(tmp, "skills"),
         "memory_dir": os.path.join(tmp, "mem"),
@@ -70,10 +71,10 @@ async def _prep():
         # 一个已结束 run（5秒时长）+ 一个 running run
         await s.execute(text(
             "INSERT INTO task_runs (id,task_id,agent_slug,status,provider_id,started_at,ended_at,fail_reason) "
-            "VALUES (9500,950,'dev','succeeded','pv',datetime('now','-5 seconds'),datetime('now'),'')"))
+            "VALUES (9500,950,'dev','succeeded','pv',to_char((now() AT TIME ZONE 'UTC') + interval '-5 seconds', 'YYYY-MM-DD HH24:MI:SS'),to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'),'')"))
         await s.execute(text(
             "INSERT INTO task_runs (id,task_id,agent_slug,status,started_at) "
-            "VALUES (9501,950,'dev','running',datetime('now'))"))
+            "VALUES (9501,950,'dev','running',to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))"))
         # run_logs：给 9500 一条 stdout + 一条 tool
         await s.execute(text(
             "INSERT INTO run_logs (run_id,channel,content) VALUES (9500,'stdout','开场发言内容')"))
@@ -83,7 +84,7 @@ async def _prep():
         # 一个失败 run（限流）
         await s.execute(text(
             "INSERT INTO task_runs (id,task_id,agent_slug,status,started_at,ended_at,fail_reason) "
-            "VALUES (9502,950,'dev','failed',datetime('now','-2 hours'),datetime('now','-2 hours'),'rate_limited')"))
+            "VALUES (9502,950,'dev','failed',to_char((now() AT TIME ZONE 'UTC') + interval '-2 hours', 'YYYY-MM-DD HH24:MI:SS'),to_char((now() AT TIME ZONE 'UTC') + interval '-2 hours', 'YYYY-MM-DD HH24:MI:SS'),'rate_limited')"))
         # run_queue + run_events（供 lineage）
         await s.execute(text(
             "INSERT INTO run_queue (id,task_id,agent_slug,trigger,status,task_run_id) "
