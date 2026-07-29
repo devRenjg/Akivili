@@ -3,6 +3,12 @@ name: CI
 # 回归门禁：每次 push 到 master + 所有 PR 自动跑全部隔离 probe + QA 主套件。
 # 清单在 TestReport/run_ci_suite.py 单处维护（不在此 yaml 重复）。
 # runner 用 windows-latest：与开发环境(Win11)一致，零跨平台风险。
+#
+# 数据底座 S5（全仓零 sqlite，PG 单引擎）后，门禁探针全量依赖 PostgreSQL——
+# 每个探针用 run_qa_suite.isolated_pg_db_url() 建独立隔离库 qa_iso_*（连 postgres 维护库
+# CREATE/DROP DATABASE + pg_terminate_backend），跑完 atexit 删库。故 CI 必须先起一个 PG。
+# GitHub services 容器仅 Linux runner 支持，为保 Windows 开发环境一致，这里用 runner
+# **预装但默认停用**的 PostgreSQL（用户决策：Windows runner 装/起 PG，不切 ubuntu、不引第三方 action）。
 on:
   push:
     branches: [master]
@@ -14,10 +20,13 @@ jobs:
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
-    # ⚠️ S5 全仓零 sqlite 后，门禁探针全量依赖 PostgreSQL——本 workflow 尚未挂 PG service，
-    #    在补上前 CI 无法跑绿（本地对着 PG 容器已 39/39）。GitHub services 容器仅 Linux runner
-    #    支持，收口需将 runner 从 windows-latest 切到 ubuntu 并加 postgres:16 service + 迁移步骤，
-    #    或在 Windows runner 上装 PG。属 S5 Phase 3 割接项，见 TestReport/README.md「GitHub Actions 待收口」。
+      # 探针默认连的 PG（对齐 backend/config.py 的 _default_pg_url 分段环境变量默认值）。
+      # 隔离层连 postgres 维护库建 qa_iso_* 库，故 akivili 需 SUPERUSER/CREATEDB（下方建角色时授予）。
+      AKIVILI_PG_HOST: localhost
+      AKIVILI_PG_PORT: "5432"
+      AKIVILI_PG_USER: akivili
+      AKIVILI_PG_PASSWORD: akivili_dev_pw
+      AKIVILI_PG_DB: akivili
     steps:
       - uses: actions/checkout@v4
 
@@ -31,5 +40,93 @@ jobs:
       - name: Install backend deps
         run: pip install -r backend/requirements.txt
 
-      - name: Run regression gate (39 probes + QA suite; requires PostgreSQL — see note above)
+      # —— 起 runner 预装 PostgreSQL 并建 akivili 超级用户 + akivili 库 ——
+      # 预装 PG 默认停用：显式发现服务名(postgresql*)并启动；PGBIN 由 runner 环境变量给出。
+      # 认证不确定性（预装 PG 本地是 trust 还是 md5/scram 因镜像而异）用「强制本地 trust」消除：
+      # 改 pg_hba.conf 把 local/127.0.0.1/::1 全设 trust 并 reload，postgres 超级用户即可免密连来建角色/库。
+      # 全程 -v ON_ERROR_STOP=1：任一步失败即让该 step 非零退出，绝不带病继续。
+      - name: Start preinstalled PostgreSQL and provision akivili role/db
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # 1) 发现并启动预装 PG 服务（服务名随镜像版本变，用通配匹配后取第一个）。
+          $svc = Get-Service -Name "postgresql*" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $svc) { throw "runner 上未发现预装 PostgreSQL 服务（postgresql*）" }
+          Write-Host "PostgreSQL 服务: $($svc.Name)"
+          Set-Service -Name $svc.Name -StartupType Automatic
+          Start-Service -Name $svc.Name
+
+          # 2) 定位 psql：优先 $env:PGBIN（runner 文档给出的预装 PG bin 目录），兜底从服务可执行路径推。
+          $psql = $null
+          if ($env:PGBIN -and (Test-Path (Join-Path $env:PGBIN "psql.exe"))) {
+            $psql = Join-Path $env:PGBIN "psql.exe"
+          } else {
+            $found = Get-ChildItem -Path "C:\Program Files\PostgreSQL" -Recurse -Filter "psql.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $psql = $found.FullName }
+          }
+          if (-not $psql) { throw "未找到 psql.exe（PGBIN=$env:PGBIN）" }
+          Write-Host "psql: $psql"
+
+          # 3) 定位 PGDATA 并强制本地 trust 认证（消除 trust/md5/scram 因镜像而异的不确定性）。
+          #    从服务查询语句拿 -D 参数最稳；兜底用 psql 起不来前的常见预装路径。
+          $bin = Split-Path $psql
+          $pgctl = Join-Path $bin "pg_ctl.exe"
+          # 服务的可执行命令行含 "-D <PGDATA>"，从中解析。
+          $wmi = Get-CimInstance Win32_Service -Filter "Name='$($svc.Name)'"
+          $pgdata = $null
+          if ($wmi.PathName -match '-D\s+"?([^"]+?)"?\s') { $pgdata = $Matches[1] }
+          if (-not $pgdata) {
+            $cand = Get-ChildItem "C:\Program Files\PostgreSQL" -Recurse -Filter "pg_hba.conf" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($cand) { $pgdata = Split-Path $cand.FullName }
+          }
+          if (-not $pgdata -or -not (Test-Path (Join-Path $pgdata "pg_hba.conf"))) { throw "未定位到 PGDATA/pg_hba.conf" }
+          $hba = Join-Path $pgdata "pg_hba.conf"
+          Write-Host "PGDATA: $pgdata"
+          @"
+          local   all   all                   trust
+          host    all   all   127.0.0.1/32    trust
+          host    all   all   ::1/128         trust
+          "@ | Set-Content -Path $hba -Encoding ascii
+          & $pgctl reload -D "$pgdata"
+
+          # 4) 等 PG 就绪（最多 ~30s），再建 akivili 超级用户 + akivili 库。
+          $pgIsReady = Join-Path $bin "pg_isready.exe"
+          $ok = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            & $pgIsReady -h localhost -p 5432 *> $null
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ok) { throw "PostgreSQL 30s 内未就绪" }
+
+          # akivili 设为 SUPERUSER：隔离层要连 postgres 维护库 CREATE/DROP DATABASE +
+          # pg_terminate_backend，与本地 Docker（akivili 拥有一切）同构。trust 下 postgres 免密连。
+          $env:PGCLIENTENCODING = "UTF8"
+          & $psql -v ON_ERROR_STOP=1 -U postgres -h localhost -d postgres -c "DO `$`$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='akivili') THEN CREATE ROLE akivili LOGIN SUPERUSER PASSWORD 'akivili_dev_pw'; END IF; END `$`$;"
+          if ($LASTEXITCODE -ne 0) { throw "创建 akivili 角色失败" }
+          # 建库（存在则跳过；owner=akivili）。CREATE DATABASE 不能进 DO 块，用 psql 条件建。
+          $exists = & $psql -tA -U postgres -h localhost -d postgres -c "SELECT 1 FROM pg_database WHERE datname='akivili';"
+          if ($exists -ne "1") {
+            & $psql -v ON_ERROR_STOP=1 -U postgres -h localhost -d postgres -c "CREATE DATABASE akivili OWNER akivili;"
+            if ($LASTEXITCODE -ne 0) { throw "创建 akivili 库失败" }
+          }
+          Write-Host "akivili 角色 + 库就绪"
+
+      # —— 门禁探针连通性自检：用 akivili 身份建/删一个临时隔离库，验证隔离层能力可用 ——
+      # 这一步早失败早暴露（比在 39 项探针里某个 CREATE DATABASE 报权限错更好定位）。
+      - name: Verify akivili can provision isolated DBs
+        shell: pwsh
+        env:
+          PGPASSWORD: akivili_dev_pw
+        run: |
+          $ErrorActionPreference = "Stop"
+          $psql = if ($env:PGBIN -and (Test-Path (Join-Path $env:PGBIN "psql.exe"))) { Join-Path $env:PGBIN "psql.exe" }
+                  else { (Get-ChildItem "C:\Program Files\PostgreSQL" -Recurse -Filter "psql.exe" | Select-Object -First 1).FullName }
+          & $psql -v ON_ERROR_STOP=1 -U akivili -h localhost -d postgres -c "CREATE DATABASE ci_smoke_iso;"
+          if ($LASTEXITCODE -ne 0) { throw "akivili 无法 CREATE DATABASE（隔离层将失败）" }
+          & $psql -v ON_ERROR_STOP=1 -U akivili -h localhost -d postgres -c "DROP DATABASE ci_smoke_iso;"
+          Write-Host "隔离库建/删自检通过"
+
+      - name: Run regression gate (39 probes + QA suite, on PostgreSQL)
         run: python TestReport/run_ci_suite.py
