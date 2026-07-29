@@ -516,17 +516,31 @@ async def run_suite(paths: dict[str, Path], include_live: bool) -> QaState:
             yield ExecEvent("text", text_out)
             yield ExecEvent("done")
 
+        # 重试退避清零：CI 慢/共享 runner 上某一棒可能因 PG await 瞬时抖动被判 retriable failed
+        # 并回 queued + 退避（默认 30/120s）。本测验的是**协同链路传导逻辑**（owner→backend→
+        # tester），不是重试节流——退避非 0 会让瞬时失败的棒在有限 tick 内领不回、链路补不齐、
+        # 假红。故临时把退避阶梯置 0（失败棒下一 tick 即可重领），让链路在瞬时抖动后自愈补齐；
+        # MAX_RETRY 仍是默认值（真断裂仍会耗尽重试→failed→断言照红）。
         runner.execute_dispatch = fake_execute_dispatch
+        original_backoff = collab._RETRY_BACKOFF
+        collab._RETRY_BACKOFF = [0, 0]
         collab_start = time.perf_counter()
         try:
             rid = await collab.enqueue_run(tid, leader_slug, "请协调完成 API 任务", "collaborate", is_leader=True)
-            for _ in range(10):
+            # 驱动到链路**真正静止**，而非「队列空即停」：一棒瞬时失败后会回 queued（退避已清零），
+            # 若此刻恰好在两次 tick 之间，简单 `if not did: break` 会漏掉重试棒。改为「连续 N 次
+            # 空转才判静止」——退避清零下重试棒立即可领，连空 3 次足以确认无待跑/待重试 run。
+            # 上限 30 次 tick 是绝对兜底（正常 3 棒 + 每棒最多 MAX_RETRY 次重试，远小于 30）。
+            idle_ticks = 0
+            for _ in range(30):
                 did = await collab._tick()
-                if not did:
+                idle_ticks = 0 if did else idle_ticks + 1
+                if idle_ticks >= 3:
                     break
             collab_ms = (time.perf_counter() - collab_start) * 1000
         finally:
             runner.execute_dispatch = original_execute
+            collab._RETRY_BACKOFF = original_backoff
 
         order = [x["slug"] for x in executed]
         state.metrics["deterministic_collab_ms"] = round(collab_ms, 2)
