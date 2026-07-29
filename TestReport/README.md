@@ -8,7 +8,7 @@
 - 探针命名 `run_<feature>_probe.py`，运行时打印 `N/N 通过` 计数。
 - **本文件是测试矩阵索引，每次新增/改动探针都要同步更新**（清单、覆盖、实测 N/N）。
   通过数以**脚本实跑打印的 N/N 为准**，不用 grep 静态计数（辅助函数/循环会让计数虚高）。
-- 提交信息 / 根 `README.md` 更新日志里写明各套件通过数（如「QA 29/29、concurrency 7/7」）。
+- 提交信息 / 根 `README.md` 更新日志里写明各套件通过数（如「QA 29/29、concurrency 8/8」）。
 
 ## 隔离与安全
 
@@ -48,7 +48,7 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
   > 问题 runner-images#13040，若启动失败按日志调整服务发现/PGDATA 定位）。
 - probe 清单只在 `run_ci_suite.py` 的 `GATE` 里维护一处——新增 probe 时同步加入。
 - 门禁**不含**需真实 CLI 的 `run_collab_scenario.py` / `run_codex_cli_smoke.py`（人工按需单跑）。
-- 实测：**39/39 项、579 断言、~101s 全绿**（跑在 PostgreSQL 单引擎；2026-07-24 S5）。
+- 实测：**39/39 项、580 断言、~98s 全绿**（跑在 PostgreSQL 单引擎；2026-07-24 S5）。
 
 ## 全套测试 vs CI 门禁
 
@@ -109,7 +109,7 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 | `run_mention_chain_reset_probe.py` | 6/6 | 循环闸「产出即重置」口径（修 task149 误伤事故）：有产出的长链协作（每棒都落 jian comment/subtask）链长重置为 0 不被误掐、纯空转（无产出）mention 链仍累积到闸值如期熔断（保护不削弱）、混合链从最新往回数到最近一棒有产出即停、run 没起来（task_run_id 空）视为空转计入链长 |
 | `run_rate_limit_probe.py` | 8/8 | 限流/429 观测：错误文本识别（429/rate limit/overloaded/quota/retry-after，不误伤普通错误）、限流 error 无产出归因 fail_reason=rate_limited、普通错误仍归 error_no_output、/runs/rate-limit-metrics 聚合窗口内 total/failed/rate_limited + 命中率 + 失败归因分布 |
 | `run_mention_prompt_probe.py` | 11/11 | @ 触发把发言原话+任务上下文作为 prompt 传给成员（修 task140 事故：此前硬传空串→成员落「不要读任何文件」兜底模板收不到指令）、prompt 明示需要读文件/启动服务就正常做（去绝对禁令）、多人@各自拿到、_clip_history 历史回灌双限（条数+字符预算，至少留最新1条）从 Settings 生效 |
-| `run_concurrency_probe.py` | 7/7 | 并发池 MAX_CONCURRENCY 并行度、卡死 Agent 超时被 kill 不阻塞队列、慢 Agent 不饿死快 Agent |
+| `run_concurrency_probe.py` | 8/8 | 并发池：卡死 Agent 超时被 kill 不阻塞队列、并发不变式（peak≤MAX 安全属性恒真 + peak≥2 确有并行，不卡「恰好=3」这种硬件相关峰值）、3 worker 全完成、慢 Agent 不饿死快 Agent（并行度不再卡绝对墙钟阈值——避免 CI 硬件抖动假红） |
 | `run_timeout_and_qa_probe.py` | 14/14 | 静默超时(A) + 宽限保成果(B) + 硬墙钟(C)、超时收尾验收路由 |
 | `run_subtask_autocomplete_probe.py` | 6/6 | 子任务执行完自动进 done、全子完成→父任务 reviewing、失败任务不推进 |
 | `run_reactivate_probe.py` | 5/5 | 重跑子任务时父任务状态即时回写 in_progress |
