@@ -2,6 +2,8 @@
 
 > 完整逐项分析见 `Papers/多项目多Agent并发-技术保障与架构演进预案.md`。本文记录风险清单、方向决策与取舍理由。
 
+> **⚠️ 数据底座已切 PostgreSQL 单引擎（foundation-db S5，2026-07-24）**：本文中涉及 SQLite / WAL / `busy_timeout` / `PRAGMA` / `database.py` 建表 等数据层表述均已**废弃**——底座现为 PostgreSQL 单引擎（无 SQLite、无降级、无双引擎兼容），建表与结构演进唯一走 **Alembic 迁移 + ORM（`backend/models/`）**，能力契约见 `openspec/specs/foundation-data-layer/spec.md`。本 change 原「阶段 0：SQLite 开 WAL/busy_timeout 过渡桥」+「阶段 1：迁移 SQLite→Postgres」已被 S5 直接落地取代；落地时以 PG 单引擎为准，正文 SQLite 前提仅存历史设计背景。
+
 ## 规模目标
 
 5 项目 × 3 Agent/项目 × 2 并发任务/Agent ≈ **30 并发任务**。当前全局池仅 3 槽，差一个量级。

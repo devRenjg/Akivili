@@ -99,7 +99,7 @@
 - [x] S5c.5 `start.ps1` 加 PostgreSQL 就绪检查（`wait_for_pg.py`，PG 不通则中止启动）
 - [x] S5c.6 更新 README：PG 前置依赖、启动步骤、**无 SQLite 降级**声明
 - [x] S5c.7 更新 OpenSpec：能力固化进 `specs/foundation-data-layer/`（「双引擎/PG默认化含降级」两条 Requirement 改写为「PostgreSQL 单引擎」+「数据搬迁一致性」，反映实际落地）
-- [ ] S5c.8 三个被阻塞 change 的 schema 章节改注「基于 Alembic 迁移 + ORM(PG 单引擎) 实现」
+- [x] S5c.8 三个被阻塞 change（concurrency-scaling / graceful-restart / session-resume）design.md 顶部加「⚠️ 数据底座已切 PG 单引擎、SQLite/WAL 表述废弃、建表走 Alembic+ORM」废弃标注（不改正文/不碰 review 历史；graceful-restart spec 一致性探针改注前后均 12 文件 0 违规）
 - [ ] **S5.V 验收**：真实数据 cutover（需用户重启窗口，严守 `backend-restart-single-instance`）+ 关键路径人工验收（建项目/跑 Agent/看流式/kill/孤儿兜底）→ **提交，change 归档到 `changes/archive/`**
 
 ## 通用验收门（每个 S*.V 都必须满足）
