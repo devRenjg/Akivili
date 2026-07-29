@@ -8,7 +8,7 @@
 - 探针命名 `run_<feature>_probe.py`，运行时打印 `N/N 通过` 计数。
 - **本文件是测试矩阵索引，每次新增/改动探针都要同步更新**（清单、覆盖、实测 N/N）。
   通过数以**脚本实跑打印的 N/N 为准**，不用 grep 静态计数（辅助函数/循环会让计数虚高）。
-- 提交信息 / 根 `README.md` 更新日志里写明各套件通过数（如「QA 30/30、concurrency 7/7」）。
+- 提交信息 / 根 `README.md` 更新日志里写明各套件通过数（如「QA 29/29、concurrency 7/7」）。
 
 ## 隔离与安全
 
@@ -48,7 +48,7 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
   > 问题 runner-images#13040，若启动失败按日志调整服务发现/PGDATA 定位）。
 - probe 清单只在 `run_ci_suite.py` 的 `GATE` 里维护一处——新增 probe 时同步加入。
 - 门禁**不含**需真实 CLI 的 `run_collab_scenario.py` / `run_codex_cli_smoke.py`（人工按需单跑）。
-- 实测：**39/39 项、580 断言、~99s 全绿**（跑在 PostgreSQL 单引擎；2026-07-24 S5）。
+- 实测：**39/39 项、579 断言、~101s 全绿**（跑在 PostgreSQL 单引擎；2026-07-24 S5）。
 
 ## 全套测试 vs CI 门禁
 
@@ -98,7 +98,7 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 ### 端到端主套件
 | 脚本 | 实测 | 覆盖 |
 |---|---|---|
-| `run_qa_suite.py` | 30/30 | 平台主回归：登录鉴权、api_key 脱敏、路径穿越防护（`../secret`）、项目/任务 CRUD、看板列、任务系统、Agent 配置全链路（任务列表 p95 延迟改为只采集 metrics，不卡阀值——避免 CI 硬件抖动弄红门禁） |
+| `run_qa_suite.py` | 29/29 | 平台主回归：登录鉴权、api_key 脱敏、路径穿越防护（`../secret`）、项目/任务 CRUD、看板列、任务系统、Agent 配置全链路（两条延迟微基准——任务列表 p95、假执行器 3 轮队列耗时——改为只采集 metrics 不卡阀值，避免 CI 硬件抖动弄红门禁；协同链路正确性仍由 order 断言守护） |
 
 ### 协同与调度（collab 层）
 | 脚本 | 实测 | 覆盖 |
