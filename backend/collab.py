@@ -9,7 +9,7 @@
 import asyncio
 import re
 
-from sqlalchemy import case, func, select, update as sa_update
+from sqlalchemy import case, func, select, text, update as sa_update
 
 from models import (get_session_factory, now_expr, now_offset, elapsed_seconds,
                     Activity, AgentProfile, AgentSkill, Message, Project,
@@ -391,20 +391,29 @@ async def enqueue_run(task_id: int, agent_slug: str, prompt: str,
                                         f"（疑似循环），自动停止以防烧钱；如需继续请人工重新指派"})
             return None
     async with get_session_factory()() as session:
-        # pending 去重：同一 (task, agent) 已有 queued/running 就不重复入队
+        # 去重双层：① 应用层预检——同 (task, agent) 已有 queued/running 直接返回 None（省一次必败 INSERT，
+        # 保留原「dedup 命中」语义）；② INSERT ... ON CONFLICT DO NOTHING——兜底真并发下预检漏网的
+        # TOCTOU（两个并发调用都过了预检才 INSERT），由 uq_run_queue_active 部分唯一索引在 DB 层保证
+        # 至多一条活跃 run（见迁移 003）。冲突时无行返回→与预检命中同样返回 None。
         dup = (await session.execute(
             select(RunQueue.id)
             .where(RunQueue.task_id == task_id, RunQueue.agent_slug == agent_slug,
                    RunQueue.status.in_(("queued", "running"))))).first()
         if dup:
             return None
-        rq = RunQueue(task_id=task_id, agent_slug=agent_slug, trigger=trigger,
-                      is_leader=1 if is_leader else 0, prompt=prompt,
-                      source_run_id=source_run_id, source_message_id=source_message_id)
-        session.add(rq)
-        await session.flush()
-        rq_id = rq.id
+        from sqlalchemy.dialects.postgresql import insert as _pg_insert  # noqa: PLC0415
+        stmt = (_pg_insert(RunQueue)
+                .values(task_id=task_id, agent_slug=agent_slug, trigger=trigger,
+                        is_leader=1 if is_leader else 0, prompt=prompt,
+                        source_run_id=source_run_id, source_message_id=source_message_id)
+                .on_conflict_do_nothing(index_elements=["task_id", "agent_slug"],
+                                        index_where=text("status IN ('queued', 'running')"))
+                .returning(RunQueue.id))
+        rq_id = (await session.execute(stmt)).scalar_one_or_none()
         await session.commit()
+        if rq_id is None:
+            # 并发冲突：另一个调用已抢先入队同 (task, agent) 的活跃 run，本次让位（同 dedup 命中）。
+            return None
     await log_run_event("enqueued", run_queue_id=rq_id, task_id=task_id, agent_slug=agent_slug,
                         detail={"trigger": trigger, "is_leader": bool(is_leader),
                                 "source_run_id": source_run_id, "source_message_id": source_message_id})

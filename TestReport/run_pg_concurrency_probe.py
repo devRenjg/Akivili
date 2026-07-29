@@ -11,13 +11,12 @@ repo runs PG-only:
             is run alongside purely as an informational contrast (it MAY lose
             updates — that is the point, it documents why atomic UPDATE is
             required — and never fails the probe).
-  GROUP 3 — N concurrent `collab.enqueue_run` for the SAME (task, agent): the
-            dedup is app-level SELECT-then-INSERT with NO DB unique constraint,
-            so this exercises a potential TOCTOU race under real concurrency.
-            The strict check only requires "at least one row enqueued"; if more
-            than one row lands (race exposed), the probe stays green but prints a
-            loud warning surfacing the finding to the owner (changing collab.py
-            is out of scope — shared abstraction, needs caller analysis).
+  GROUP 3 — N concurrent `collab.enqueue_run` for the SAME (task, agent): asserts
+            EXACTLY one row lands. dedup is now two-layer: app-level pre-check
+            (SELECT) + DB partial unique index uq_run_queue_active (migration 003)
+            backing INSERT ... ON CONFLICT DO NOTHING. The DB index makes the
+            TOCTOU race impossible under real concurrency, so this is a hard
+            "exactly 1" guarantee (was "at least 1 + warn" before 003).
 
 All concurrency runs on ONE event loop (single asyncio.run). Each get_connection()
 opens its own raw asyncpg connection => independent PG sessions => real
@@ -213,19 +212,13 @@ async def _group3_enqueue_dedup(probe: Probe) -> None:
     finally:
         await db.close()
 
-    # Strict check: at least one enqueued. count==1 => dedup held; count>1 =>
-    # pre-existing design property (TOCTOU), surfaced loudly but not a regression.
+    # 严格断言：N 个并发 enqueue 同 (task,agent) 恰好进 1 条。
+    # 迁移 003 的部分唯一索引 uq_run_queue_active 已把去重从应用层软 dedup 升级为 DB 硬保证，
+    # TOCTOU 竞态由 ON CONFLICT DO NOTHING + 唯一索引在 DB 层消除——故这里从原「至少 1 条 + 告警」
+    # 收紧为「恰好 1 条」。若 >1，说明索引/ON CONFLICT 兜底失效（真回归），必须红。
     probe.check(
-        "G3 concurrent enqueue_run(same task,agent): at least one enqueued",
-        count >= 1, f"run_queue rows={count} for {N} concurrent calls")
-    if count == 1:
-        print(f"[INFO] enqueue_run dedup held under {N} concurrent calls (count=1).")
-    else:
-        print("=" * 78)
-        print(f"[WARN] enqueue_run dedup is app-level SELECT-then-INSERT (no DB unique "
-              f"constraint); observed {count} rows under {N} concurrent calls — "
-              f"potential TOCTOU race, report to owner.")
-        print("=" * 78)
+        "G3 并发 enqueue_run(同 task,agent) 恰好进 1 条（DB 唯一索引兜底 TOCTOU）",
+        count == 1, f"run_queue rows={count} for {N} concurrent calls（期望 1）")
 
 
 async def run_probe(paths: dict, keep: bool) -> Probe:
