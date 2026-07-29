@@ -3,6 +3,8 @@
 > 目标：改代码可随时重启,**用户访问不断、正在跑的 Agent 不中断**（改 API 零中断;改执行层温和重启:能等则零中断,超时中断后 resume 续跑——恢复承诺按三层口径：平台消息 at-least-once / CLI 原生 session best-effort resume / 外部副作用非 exactly-once，**不承诺「上下文必然不丢」**，见 [agent-session-resume] P1-7）。**分期改为阶段 0-6（先补执行协议状态机再实现，Worker 剥离优先、resume 后置）**——见文末「实施阶段」。本文记录架构、执行状态机与不变量、关键取舍与落地细节,**不含代码改动**。
 >
 > **本文经技术负责人 Review 修订（2026-07-16）**：核心升级 = 从「resume 功能列表」升级为「持久化执行协议」——先定义 durable execution 状态机 + 并发不变量（见「决策 0」），再谈 resume。修正了原方案 3 处事实错误（claim 非原子、`run_queue` 无 conversation_id 列、resume mismatch 判定过严）。
+>
+> **⚠️ 数据底座已切 PostgreSQL 单引擎（foundation-db S5，2026-07-24）**：本文中涉及 SQLite / WAL / `busy_timeout` / `SQLite ALTER 能力有限` / `database.py` 建表 等数据层表述均已**废弃**——底座现为 PostgreSQL 单引擎（无 SQLite、无降级、无双引擎兼容），建表与结构演进唯一走 **Alembic 迁移 + ORM（`backend/models/`）**，能力契约见 `openspec/specs/foundation-data-layer/spec.md`。文中新增列 / 新表 / expand→activate→contract 三段式迁移一律在 PostgreSQL 上以 Alembic 实现；`FOR UPDATE` 行锁、partial unique index、per-execution 序号等本就依赖 PG 语义、不受影响。正文的 SQLite 前提仅存历史设计背景。
 
 ## 现状（实地核查确认）
 

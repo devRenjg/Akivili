@@ -2,6 +2,8 @@
 
 > 目标：把「每次执行全量回灌历史」换成「每个 (conversation, agent) 维护一条 CLI session、再执行时 resume 续接 + 只喂增量」（`conversation_id IS NULL` 的 task 不可执行，NULL 组索引仅防存量脏数据并发，第十二轮 P0-A）。省 token、上下文连贯，并为 [platform-graceful-restart] M2.5「温和重启+resume」提供 resume 地基。**claude 与 codex 均为必选**（codex 是重度使用的 backend）。本文不含代码改动。
 
+> **⚠️ 数据底座已切 PostgreSQL 单引擎（foundation-db S5，2026-07-24）**：本文中涉及 SQLite / `SQLite UNIQUE 对 NULL` / `database.py` 建表 等数据层表述均已**废弃**——底座现为 PostgreSQL 单引擎（无 SQLite、无降级、无双引擎兼容），建表与结构演进唯一走 **Alembic 迁移 + ORM（`backend/models/`）**，能力契约见 `openspec/specs/foundation-data-layer/spec.md`。文中 `agent_sessions` 建表、partial unique index、`message_seq` 序号等一律在 PostgreSQL 上以 Alembic 实现（PG 对 NULL 的唯一性语义与 SQLite 一致，不影响 NULL 组索引结论）。正文 SQLite 前提仅存历史设计背景。
+
 ## 设计哲学
 
 核心原则：**「别过度接管，能下推给 CLI/prompt 的就下推」**——平台只存 `session_id` 指针 + workdir，对话上下文由 CLI 原生 session 恢复；不追求副作用 exactly-once，靠 prompt 约束 + session 记忆 + 任务级去重。本方案全面遵循这套策略，仅在一处有意偏离（见决策 3 末）。
