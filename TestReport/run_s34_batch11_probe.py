@@ -133,12 +133,14 @@ async def _run():
 
     # ---- _claim_one：next_retry_at 退避过滤 ----
     async with SF() as s:
+        # 两行用**不同 agent_slug**（lead/qa），避免撞 uq_run_queue_active（同 task+agent 至多一条
+        # 活跃 run，迁移 003）——本子测只关心 next_retry_at 退避过滤，与去重正交，换 slug 不改语义。
         # 一个未来退避的 queued 行（不应被领取）
         await s.execute(text("INSERT INTO run_queue (id,task_id,agent_slug,status,next_retry_at) "
-                             "VALUES (900,600,'dev','queued',to_char((now() AT TIME ZONE 'UTC') + interval '+1 hour', 'YYYY-MM-DD HH24:MI:SS'))"))
+                             "VALUES (900,600,'lead','queued',to_char((now() AT TIME ZONE 'UTC') + interval '+1 hour', 'YYYY-MM-DD HH24:MI:SS'))"))
         # 一个已到点的 queued 行（应被领取）
         await s.execute(text("INSERT INTO run_queue (id,task_id,agent_slug,status,next_retry_at) "
-                             "VALUES (901,600,'dev','queued',to_char((now() AT TIME ZONE 'UTC') + interval '-1 minute', 'YYYY-MM-DD HH24:MI:SS'))"))
+                             "VALUES (901,600,'qa','queued',to_char((now() AT TIME ZONE 'UTC') + interval '-1 minute', 'YYYY-MM-DD HH24:MI:SS'))"))
         await s.commit()
     c = await collab._claim_one()
     check("_claim_one 跳过退避窗口内、领到已到点行", c and c["id"] == 901, str(c and c["id"]))

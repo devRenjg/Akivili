@@ -15,7 +15,7 @@
 
 本文件只声明，不接运行期。见 base.py 说明。
 """
-from sqlalchemy import ForeignKey, Integer, Text, text
+from sqlalchemy import ForeignKey, Index, Integer, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -293,7 +293,19 @@ class RunEvent(Base):
 
 class RunQueue(Base):
     __tablename__ = "run_queue"
-    __table_args__ = _AUTOINC
+    # 「活跃 run 唯一」部分唯一索引：同 (task_id, agent_slug) 至多一条 queued/running。
+    # DB 层兜底 collab.enqueue_run 的应用层去重 TOCTOU（见迁移 003）。done/failed 不受限（允许重跑）。
+    # 与 003 迁移逐字对齐（全新库 create_all 建此、存量库 003 补建，schema_parity 探针守护两边一致）。
+    __table_args__ = (
+        Index(
+            "uq_run_queue_active",
+            "task_id",
+            "agent_slug",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
+        _AUTOINC,
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     task_id: Mapped[int] = mapped_column(
