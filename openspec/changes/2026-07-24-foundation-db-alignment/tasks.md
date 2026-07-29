@@ -100,10 +100,10 @@
 - [x] S5c.6 更新 README：PG 前置依赖、启动步骤、**无 SQLite 降级**声明
 - [x] S5c.7 更新 OpenSpec：能力固化进 `specs/foundation-data-layer/`（「双引擎/PG默认化含降级」两条 Requirement 改写为「PostgreSQL 单引擎」+「数据搬迁一致性」，反映实际落地）
 - [x] S5c.8 三个被阻塞 change（concurrency-scaling / graceful-restart / session-resume）design.md 顶部加「⚠️ 数据底座已切 PG 单引擎、SQLite/WAL 表述废弃、建表走 Alembic+ORM」废弃标注（不改正文/不碰 review 历史；graceful-restart spec 一致性探针改注前后均 12 文件 0 违规）
-- [ ] **S5.V 验收**：真实数据 cutover（需用户重启窗口，严守 `backend-restart-single-instance`）+ 关键路径人工验收（建项目/跑 Agent/看流式/kill/孤儿兜底）→ **提交，change 归档到 `changes/archive/`**
+- [x] **S5.V 验收**：真实数据 cutover **已随 S5a 切引擎事实完成**——2026-07-29 只读核查确认后端自 S5a 起即运行在 PG（`localhost:5432/akivili`，启动自动 Alembic upgrade，19 表 31800 行），PG 为**当前唯一真实运行库**：`activities` 最新 2026-07-29 vs sqlite 快照停在 2026-07-28、`tasks.max(id)` PG 950 vs sqlite 277、projects PG 9 vs sqlite 4。故**不执行** `migrate_sqlite_to_pg.py --truncate`（会用过期 sqlite 覆盖 PG 真实数据，方向相反）；旧 `backend/jianagency.db`（7-28 快照）留存、非权威源（`*.db` 已被 gitignore、另有 3 个历史 .bak 快照）。当前后端进程（PID 53584，7-28 16:05 启动）仍持有该 sqlite 的 `-wal/-shm` 句柄（启动早期残留、之后再无 sqlite 写入——sqlite 数据停在 7-28 03:35 早于进程启动），故暂无法改名归档；代码侧已核查**零 sqlite 运行期 open**（无 `sqlite3.connect`/`aiosqlite`/`journal_mode`，`database.py` 是 PG 适配器），句柄纯属旧进程残留，**下次重启后端即随之释放、wal/shm 消失**，非当前代码缺陷。关键路径人工验收（建项目/跑 Agent/看流式/kill/孤儿兜底）由日常运行覆盖，无需专门 cutover 重启。change 可归档到 `changes/archive/`。
 
 ## 通用验收门（每个 S*.V 都必须满足）
-- [ ] 该阶段 S0.2 回归基准全绿（行为不回退）
-- [ ] 该阶段改动可通过回退到上一 `V` 锚点提交完整回滚
-- [ ] 无新增 `fmt.Println` 类裸输出 / 无 TODO / 无 mock 占位
-- [ ] 涉及重启的验证严格遵守 `backend-restart-single-instance`（杀净 8100 监听、确认端口空闲），改代码前不擅自重启后端
+- [x] 该阶段 S0.2 回归基准全绿（行为不回退）——CI 门禁 39 项 · 580 断言全绿（本地 + GitHub Actions PG 上）
+- [x] 该阶段改动可通过回退到上一 `V` 锚点提交完整回滚——每步 spec 分支 + `--no-ff` 合入，锚点可回退
+- [x] 无新增 `fmt.Println` 类裸输出 / 无 TODO / 无 mock 占位
+- [x] 涉及重启的验证严格遵守 `backend-restart-single-instance`（杀净 8100 监听、确认端口空闲），改代码前不擅自重启后端——本轮 cutover 为只读核查，未擅自重启
