@@ -40,8 +40,9 @@ def _isolate(tmp):
         f.write("---\nname: Alpha技能\ndescription: 关键词ABC\n---\n\n正文A")
     with open(os.path.join(skills_dir, "beta-skill.md"), "w", encoding="utf-8") as f:
         f.write("---\nname: Beta技能\ndescription: 无关\ndownloadable: false\n---\n\n正文B")
+    from run_qa_suite import isolated_pg_db_url  # noqa: PLC0415
     cfg = {
-        "db_path": os.path.join(tmp, "batch3.db"),
+        "db_url": isolated_pg_db_url(),   # S5：PG 隔离库（替代 sqlite db_path）
         "skills_dir": skills_dir,
         "memory_dir": os.path.join(tmp, "mem"),
         "agent_library_dir": os.path.join(tmp, "agents"),

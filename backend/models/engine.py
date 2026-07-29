@@ -1,33 +1,25 @@
-"""数据底座 S3.2 · 统一 async engine + session 工厂。
+"""数据底座 S3.2 · 统一 async engine + session 工厂（S5：PostgreSQL 单引擎）。
 
-给 ORM 提供一个「能连库、且连接调优与 S1 的 get_connection() 完全一致」的入口，
-为 S3.4 把业务查询迁到 ORM 铺路。
+给 ORM 提供进程级唯一的 async engine / session 工厂。业务/路由/执行层的数据访问全量
+走本 engine（S3.4 完成）；建表唯一走 Alembic（S3.6 下线 init_db 建表职责）。
 
-**与 S1 get_connection() 的调优对齐（逐条一致）**：
-    database.py get_connection() 每条连接执行：
-        PRAGMA journal_mode = WAL
-        PRAGMA busy_timeout = {db_busy_timeout_ms}
-        PRAGMA foreign_keys = ON
-    本模块用 SQLAlchemy 的 connect 事件监听器，对 engine 每条底层连接执行同样三条
-    PRAGMA（busy_timeout 同样每连接读一次 config，与 S1 行为一致）。二者走同一套调优，
-    不因 ORM/手写路径而分叉。
-
-**现状（S3.4 已完成）**：业务/路由/执行层的数据访问已全量走 session（本 engine）；
-database.py 仅保留 get_connection() 连接工厂（供部分测试 seed）。建表唯一走 Alembic
-（S3.6 已下线 init_db 建表职责）。
-
-driver 选型：运行期业务用 async（aiosqlite driver），与 S1 的 aiosqlite 同底层驱动；
-迁移仍走 S2 的同步 sqlite3（见决策 2，二者分离）。
+**数据底座 S5：PostgreSQL 单引擎**。SQLite 已退役——无 sqlite 分支、无 PRAGMA 监听
+（PG 的 WAL/MVCC/外键是服务端内建强制的，无需也不接受 journal_mode/busy_timeout 之类
+PRAGMA）。运行期 driver 恒为 asyncpg（异步）；迁移期由 config._pg_sync_url 转 psycopg。
+连接串来自 config.db_url（AKIVILI_DB_URL 环境变量优先，否则 _default_pg_url 拼默认）。
 """
 from __future__ import annotations
 
-from sqlalchemy import event, text
+import os
+
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
 
 from config import load_settings
 
@@ -36,41 +28,21 @@ _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
-def _apply_pragmas(dbapi_conn, _connection_record) -> None:
-    """每条底层连接建立时执行 S1 同款 PRAGMA（WAL + busy_timeout + foreign_keys）。
-
-    用 DBAPI 游标直接执行，避免走 SQLAlchemy 事务层（WAL 需无活动事务，与 S2 env.py
-    的教训一致）。busy_timeout 每连接读一次 config，对齐 S1 get_connection 的行为。
-    """
-    timeout_ms = load_settings().db_busy_timeout_ms
-    cur = dbapi_conn.cursor()
-    try:
-        cur.execute("PRAGMA journal_mode = WAL")
-        cur.execute(f"PRAGMA busy_timeout = {timeout_ms}")
-        cur.execute("PRAGMA foreign_keys = ON")
-    finally:
-        cur.close()
-
-
 def _build_engine() -> AsyncEngine:
-    """按当前 config 建 async engine。
+    """按当前 config 建 PostgreSQL async engine（S5：PG 单引擎）。
 
-    S4 双引擎：db_url 非空则直接用（PostgreSQL，如 postgresql+asyncpg://...）；
-    否则用 db_path 拼 SQLite URL（S1-S3 默认路径，行为不变）。
-    PRAGMA 监听器是 SQLite 专属（WAL/busy_timeout/foreign_keys），PG 分支不挂——
-    PG 的 WAL/MVCC/外键是内建强制的，无需也不接受这些 PRAGMA。
+    db_url 恒为 postgresql+asyncpg://…（config 保证：AKIVILI_DB_URL 优先，否则默认 PG 串）。
+    不再有 SQLite 分支/PRAGMA 监听。
+
+    连接池：生产默认用 SQLAlchemy 的连接池（单 uvicorn 事件循环，长驻复用）。
+    **测试**（AKIVILI_TEST_NULLPOOL=1）用 NullPool——探针常在一进程内多次 asyncio.run()
+    跨事件循环，asyncpg 的池连接是 loop 绑定的，跨 loop 复用会 "Event loop is closed"；
+    NullPool 每次现开现关，规避跨 loop 问题。对生产零影响（生产不设该变量）。
     """
-    settings = load_settings()
-    if settings.db_url:
-        # PostgreSQL（或其它 SQLAlchemy 支持的引擎）：URL 由 config 显式给全
-        engine = create_async_engine(settings.db_url, future=True)
-        return engine
-    # SQLite 默认路径（与 S1-S3 逐字一致）
-    url = "sqlite+aiosqlite:///" + settings.db_path.replace("\\", "/")
-    engine = create_async_engine(url, future=True)
-    # sync_engine 上挂 connect 监听：每条新连接执行 PRAGMA（仅 SQLite）
-    event.listen(engine.sync_engine, "connect", _apply_pragmas)
-    return engine
+    url = load_settings().db_url
+    if os.environ.get("AKIVILI_TEST_NULLPOOL") == "1":
+        return create_async_engine(url, future=True, poolclass=NullPool)
+    return create_async_engine(url, future=True)
 
 
 def get_engine() -> AsyncEngine:

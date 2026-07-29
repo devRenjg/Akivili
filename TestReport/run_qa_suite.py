@@ -23,6 +23,64 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
 REPORT_DIR = ROOT / "TestReport"
 
+# 数据底座 S5：探针隔离从"临时 sqlite 文件"改为"每探针独立 PG 库"。同一进程内多次
+# setup 用递增序号保证库名唯一。库建在与运行期同一 PG 实例（连接参数取自 config 默认/env）。
+import os as _os2  # noqa: E402
+_ISO_DB_SEQ = 0
+# 探针跨 asyncio.run() 事件循环 → PG engine 用 NullPool 规避 asyncpg 池的 loop 绑定问题
+# （见 backend/models/engine.py）。import 本模块即生效，覆盖独立单跑探针；ci_suite 也在
+# 子进程 env 里设了同一变量。仅测试，生产不设。
+_os2.environ.setdefault("AKIVILI_TEST_NULLPOOL", "1")
+
+
+def _admin_dsn() -> str:
+    """连到 PG 的 'postgres' 维护库的同步 DSN（用于 CREATE/DROP DATABASE，不能在事务里跑）。"""
+    import sys as _sys
+    if str(BACKEND) not in _sys.path:
+        _sys.path.insert(0, str(BACKEND))
+    from config import _default_pg_url
+    # 取运行期默认 PG 串，把库名换成 postgres 维护库，driver 段去掉给 psycopg 同步用。
+    url = _os2.environ.get("AKIVILI_DB_URL") or _default_pg_url()
+    base = url.rsplit("/", 1)[0]                      # 去掉 /dbname
+    base = base.replace("+asyncpg", "").replace("+psycopg", "")
+    return base + "/postgres"
+
+
+def _create_isolated_pg_db() -> tuple[str, str]:
+    """建一个唯一命名的空 PG 库，返回 (库名, 运行期 asyncpg URL)。跑完由 teardown 删。"""
+    global _ISO_DB_SEQ
+    _ISO_DB_SEQ += 1
+    name = f"qa_iso_{_os2.getpid()}_{_ISO_DB_SEQ}"
+    import psycopg
+    with psycopg.connect(_admin_dsn(), autocommit=True) as conn:
+        conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        conn.execute(f'CREATE DATABASE "{name}"')
+    admin = _admin_dsn().rsplit("/", 1)[0]            # postgresql://user:pw@host:port
+    run_url = admin.replace("postgresql://", "postgresql+asyncpg://", 1) + f"/{name}"
+    return name, run_url
+
+
+def _drop_isolated_pg_db(name: str) -> None:
+    """删除隔离库（探针清理调用）。先断开残留连接再 DROP。"""
+    import psycopg
+    with psycopg.connect(_admin_dsn(), autocommit=True) as conn:
+        conn.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = %s AND pid <> pg_backend_pid()", (name,))
+        conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+
+
+def isolated_pg_db_url() -> str:
+    """公开 helper：建一个唯一 PG 隔离库并返回其运行期 db_url，进程退出自动删。
+
+    供**自建 config.json** 的探针（s34_batch* / dialect / scheduling 等）复用——它们把返回值
+    写进 cfg 的 db_url 字段即可获得与 setup_isolated_config 同等的 PG 隔离，不再落 sqlite db_path。
+    """
+    name, url = _create_isolated_pg_db()
+    import atexit
+    atexit.register(_drop_isolated_pg_db, name)
+    return url
+
 # 管理员凭证与 auth.seed_admin 一致：从环境变量读，缺省用占位。
 import os as _os
 ADMIN_USER = _os.environ.get("AKIVILI_ADMIN_USER", "admin")
@@ -142,8 +200,15 @@ def setup_isolated_config(tmp: Path) -> dict[str, Path]:
         "先确认资产边界，再用最小化 payload 验证拒绝行为。",
     )
 
+    # S5：建独立 PG 库做隔离（替代临时 sqlite 文件）。db_url 写进临时 config.json，
+    # 让本探针进程的所有数据访问都落到这个隔离库。用 atexit 注册删库——探针 main() 各自
+    # rmtree 临时目录即可，无需逐个改 25 个 main 去删库（进程退出时自动清理隔离库）。
+    iso_db_name, iso_db_url = _create_isolated_pg_db()
+    import atexit
+    atexit.register(_drop_isolated_pg_db, iso_db_name)
+
     cfg = {
-        "db_path": str(db_path),
+        "db_url": iso_db_url,
         "agent_library_dir": str(agents_dir),
         "memory_dir": str(memory_dir),
         "skills_dir": str(skills_dir),
@@ -166,7 +231,8 @@ def setup_isolated_config(tmp: Path) -> dict[str, Path]:
         "memory": memory_dir,
         "skills": skills_dir,
         "project": project_dir,
-        "db": db_path,
+        "pg_db": iso_db_name,     # 供 teardown 删库
+        "db_url": iso_db_url,
     }
 
 

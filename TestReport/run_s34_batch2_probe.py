@@ -33,8 +33,9 @@ def check(name, cond, detail=""):
 
 
 def _isolate(tmp):
-    db_path = os.path.join(tmp, "batch2.db")
-    cfg = {"db_path": db_path, "memory_dir": os.path.join(tmp, "mem"),
+    from run_qa_suite import isolated_pg_db_url  # noqa: PLC0415
+    cfg = {"db_url": isolated_pg_db_url(),   # S5：PG 隔离库（替代 sqlite db_path）
+           "memory_dir": os.path.join(tmp, "mem"),
            "providers": [], "default_provider_id": ""}
     cfg_path = os.path.join(tmp, "config.json")
     with open(cfg_path, "w", encoding="utf-8") as f:

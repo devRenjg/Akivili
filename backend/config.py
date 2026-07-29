@@ -37,13 +37,32 @@ class Provider(BaseModel):
 _ROOT = Path(__file__).parent.parent   # 项目根目录（backend 的上一级）
 
 
+def _default_pg_url() -> str:
+    """未显式给 AKIVILI_DB_URL 时的默认 PostgreSQL 连接串（数据底座 S5：PG 单引擎）。
+
+    按分段环境变量拼装，全部有本地开发默认值；口令单独走 AKIVILI_PG_PASSWORD——
+    不把口令硬编码进源码（默认值 'akivili_dev_pw' 仅本地开发用，生产务必用环境变量覆盖）。
+    driver 恒为 asyncpg（运行期异步）；迁移期由 _pg_sync_url() 转 psycopg。
+    """
+    host = os.environ.get("AKIVILI_PG_HOST", "localhost")
+    port = os.environ.get("AKIVILI_PG_PORT", "5432")
+    db = os.environ.get("AKIVILI_PG_DB", "akivili")
+    user = os.environ.get("AKIVILI_PG_USER", "akivili")
+    pw = os.environ.get("AKIVILI_PG_PASSWORD", "akivili_dev_pw")
+    return f"postgresql+asyncpg://{user}:{pw}@{host}:{port}/{db}"
+
+
 class Settings(BaseSettings):
+    # 数据底座 S5：**PostgreSQL 单引擎**。SQLite 已退役（无降级、无 fallback）。
+    # 运行期数据库 URL：
+    #   - 优先取环境变量 AKIVILI_DB_URL（运维切库/指不同 PG 实例用，不落 config.json 避免口令入文件）；
+    #   - 未设时用 _default_pg_url() 按 PG 分段环境变量拼默认串（口令走 AKIVILI_PG_PASSWORD）。
+    # 恒为 postgresql+asyncpg://…（运行期异步驱动）。
+    db_url: str = os.environ.get("AKIVILI_DB_URL", "") or _default_pg_url()
+    # 旧 SQLite 文件路径。S5 运行期已不用（PG 单引擎）；仅剩两处遗留引用，S5b 一并清除：
+    #   - database.py 的测试 seed（S5b 改 PG 适配器后删）；
+    #   - migrate_sqlite_to_pg.py 读取搬迁**源**（一次性割接工具，读旧库天然需要）。
     db_path: str = str(Path(__file__).parent / "jianagency.db")
-    # 数据底座 S4：显式数据库 URL（双引擎切换）。
-    # 空（默认）= 用 db_path 走 SQLite，行为与 S1-S3 完全一致；
-    # 非空则优先，支持 PostgreSQL，如 postgresql+asyncpg://user:pass@host:5432/dbname。
-    # 由环境变量 AKIVILI_DB_URL 提供（不落 config.json，避免把连接串/口令写进文件）。
-    db_url: str = os.environ.get("AKIVILI_DB_URL", "")
     # SQLite 连接锁等待超时（毫秒）：WAL 下写-写竞争时后到的写等待而非立即 database is locked。
     # 默认 5000（5 秒），可用环境变量 AKIVILI_DB_BUSY_TIMEOUT_MS 覆盖。（仅 SQLite 有意义）
     db_busy_timeout_ms: int = int(os.environ.get("AKIVILI_DB_BUSY_TIMEOUT_MS", "5000"))
@@ -86,11 +105,6 @@ def load_settings() -> Settings:
     return Settings()
 
 
-def _sqlite_sync_url(db_path: str) -> str:
-    """同步 sqlite URL；db_path 的反斜杠(Windows)转正斜杠避免被当转义。"""
-    return "sqlite:///" + db_path.replace("\\", "/")
-
-
 def _pg_sync_url(url: str) -> str:
     """把运行期 PG URL（postgresql+asyncpg://…）转成迁移期同步 psycopg URL。
 
@@ -107,18 +121,10 @@ def _pg_sync_url(url: str) -> str:
 def migration_db_url() -> str:
     """迁移期（Alembic，同步）数据库 URL —— db_migrate.py 与 migrations/env.py 的单一真相源。
 
-    优先级：
-      1. ALEMBIC_DB_PATH（测试隔离，始终 sqlite）——保持 S1-S3 测试路径逐字节不变，最高优先。
-      2. db_url（S4 双引擎，PG）——转成同步 psycopg URL。
-      3. db_path（默认 sqlite）。
+    数据底座 S5：PG 单引擎。运行期 db_url（asyncpg）转成同步 psycopg URL 供 Alembic。
+    AKIVILI_DB_URL 环境变量已在 Settings.db_url 里最高优先，故此处直接取 settings.db_url。
     """
-    alembic_path = os.environ.get("ALEMBIC_DB_PATH")
-    if alembic_path:
-        return _sqlite_sync_url(alembic_path)
-    settings = load_settings()
-    if settings.db_url:
-        return _pg_sync_url(settings.db_url)
-    return _sqlite_sync_url(settings.db_path)
+    return _pg_sync_url(load_settings().db_url)
 
 
 def save_settings(settings: Settings) -> None:

@@ -1,39 +1,49 @@
-"""Akivili Alembic migration regression probe (foundation-db S2).
+"""Akivili Alembic migration regression probe (foundation-db S2 / S5 · PG 单引擎).
 
-Guards the S2 outcome so later data-layer work (S3 ORM / S4-S5 PG) and any future
-schema migration cannot silently regress the baseline contract:
-  1. Empty DB `alembic upgrade head` rebuilds exactly the S0.1 baseline schema
-     (18 tables, byte-for-byte identical to baseline_schema.sql).
-  2. Version stamping works: after upgrade, alembic_version == head; a second
-     upgrade is idempotent (no re-create, no "table already exists").
-  3. Legacy DB (has tables, no alembic_version) → run_migrations() auto-stamps
-     (action='stamp'), does NOT recreate tables, does NOT lose data.
-  4. Round-trip: upgrade → downgrade base (drops all 18) → upgrade rebuilds
-     byte-identical (down/up both correct).
-  5. WAL is applied by the migration path (journal_mode=wal after upgrade).
+Guards the migration contract so later data-layer work and any future schema
+migration cannot silently regress it. **S5：PostgreSQL 单引擎**——不再有 SQLite，
+故不再做「逐字节对齐 baseline_schema.sql」「PRAGMA journal_mode=wal」这类 sqlite 专属校验；
+保留迁移的真实价值，改在 PG 上验证：
 
-Uses isolated temp DBs via ALEMBIC_DB_PATH (never the real jianagency.db).
+  1. 空的隔离 PG 库 `run_migrations()` 返回 action=='upgrade'；之后恰好 18 张基线表
+     （不含 alembic_version），且 alembic_version.version_num=='002'（head）。
+  2. 幂等：第二次 `run_migrations()` 返回 action=='noop'；仍 18 张表。
+  3. 存量库（已有表、无 alembic_version）→ `run_migrations()` 返回 action=='stamp'，
+     不重建/不删表、保留既有数据，并 stamp 到 '002'。
+  4. 002 数据规整：只 upgrade 到 '001'（建表）→ 插 planning/archived/in_progress 三态任务
+     → upgrade 到 '002'（跑规整）→ 断言 planning→backlog、archived→done、in_progress 不动。
+  5. 往返：upgrade head → downgrade base（0 张基线表、alembic_version 清空）→ upgrade head
+     重建 18 张表。（比对**表数量**，不比对逐字节 schema——PG 无 baseline dump。）
+
+每个场景各建一个隔离 PG 库（run_qa_suite.isolated_pg_db_url()，进程退出自动删），写一份临时
+config.json 指向它、改 config.CONFIG_FILE，再跑 run_migrations()/alembic 命令。
+config.load_settings() 每次现读 CONFIG_FILE（无 lru_cache/全局缓存），故切库只需改 CONFIG_FILE。
 No CLI/LLM. Cleans up temp dir unless --keep.
 """
 from __future__ import annotations
 
 import argparse
-import os
-import sqlite3
+import json
 import sys
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_qa_suite import BACKEND  # noqa: E402
+# 导入 run_qa_suite 即设置 AKIVILI_TEST_NULLPOOL=1，并暴露 BACKEND / isolated_pg_db_url。
+from run_qa_suite import BACKEND, isolated_pg_db_url  # noqa: E402
 
-# 让 backend/ 可 import（db_migrate/config/alembic env）——run_qa_suite 只在
-# setup_isolated_config 内插入，本 probe 不走那条路径，故显式加入。
+# 让 backend/ 可 import（db_migrate/config/alembic env）。
 sys.path.insert(0, str(BACKEND))
 
-BASELINE_SQL = (
-    BACKEND.parent
-    / "openspec" / "changes" / "2026-07-24-foundation-db-alignment" / "baseline_schema.sql"
+# 期望的基线业务表数量（models/tables.py 的 18 张，不含 alembic_version）。
+EXPECTED_TABLES = 18
+HEAD_REV = "002"
+
+# 统计基线表数：public schema 下的 BASE TABLE，排除 alembic_version。
+_COUNT_SQL = (
+    "SELECT count(*) FROM information_schema.tables "
+    "WHERE table_schema='public' AND table_type='BASE TABLE' "
+    "AND table_name <> 'alembic_version'"
 )
 
 
@@ -51,117 +61,127 @@ class Probe:
         return all(r[1] for r in self.results)
 
 
-def _export_schema(db_path: str) -> str:
-    """Dump table DDL the same way S0.1 did (exclude alembic_version + sqlite internals)."""
-    db = sqlite3.connect(db_path)
-    rows = db.execute(
-        "SELECT type, name, sql FROM sqlite_master "
-        "WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name != 'alembic_version' "
-        "ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name"
-    ).fetchall()
-    db.close()
-    return "\n".join(f"-- [{t}] {n}\n{s.strip()};\n" for t, n, s in rows)
+def _pg_dsn(run_url: str) -> str:
+    """从运行期 asyncpg URL 得到 psycopg（同步）可用的 DSN。
+
+    postgresql+asyncpg://user:pw@host:port/db → postgresql://user:pw@host:port/db
+    不硬编码任何凭证——纯粹从隔离库 URL 去掉 +asyncpg driver 段。
+    """
+    return run_url.replace("+asyncpg", "", 1)
 
 
-def _table_count(db_path: str) -> int:
-    db = sqlite3.connect(db_path)
-    n = db.execute(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
-        "AND name != 'alembic_version' AND name NOT LIKE 'sqlite_%'"
-    ).fetchone()[0]
-    db.close()
-    return n
+def _table_count(run_url: str) -> int:
+    import psycopg  # noqa: PLC0415
+    with psycopg.connect(_pg_dsn(run_url)) as conn:
+        return int(conn.execute(_COUNT_SQL).fetchone()[0])
 
 
-def _version(db_path: str) -> str | None:
-    db = sqlite3.connect(db_path)
-    try:
-        r = db.execute("SELECT version_num FROM alembic_version").fetchone()
-        return r[0] if r else None
-    except sqlite3.OperationalError:
-        return None
-    finally:
-        db.close()
+def _version(run_url: str) -> str | None:
+    """读 alembic_version.version_num；表不存在 → None。"""
+    import psycopg  # noqa: PLC0415
+    with psycopg.connect(_pg_dsn(run_url)) as conn:
+        exists = conn.execute(
+            "SELECT to_regclass('public.alembic_version')"
+        ).fetchone()[0]
+        if not exists:
+            return None
+        row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+        return row[0] if row else None
+
+
+def _use_db(tmp: Path, run_url: str, tag: str) -> None:
+    """把 config.CONFIG_FILE 指向一份 db_url=<隔离库> 的临时 config.json。
+
+    load_settings() 每次现读 CONFIG_FILE（无缓存），故此后所有 run_migrations()/alembic
+    命令都通过 migration_db_url() 落到该隔离库。
+    """
+    import config  # noqa: PLC0415
+    cfg = {"db_url": run_url, "providers": [], "default_provider_id": ""}
+    cfg_path = tmp / f"config_{tag}.json"
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    config.CONFIG_FILE = cfg_path
 
 
 def run_probe(tmp: Path) -> Probe:
     probe = Probe()
-    # 迁移接入模块与 alembic 均从 backend/ 解析；ALEMBIC_DB_PATH 指向隔离临时库。
     import db_migrate  # noqa: PLC0415
+    from alembic import command  # noqa: PLC0415
 
-    baseline = BASELINE_SQL.read_text(encoding="utf-8")
-
-    # --- Check 1+2+5: 空库 upgrade → 结构对齐基线 + 版本 stamp + 幂等 + WAL ---
-    empty_db = str(tmp / "empty.db")
-    os.environ["ALEMBIC_DB_PATH"] = empty_db
+    # --- Check 1+2: 空的隔离库 upgrade → 18 表 + 版本 stamp + 幂等 ---
+    empty_url = isolated_pg_db_url()
+    _use_db(tmp, empty_url, "empty")
     action1 = db_migrate.run_migrations()
     probe.check("empty DB run_migrations action=upgrade", action1 == "upgrade", f"got {action1}")
-    probe.check("empty DB rebuilt == baseline (byte-identical)",
-                _export_schema(empty_db) == baseline,
-                "18 tables byte-for-byte" if _export_schema(empty_db) == baseline else "SCHEMA DIFF")
-    probe.check("empty DB table count == 18", _table_count(empty_db) == 18, f"{_table_count(empty_db)} tables")
-    probe.check("alembic_version stamped to head(002)", _version(empty_db) == "002", f"v={_version(empty_db)}")
-    jm = sqlite3.connect(empty_db).execute("PRAGMA journal_mode").fetchone()[0]
-    probe.check("migration path leaves DB in WAL", str(jm).lower() == "wal", f"journal_mode={jm}")
+    probe.check(f"empty DB table count == {EXPECTED_TABLES}",
+                _table_count(empty_url) == EXPECTED_TABLES, f"{_table_count(empty_url)} tables")
+    probe.check(f"alembic_version stamped to head({HEAD_REV})",
+                _version(empty_url) == HEAD_REV, f"v={_version(empty_url)}")
     action2 = db_migrate.run_migrations()
     probe.check("second run is idempotent (action=noop)", action2 == "noop", f"got {action2}")
-    probe.check("still 18 tables after 2nd run", _table_count(empty_db) == 18, f"{_table_count(empty_db)} tables")
+    probe.check(f"still {EXPECTED_TABLES} tables after 2nd run",
+                _table_count(empty_url) == EXPECTED_TABLES, f"{_table_count(empty_url)} tables")
 
     # --- Check 3: 存量库(有表无 version) → 自动 stamp、不重建、不丢数据 ---
-    legacy_db = str(tmp / "legacy.db")
-    ldb = sqlite3.connect(legacy_db)
-    ldb.execute("CREATE TABLE projects (id INTEGER PRIMARY KEY, title TEXT)")
-    ldb.execute("CREATE TABLE tasks (id INTEGER PRIMARY KEY, project_id INTEGER)")
-    ldb.execute("INSERT INTO projects (title) VALUES ('legacy-keep')")
-    ldb.commit()
-    ldb.close()
-    os.environ["ALEMBIC_DB_PATH"] = legacy_db
+    legacy_url = isolated_pg_db_url()
+    import psycopg  # noqa: PLC0415
+    with psycopg.connect(_pg_dsn(legacy_url), autocommit=True) as conn:
+        conn.execute("CREATE TABLE projects (id SERIAL PRIMARY KEY, title TEXT)")
+        conn.execute("CREATE TABLE tasks (id SERIAL PRIMARY KEY, project_id INTEGER)")
+        conn.execute("INSERT INTO projects (title) VALUES ('legacy-keep')")
+    _use_db(tmp, legacy_url, "legacy")
     action3 = db_migrate.run_migrations()
     probe.check("legacy DB run_migrations action=stamp", action3 == "stamp", f"got {action3}")
-    probe.check("legacy DB NOT recreated (still 2 tables)", _table_count(legacy_db) == 2,
-                f"{_table_count(legacy_db)} tables")
-    probe.check("legacy DB stamped to head(002)", _version(legacy_db) == "002", f"v={_version(legacy_db)}")
-    kept = sqlite3.connect(legacy_db).execute("SELECT title FROM projects").fetchone()
+    probe.check("legacy DB NOT recreated (still 2 tables)", _table_count(legacy_url) == 2,
+                f"{_table_count(legacy_url)} tables")
+    probe.check(f"legacy DB stamped to head({HEAD_REV})",
+                _version(legacy_url) == HEAD_REV, f"v={_version(legacy_url)}")
+    with psycopg.connect(_pg_dsn(legacy_url)) as conn:
+        kept = conn.execute("SELECT title FROM projects").fetchone()
     probe.check("legacy DB data preserved", bool(kept) and kept[0] == "legacy-keep",
                 f"projects.title={kept[0] if kept else None}")
 
-    # --- Check 6 (S3.6): 002 数据规整——planning→backlog / archived→done ---
+    # --- Check 4: 002 数据规整——planning→backlog / archived→done / 其它不动 ---
     # 走 upgrade 链精确验证 002.upgrade 的数据逻辑：upgrade 到 001(仅建表) → 插废弃状态行
     # → upgrade 到 002(跑数据规整) → 校验。（stamp 只打版本、不执行迁移体，故不能靠 stamp 验。）
-    from alembic import command as _command  # noqa: PLC0415
-    norm_db = str(tmp / "normalize.db")
-    os.environ["ALEMBIC_DB_PATH"] = norm_db
+    norm_url = isolated_pg_db_url()
+    _use_db(tmp, norm_url, "normalize")
     cfg_n = db_migrate._alembic_config()
-    _command.upgrade(cfg_n, "001")   # 只到 001（建表，未跑 002）
-    ndb = sqlite3.connect(norm_db)
-    ndb.execute("INSERT INTO tasks (project_id, title, status) VALUES (1,'旧规划态','planning')")
-    ndb.execute("INSERT INTO tasks (project_id, title, status) VALUES (1,'旧归档态','archived')")
-    ndb.execute("INSERT INTO tasks (project_id, title, status) VALUES (1,'正常态','in_progress')")
-    ndb.commit()
-    ndb.close()
-    _command.upgrade(cfg_n, "002")   # 跑 002 数据规整
-    ndb = sqlite3.connect(norm_db)
-    st = {t: s for t, s in ndb.execute("SELECT title, status FROM tasks").fetchall()}
-    ndb.close()
+    command.upgrade(cfg_n, "001")   # 只到 001（建表，未跑 002）
+    # PG 强制外键：tasks.project_id → projects.id NOT NULL，故先建一个 project 再插 task。
+    with psycopg.connect(_pg_dsn(norm_url), autocommit=True) as conn:
+        conn.execute("INSERT INTO projects (id, title, local_path) VALUES (1, 'p', '/tmp')")
+        conn.execute("INSERT INTO tasks (project_id, title, status) VALUES (1,'旧规划态','planning')")
+        conn.execute("INSERT INTO tasks (project_id, title, status) VALUES (1,'旧归档态','archived')")
+        conn.execute("INSERT INTO tasks (project_id, title, status) VALUES (1,'正常态','in_progress')")
+    command.upgrade(cfg_n, "002")   # 跑 002 数据规整
+    with psycopg.connect(_pg_dsn(norm_url)) as conn:
+        st = {t: s for t, s in conn.execute("SELECT title, status FROM tasks").fetchall()}
     probe.check("002: planning→backlog", st.get("旧规划态") == "backlog", f"got {st.get('旧规划态')}")
     probe.check("002: archived→done", st.get("旧归档态") == "done", f"got {st.get('旧归档态')}")
     probe.check("002: 其它状态不动", st.get("正常态") == "in_progress", f"got {st.get('正常态')}")
 
-    # --- Check 4: 往返 upgrade → downgrade base → upgrade 无损 ---
-    from alembic import command  # noqa: PLC0415
-    rt_db = str(tmp / "roundtrip.db")
-    os.environ["ALEMBIC_DB_PATH"] = rt_db
+    # --- Check 5: 往返 upgrade → downgrade base → upgrade（比表数量，非逐字节） ---
+    rt_url = isolated_pg_db_url()
+    _use_db(tmp, rt_url, "roundtrip")
     db_migrate.run_migrations()  # upgrade → 18
     cfg = db_migrate._alembic_config()
-    command.downgrade(cfg, "base")
-    probe.check("downgrade base drops all tables", _table_count(rt_db) == 0, f"{_table_count(rt_db)} tables")
-    probe.check("downgrade clears version", _version(rt_db) is None, f"v={_version(rt_db)}")
-    command.upgrade(cfg, "head")
-    probe.check("re-upgrade rebuilds 18 tables", _table_count(rt_db) == 18, f"{_table_count(rt_db)} tables")
-    probe.check("round-trip schema == baseline", _export_schema(rt_db) == baseline,
-                "byte-identical" if _export_schema(rt_db) == baseline else "SCHEMA DIFF")
+    try:
+        command.downgrade(cfg, "base")
+        down_err = ""
+    except Exception as exc:  # noqa: BLE001
+        # 不吞成功、不伪造：downgrade 抛错时如实记为 FAIL，附首行错误，避免整探针崩在此处不打计数。
+        down_err = str(exc).splitlines()[0]
+    probe.check("downgrade base drops all base tables",
+                not down_err and _table_count(rt_url) == 0,
+                down_err or f"{_table_count(rt_url)} tables")
+    probe.check("downgrade clears version", not down_err and _version(rt_url) is None,
+                down_err or f"v={_version(rt_url)}")
+    if not down_err:
+        command.upgrade(cfg, "head")
+    probe.check(f"re-upgrade rebuilds {EXPECTED_TABLES} tables",
+                not down_err and _table_count(rt_url) == EXPECTED_TABLES,
+                down_err or f"{_table_count(rt_url)} tables")
 
-    os.environ.pop("ALEMBIC_DB_PATH", None)
     return probe
 
 

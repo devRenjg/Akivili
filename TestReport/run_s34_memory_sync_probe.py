@@ -32,7 +32,8 @@ def check(name, cond, detail=""):
 
 def _isolate(tmp):
     db_path = os.path.join(tmp, "s34_probe.db")
-    cfg = {"db_path": db_path, "providers": [], "default_provider_id": ""}
+    from run_qa_suite import isolated_pg_db_url  # noqa: PLC0415
+    cfg = {"db_url": isolated_pg_db_url(), "providers": [], "default_provider_id": ""}
     cfg_path = os.path.join(tmp, "config.json")
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False)

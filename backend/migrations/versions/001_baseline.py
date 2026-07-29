@@ -239,6 +239,24 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade schema：逆序 DROP（尊重外键依赖，被引用表最后删）。"""
+    """Downgrade schema：逆序 DROP（尊重外键依赖，被引用表最后删）。
+
+    S4 双引擎：与 upgrade 对称按方言分支。
+    - SQLite：逐条 op.execute（FK 默认不强制，reversed(_DROP_ORDER) 顺序即可）。
+    - PostgreSQL：走 ORM metadata.drop_all——SQLAlchemy 按外键依赖自动拓扑排序删表
+      （被引用表最后删），避免手写 _DROP_ORDER 与真实 FK 依赖漂移。upgrade 用 create_all
+      建、downgrade 用 drop_all 删，一对一对称。（_DROP_ORDER 手写顺序把 conversations 排在
+      其依赖的 project_agents 之前，SQLite FK-off 掩盖、PG 强制 FK 下会 DependentObjectsStillExist。）
+    """
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        import sys
+        from pathlib import Path
+        _backend = Path(__file__).resolve().parents[2]
+        if str(_backend) not in sys.path:
+            sys.path.insert(0, str(_backend))
+        from models import Base  # noqa: PLC0415
+        Base.metadata.drop_all(bind)
+        return
     for name in reversed(_DROP_ORDER):
         op.execute(f"DROP TABLE IF EXISTS {name}")

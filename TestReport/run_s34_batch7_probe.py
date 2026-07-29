@@ -31,8 +31,9 @@ def check(name, cond, detail=""):
 
 
 def _isolate(tmp):
+    from run_qa_suite import isolated_pg_db_url  # noqa: PLC0415
     cfg = {
-        "db_path": os.path.join(tmp, "batch7.db"),
+        "db_url": isolated_pg_db_url(),   # S5：PG 隔离库（替代 sqlite db_path）
         "agent_library_dir": os.path.join(tmp, "agents"),
         "skills_dir": os.path.join(tmp, "skills"),
         "memory_dir": os.path.join(tmp, "mem"),

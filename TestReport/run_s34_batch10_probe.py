@@ -32,8 +32,9 @@ def check(name, cond, detail=""):
 
 
 def _isolate(tmp):
+    from run_qa_suite import isolated_pg_db_url  # noqa: PLC0415
     cfg = {
-        "db_path": os.path.join(tmp, "batch10.db"),
+        "db_url": isolated_pg_db_url(),   # S5：PG 隔离库（替代 sqlite db_path）
         "agent_library_dir": os.path.join(tmp, "agents"),
         "skills_dir": os.path.join(tmp, "skills"),
         "memory_dir": os.path.join(tmp, "mem"),
@@ -155,7 +156,7 @@ async def _run():
     # 活动路径：造一条 run 启动后的 commented 活动
     async with SF() as s:
         await s.execute(text("INSERT INTO activities (task_id,actor_type,actor_name,action,created_at) "
-                             "VALUES (770,'agent','dev','commented',datetime('now'))"))
+                             "VALUES (770,'agent','dev','commented',to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))"))
         await s.commit()
     d3 = await runner._has_jian_deliverable(77, "dev", 502, 770, 7000)
     check("_has_jian_deliverable 活动 JOIN 命中", d3 is True, str(d3))
@@ -166,22 +167,22 @@ async def _run():
     async with SF() as s:
         await s.execute(text("INSERT INTO conversations (id,project_id) VALUES (78,77)"))
         await s.execute(text("INSERT INTO task_runs (id,task_id,agent_slug,status,started_at) "
-                             "VALUES (7500,770,'trail-dev','running',datetime('now','-1 hour'))"))
+                             "VALUES (7500,770,'trail-dev','running',to_char((now() AT TIME ZONE 'UTC') + interval '-1 hour', 'YYYY-MM-DD HH24:MI:SS'))"))
         # 会话内该 slug 唯一交付消息：60 分钟前
         await s.execute(text("INSERT INTO messages (conversation_id,role,content,author_slug,created_at) "
-                             "VALUES (78,'assistant','早交付','trail-dev',datetime('now','-60 minutes'))"))
+                             "VALUES (78,'assistant','早交付','trail-dev',to_char((now() AT TIME ZONE 'UTC') + interval '-60 minutes', 'YYYY-MM-DD HH24:MI:SS'))"))
         # 长 stdout：现在（明显 >15s 晚于交付）；须 >40 字符方过 length(trim)>40 阈值
         await s.execute(text("INSERT INTO run_logs (run_id,channel,content,ts) VALUES "
-                             "(7500,'stdout','这是一段很长的收尾分析结论用于触发长度阈值判定这里再补足够多的中文字符确保整体长度稳稳超过四十个字符的下限判定通过',datetime('now'))"))
+                             "(7500,'stdout','这是一段很长的收尾分析结论用于触发长度阈值判定这里再补足够多的中文字符确保整体长度稳稳超过四十个字符的下限判定通过',to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))"))
         await s.commit()
     t1 = await runner._has_trailing_stdout_after_deliverable(78, "trail-dev", 770, 7500)
     check("_has_trailing 收尾漏交付判 True", t1 is True, str(t1))
     # run 7501：有 stdout 但无任何交付 → False（交由 _has_jian_deliverable 那条负责）
     async with SF() as s:
         await s.execute(text("INSERT INTO task_runs (id,task_id,agent_slug,status,started_at) "
-                             "VALUES (7501,770,'zzz','running',datetime('now'))"))
+                             "VALUES (7501,770,'zzz','running',to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))"))
         await s.execute(text("INSERT INTO run_logs (run_id,channel,content,ts) VALUES "
-                             "(7501,'stdout','另一段足够长的输出内容超过四十字符阈值判定使用yyyyyyyyyy',datetime('now'))"))
+                             "(7501,'stdout','另一段足够长的输出内容超过四十字符阈值判定使用yyyyyyyyyy',to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'))"))
         await s.commit()
     t2 = await runner._has_trailing_stdout_after_deliverable(78, "zzz", 770, 7501)
     check("_has_trailing 无交付返回 False", t2 is False, str(t2))

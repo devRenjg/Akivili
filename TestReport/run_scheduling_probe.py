@@ -217,7 +217,8 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
     # ---- Test D: error 事件无产出（CLI/LLM 瞬时报错）属可重试类 ----
     async def err_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
         run_seq["n"] += 1
-        yield ExecEvent("system", "", {"run_id": f"tr-{run_seq['n']}"})
+        # run_id 对齐生产语义：等于 task_runs.id（INTEGER）。PG 严格类型下字符串会 DataError。
+        yield ExecEvent("system", "", {"run_id": run_seq["n"]})
         yield ExecEvent("error", "boom")   # error 且无 text 产出 → 瞬时报错，可重试
         yield ExecEvent("done")
 
@@ -241,7 +242,8 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
 
     async def hang_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
         run_seq["n"] += 1
-        yield ExecEvent("system", "", {"run_id": f"tr-{run_seq['n']}"})
+        # run_id = task_runs.id（INTEGER），与生产一致；PG 下字符串 run_id 会触发 DataError。
+        yield ExecEvent("system", "", {"run_id": run_seq["n"]})
         await asyncio.sleep(3600)   # 卡死，不再产出任何事件
 
     runner.execute_dispatch = hang_dispatch
