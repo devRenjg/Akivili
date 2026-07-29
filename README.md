@@ -42,7 +42,7 @@ Akivili 是一个**本地优先（local-first）**的多 Agent 编排平台：
 |------|----------|
 | 前端 | Vue 3 + Vite + Element Plus + Vue Router |
 | 后端 | Python 3.12 + FastAPI + Uvicorn |
-| 存储 | SQLite（项目 / Agent / 会话 / 工作流元数据）+ 本地文件系统（项目工作区） |
+| 存储 | PostgreSQL（项目 / Agent / 会话 / 工作流元数据；运行期 asyncpg + 迁移期 psycopg，Alembic 迁移 + SQLAlchemy ORM）+ 本地文件系统（项目工作区） |
 | 执行引擎 | Claude Code CLI（`claude -p`）/ Codex CLI（`codex exec`）/ 纯 LLM API |
 | LLM | OpenAI Chat Completions / Anthropic Messages（双格式兼容） |
 | 规格管理 | OpenSpec（specs 已实现能力 / changes 待实现提案） |
@@ -203,10 +203,21 @@ JianAgency/
 - [ ] 终端 CLI 入口
 - [ ] OpenSpec 看板
 
+## 环境依赖
+
+- **Python 3.12**、**Node.js**（前端）。
+- **PostgreSQL**（**必需**）：数据底座为 **PostgreSQL 单引擎**——无 SQLite、无降级、无双引擎兼容。PG 不可用时后端**不会启动**（`start.ps1` 启动前会做就绪检查，连不上即中止并给出排查指引）。
+  - 建库：创建一个数据库与角色（默认库名 / 用户名均为 `akivili`）。
+  - 连接配置（二选一，环境变量优先，口令不落 `config.json`）：
+    - `AKIVILI_DB_URL`（整串，最高优先）：`postgresql+asyncpg://<user>:<pw>@<host>:5432/<db>`；
+    - 或分段：`AKIVILI_PG_HOST` / `AKIVILI_PG_PORT` / `AKIVILI_PG_DB` / `AKIVILI_PG_USER` / `AKIVILI_PG_PASSWORD`（缺省 `localhost:5432` / `akivili` / `akivili` / `akivili_dev_pw`）。
+  - 建表由 **Alembic 迁移**在后端启动时自动 `upgrade head` 完成，无需手工建表。
+  - 就绪检查窗口可调：`AKIVILI_PG_WAIT_TIMEOUT`（默认 30s）/ `AKIVILI_PG_WAIT_INTERVAL`（默认 1s）。
+
 ## 快速开始
 
 ```powershell
-# 一键启动（安装依赖 + 起前后端）
+# 一键启动（装依赖 + PG 就绪检查 + 起前后端）
 ./start.ps1
 # 前端 http://localhost:3100   后端 http://localhost:8100
 ```
