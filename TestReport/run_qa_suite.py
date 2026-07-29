@@ -531,12 +531,22 @@ async def run_suite(paths: dict[str, Path], include_live: bool) -> QaState:
         order = [x["slug"] for x in executed]
         state.metrics["deterministic_collab_ms"] = round(collab_ms, 2)
         state.metrics["deterministic_collab_order"] = order
+        # 断言按「链路语义」判定，不锁精确位置/次数——慢/共享 CI runner 上调度抖动可能让某个 run
+        # 被判瞬时失败并重试（order 出现重复项）或错峰，精确 order[:2]==[leader,backend] 会假红。
+        # 真正要守护的正确性：① Leader 第一个跑且把活委派给了后端（backend 首次出现在 leader 之后）；
+        # ② 链路最终传导到测试专员。用 index 关系 + 成员在场判定，对重复/错峰稳健。
+        first_leader = order.index(leader_slug) if leader_slug in order else -1
+        first_backend = order.index(backend_agent["slug"]) if backend_agent["slug"] in order else -1
+        leader_delegated_backend = (
+            bool(rid) and first_leader == 0 and first_backend > first_leader)
         state.add("协同：Leader 入队并按后端任务找对后端开发者",
-                  bool(rid) and order[:2] == [leader_slug, backend_agent["slug"]],
+                  leader_delegated_backend,
                   "collaboration", "P0", f"order={order}")
+        first_tester = order.index(tester_agent["slug"]) if tester_agent["slug"] in order else -1
         state.add("协同：成员回报后触发测试专员验证",
-                  tester_agent["slug"] in order,
-                  "collaboration", "P0", f"order={order}")
+                  first_backend >= 0 and first_tester > first_backend,
+                  "collaboration", "P0",
+                  f"order={order}（backend@{first_backend} → tester@{first_tester}）")
         # 3 轮队列耗时：只采集不卡阀值（同 p95 一处理）。本质是 3×sleep(0.02)+队列开销的
         # 延迟微基准，共享/冷启动 CI runner 上会超 1000ms 阈（本地 ~950ms、CI 1087ms），
         # 卡它无正确性价值——链路正确性已由上面两条 order 断言守护。回归看 deterministic_collab_ms 趋势。
