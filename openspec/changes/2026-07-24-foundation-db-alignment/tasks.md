@@ -73,13 +73,34 @@
 - [x] S4.7 双跑回归：sqlite 侧 40 门禁 40/40（默认路径零回归）+ PG 侧端到端 22/22 + 一致性 37/37。注：40 门禁 27 个深度绑 sqlite-only seed（业务运行期已零 `get_connection`），PG 侧以端到端场景验证替代单元探针硬改（见 README S4.6）
 - [x] **S4.V 验收**：大检阅 8 项全通——依赖就绪 / 001→002 双引擎建库 / 迁移 31772 行 / 一致性 37/37 / PG 端到端 22/22 / 探针后一致性重验 37/37 / sqlite 40 门禁 1125 断言 / 方言 helper 双引擎编译核对 → **回滚锚点 D**
 
-## S5. 切 PostgreSQL 为默认
-- [ ] S5.1 默认 `DB_URL` 指向 PostgreSQL；SQLite 保留为显式可选（本地轻量开发）
-- [ ] S5.2 `start.ps1` 增加 PG 就绪检查 / 启动前置（不破坏现有单进程流程）
-- [ ] S5.3 PG 上跑完整回归 + 关键路径人工验收（建项目 / 跑 Agent / 看流式 / kill / 孤儿兜底）
-- [ ] S5.4 更新 README：PG 前置依赖、启动步骤、SQLite 降级说明
-- [ ] S5.5 更新 OpenSpec：本 change 涉及能力固化进 `specs/foundation-data-layer/`；三个被阻塞 change 的 schema 章节改注「基于 Alembic 迁移 + ORM 实现」
-- [ ] **S5.V 验收**：PG 默认启动全回归绿 + 人工验收通过；README/OpenSpec 更新完成；底座对齐 Multica 完成 → **提交，change 待归档**
+## S5. 切 PostgreSQL 为**唯一**引擎（方向调整）
+> 计划调整（用户 2026-07-24 拍板）：原 S5「PG 默认 + SQLite 显式可选/降级」升级为
+> **PG 单引擎、无 SQLite、无降级、无双引擎兼容**（"挂了就挂了"）。连测试也彻底去 sqlite。
+> 落地拆为 S5a（运行期/迁移侧去 sqlite）+ S5b（测试基座去 sqlite）+ 收尾三项。
+
+### S5a. 运行期 + 迁移侧单引擎化
+- [x] S5a.1 `config.py` 硬默认 PG（`_default_pg_url` 按 `AKIVILI_PG_*` 拼），删 sqlite 分支
+- [x] S5a.2 `models/engine.py` 删 sqlite 分支与 PRAGMA 监听（PG 内建 WAL/MVCC/外键）
+- [x] S5a.3 迁移侧（`db_migrate`/`migrations/env.py`）删 sqlite 分支，`migration_db_url` 恒 psycopg
+- [x] S5a.4 `database.py` 改为**保留 aiosqlite 式 API 的 PG 适配器**（测试 seed 零改跑 PG）
+
+### S5b. 测试基座去 sqlite
+- [x] S5b.1 探针隔离改 PG namespace（`isolated_pg_db_url` 建 `qa_iso_*` 库 + atexit drop）
+- [x] S5b.2 `get_connection` PG 适配器：`?`→`$N`、INSERT 自动 `RETURNING id`、`datetime('now')`→PG、`INSERT OR IGNORE/REPLACE`→`ON CONFLICT DO NOTHING`
+- [x] S5b.3 修 seed 内联 sqlite SQL（`INSERT OR *`、`datetime` 修饰符）
+- [x] S5b.4 sqlite 语义探针改造：退役 WAL/orm_engine 探针；新建 `run_pg_concurrency_probe`；migration/parity/dialect 探针改 PG
+- [x] S5b.5 全量门禁 PG 上全绿（39 项 · 580 断言）
+
+### S5c. 收尾
+- [x] S5c.1 CI（GitHub Actions windows-latest）在 PostgreSQL 上跑门禁 + QA Suite，绿
+- [x] S5c.2 根治 CI 时序/并发敏感断言（验不变式不验精确值）+ 协同链路 flaky（退避清零+驱动到静止）
+- [x] S5c.3 `run_queue` 部分唯一索引 `uq_run_queue_active`（迁移 003）兜底 enqueue TOCTOU
+- [x] S5c.4 `config.py` 清理 sqlite 时代死配置（`db_busy_timeout_ms`）+ `db_path` 注释收口
+- [x] S5c.5 `start.ps1` 加 PostgreSQL 就绪检查（`wait_for_pg.py`，PG 不通则中止启动）
+- [x] S5c.6 更新 README：PG 前置依赖、启动步骤、**无 SQLite 降级**声明
+- [x] S5c.7 更新 OpenSpec：能力固化进 `specs/foundation-data-layer/`（「双引擎/PG默认化含降级」两条 Requirement 改写为「PostgreSQL 单引擎」+「数据搬迁一致性」，反映实际落地）
+- [ ] S5c.8 三个被阻塞 change 的 schema 章节改注「基于 Alembic 迁移 + ORM(PG 单引擎) 实现」
+- [ ] **S5.V 验收**：真实数据 cutover（需用户重启窗口，严守 `backend-restart-single-instance`）+ 关键路径人工验收（建项目/跑 Agent/看流式/kill/孤儿兜底）→ **提交，change 归档到 `changes/archive/`**
 
 ## 通用验收门（每个 S*.V 都必须满足）
 - [ ] 该阶段 S0.2 回归基准全绿（行为不回退）
