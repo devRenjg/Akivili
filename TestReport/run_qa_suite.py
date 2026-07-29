@@ -590,7 +590,10 @@ async def run_suite(paths: dict[str, Path], include_live: bool) -> QaState:
         state.add("看板按状态分组返回任务", r.status_code == 200 and "in_progress" in board,
                   "task-board", "P1", f"columns={list(board.keys())}")
 
-        # Simple API latency probe.
+        # 任务列表接口延迟：只采集不卡阀值。
+        # 原为硬断言 p95<300ms——本地 ~85ms 但共享/冷启动的 CI runner 会偶发超阈红门禁
+        # （机器速度依赖的延迟微基准塞进 pass/fail 门是反模式）。改为录入 metrics + 打印，
+        # 性能回归靠看 tasks_list_p95_ms 趋势，不让 CI 硬件抖动弄红正确性门禁。
         latencies = []
         for _ in range(10):
             _, one_ms = await timed(admin.get(f"/api/projects/{pid}/tasks"))
@@ -598,8 +601,7 @@ async def run_suite(paths: dict[str, Path], include_live: bool) -> QaState:
         latencies_sorted = sorted(latencies)
         p95 = latencies_sorted[int(len(latencies_sorted) * 0.95) - 1]
         state.metrics["tasks_list_p95_ms"] = round(p95, 2)
-        state.add("性能：任务列表本地 p95 < 300ms", p95 < 300,
-                  "performance", "P1", f"p95={p95:.2f} ms")
+        state.note(f"任务列表 p95={p95:.2f}ms（仅采集，参考阈 300ms；CI 硬件抖动不计入门禁）")
 
         if not include_live:
             state.note("真实模型协同未执行：本次默认只跑隔离可重复测试。需要设置 --live 并确认供应商/CLI 可用后执行真实质量评估。")
@@ -834,6 +836,13 @@ async def amain() -> int:
 
     failed = payload["summary"]["failed"]
     print(f"QA results: {payload['summary']['passed']}/{payload['summary']['total']} passed")
+    # 失败项直接打到 stdout：run_ci_suite 只截子进程 stdout 尾部，报告文件在 runner 上跑完即失。
+    # 有了这几行，CI 门禁日志本身就能看出是哪个 case 挂、挂在哪（无需再传 artifact）。
+    if failed:
+        print(f"失败项（{failed}）：")
+        for r in state.results:
+            if r.status != "PASS":
+                print(f"  [FAIL] {r.category} · {r.name} — {r.detail}")
     print(f"Markdown report: {md_path}")
     print(f"JSON report: {json_path}")
     if args.keep:
