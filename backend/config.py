@@ -59,13 +59,10 @@ class Settings(BaseSettings):
     #   - 未设时用 _default_pg_url() 按 PG 分段环境变量拼默认串（口令走 AKIVILI_PG_PASSWORD）。
     # 恒为 postgresql+asyncpg://…（运行期异步驱动）。
     db_url: str = os.environ.get("AKIVILI_DB_URL", "") or _default_pg_url()
-    # 旧 SQLite 文件路径。S5 运行期已不用（PG 单引擎）；仅剩两处遗留引用，S5b 一并清除：
-    #   - database.py 的测试 seed（S5b 改 PG 适配器后删）；
-    #   - migrate_sqlite_to_pg.py 读取搬迁**源**（一次性割接工具，读旧库天然需要）。
+    # 旧 SQLite 文件路径。S5 运行期已不用（PG 单引擎），运行期/测试 seed 均不再引用。
+    # 唯一使用者是 migrate_sqlite_to_pg.py（一次性割接工具，读旧库做**搬迁源**天然需要）——
+    # 保留此字段直到真实数据 cutover 完成、割接工具退役。
     db_path: str = str(Path(__file__).parent / "jianagency.db")
-    # SQLite 连接锁等待超时（毫秒）：WAL 下写-写竞争时后到的写等待而非立即 database is locked。
-    # 默认 5000（5 秒），可用环境变量 AKIVILI_DB_BUSY_TIMEOUT_MS 覆盖。（仅 SQLite 有意义）
-    db_busy_timeout_ms: int = int(os.environ.get("AKIVILI_DB_BUSY_TIMEOUT_MS", "5000"))
     # Agent 模版库根目录：默认项目内 agents/，可用环境变量 AKIVILI_AGENT_LIBRARY_DIR 指向外部库
     agent_library_dir: str = os.environ.get("AKIVILI_AGENT_LIBRARY_DIR", str(_ROOT / "agents"))
     memory_dir: str = os.environ.get("AKIVILI_MEMORY_DIR", str(_ROOT / "memory"))   # Agent 记忆目录（每个 slug.md 一份）
