@@ -39,8 +39,13 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 ```
 
 - **GitHub Actions**（`.github/workflows/ci.yml`）：push 到 master + 所有 PR 自动跑
-  `run_ci_suite.py`。runner 用 `windows-latest`（与开发环境一致）。
+  `run_ci_suite.py`。runner 用 `windows-latest`（与开发环境一致）。S5 起门禁全量依赖 PG——
+  workflow 先启动 runner **预装的 PostgreSQL**（默认停用，显式 `Start-Service postgresql*` +
+  改 pg_hba 本地 trust + 建 akivili 超级用户/库），再跑门禁。
   > 注：目前**未开分支保护**——CI 红了在 Actions 页面可见，但不强制拦截合入。
+  > ⚠️ CI 的 PG provisioning（预装 PG 启动/建库）尚未经真实 Actions 运行验证——首次 push 后需看
+  > Actions 日志确认 `Start preinstalled PostgreSQL` 步骤跑通（windows-2025 镜像预装 PG 有已知启动
+  > 问题 runner-images#13040，若启动失败按日志调整服务发现/PGDATA 定位）。
 - probe 清单只在 `run_ci_suite.py` 的 `GATE` 里维护一处——新增 probe 时同步加入。
 - 门禁**不含**需真实 CLI 的 `run_collab_scenario.py` / `run_codex_cli_smoke.py`（人工按需单跑）。
 - 实测：**39/39 项、581 断言、~97s 全绿**（跑在 PostgreSQL 单引擎；2026-07-24 S5）。
@@ -80,11 +85,11 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 **新增测试时**：确定性桩 → 加进 `run_ci_suite.py` 的 `GATE`（会跑在 PG 隔离库上）；
 依赖真实 CLI/LLM 或一次性核验 → 保持门禁外，并在下方矩阵用 `*` 标注。
 
-> ⚠️ **GitHub Actions 待收口（S5 Phase 3）**：`.github/workflows/ci.yml` 目前仍是
-> `windows-latest` + SQLite 假设，尚未挂 PostgreSQL service——门禁探针已全量依赖 PG，故
-> **CI 在补上 PG service 前无法在 GitHub 上跑绿**（本地 `run_ci_suite.py` 对着 PG 容器已 39/39）。
-> GitHub `services:` 容器仅 Linux runner 支持，收口需定 runner OS（windows→ubuntu）或 Windows 装 PG，
-> 属 Phase 3 割接决策，见根 README「数据底座 S5」。
+> **GitHub Actions PG 收口（S5 Phase 3，已改 workflow）**：门禁探针全量依赖 PG。因保 Windows
+> 开发环境一致（`services:` 容器仅 Linux runner 支持），`ci.yml` 改为在 `windows-latest` 上启动
+> runner **预装的 PostgreSQL**：`Start-Service postgresql*` + 改 pg_hba 本地 trust + 建 akivili
+> 超级用户/库 + 隔离库建删自检，再跑 39 门禁。**尚待首次真实 Actions 运行验证**（本地对 PG 容器已 39/39；
+> 预装 PG 在 windows-2025 有已知启动问题 runner-images#13040，首跑看日志确认 provisioning 步骤跑通）。
 
 ## 测试矩阵
 
