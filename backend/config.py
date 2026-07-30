@@ -93,6 +93,18 @@ class Settings(BaseSettings):
     # 巡检间隔（秒，默认 120）；静默阈值（秒，默认 1800=30分，须 ≥ 最长 idle 超时以免误伤慢但在跑的 run）。
     orphan_sweep_interval_sec: int = int(os.environ.get("AKIVILI_ORPHAN_SWEEP_INTERVAL", "120"))
     orphan_sweep_idle_sec: int = int(os.environ.get("AKIVILI_ORPHAN_SWEEP_IDLE", "1800"))
+    # 数据底座 S5b：PG 连接池调优（对标 Multica pgx 池的显式容量+存活探测，但按本平台单进程
+    # MAX_CONCURRENCY 规模取值，不照搬其 MaxConns=25）。全部可用环境变量覆盖：
+    #   - db_pool_size：常驻连接数。默认 5，够 MAX_CONCURRENCY=3 的并发查询+孤儿巡检+ping 富余。
+    #   - db_max_overflow：峰值临时溢出连接数（超出 pool_size 的突发）。默认 5。
+    #   - db_pool_timeout_sec：池满时等空闲连接的最长秒数，超时抛错而非无限阻塞。默认 30。
+    #   - db_pool_recycle_sec：连接最长存活秒数，到期回收重建（防 PG 侧 idle 超时踢连接）。默认 1800。
+    #   - db_pool_pre_ping：借出连接前 SELECT 1 探活，失效则丢弃重连（扛 PG 重启/网络抖动）。默认 True。
+    db_pool_size: int = int(os.environ.get("AKIVILI_DB_POOL_SIZE", "5"))
+    db_max_overflow: int = int(os.environ.get("AKIVILI_DB_MAX_OVERFLOW", "5"))
+    db_pool_timeout_sec: int = int(os.environ.get("AKIVILI_DB_POOL_TIMEOUT", "30"))
+    db_pool_recycle_sec: int = int(os.environ.get("AKIVILI_DB_POOL_RECYCLE", "1800"))
+    db_pool_pre_ping: bool = os.environ.get("AKIVILI_DB_POOL_PRE_PING", "1") != "0"
 
 
 def load_settings() -> Settings:

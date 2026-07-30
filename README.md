@@ -211,8 +211,9 @@ JianAgency/
   - 连接配置（二选一，环境变量优先，口令不落 `config.json`）：
     - `AKIVILI_DB_URL`（整串，最高优先）：`postgresql+asyncpg://<user>:<pw>@<host>:5432/<db>`；
     - 或分段：`AKIVILI_PG_HOST` / `AKIVILI_PG_PORT` / `AKIVILI_PG_DB` / `AKIVILI_PG_USER` / `AKIVILI_PG_PASSWORD`（缺省 `localhost:5432` / `akivili` / `akivili` / `akivili_dev_pw`）。
-  - 建表由 **Alembic 迁移**在后端启动时自动 `upgrade head` 完成，无需手工建表。
+  - 建表由 **Alembic 迁移**在后端启动时自动 `upgrade head` 完成，无需手工建表。迁移用 PostgreSQL **advisory lock** 串行化（多实例并发启动时只有一个能跑迁移，其余等锁；拿不到锁则 fail-closed 拒绝无锁裸迁移）——等待上限 `AKIVILI_MIGRATION_LOCK_TIMEOUT`（默认 30s）。
   - 就绪检查窗口可调：`AKIVILI_PG_WAIT_TIMEOUT`（默认 30s）/ `AKIVILI_PG_WAIT_INTERVAL`（默认 1s）。
+  - 连接池调优（均可环境变量覆盖，默认按单进程 `MAX_CONCURRENCY` 规模取值，非越大越好）：`AKIVILI_DB_POOL_SIZE`（常驻连接数，默认 5）/ `AKIVILI_DB_MAX_OVERFLOW`（峰值溢出，默认 5）/ `AKIVILI_DB_POOL_TIMEOUT`（池满等待秒数，默认 30）/ `AKIVILI_DB_POOL_RECYCLE`（连接回收秒数，默认 1800，防 PG 侧 idle 超时踢连接）/ `AKIVILI_DB_POOL_PRE_PING`（借出前探活，默认开，设 `0` 关——开启后可扛 PG 重启/网络抖动/idle 断连）。
 
 ## 快速开始
 
@@ -235,6 +236,13 @@ JianAgency/
 > ⚠️ **安全提醒**：管理员触发 Agent 执行时为放开权限模式，Agent 能在本机改文件、跑命令。请仅在可信内网开放，妥善设置并保管管理员密码。如需真正的域名，请让内网 DNS 把名称解析到本机 IP。
 
 ## 版本记录
+
+### 数据底座对标 Multica · S5b 连接池调优 + 迁移 advisory lock — 2026-07-30
+- 🔧 **PG 单引擎落地后的 DB 层加固（对标 Multica 的两个小点，CAS 原子领取留给 platform-graceful-restart 阶段 1）**
+  - **背景**：S5 切 PG 单引擎为默认后，比对 Multica 发现 DB 层还差三点——连接池未显式调优、迁移无并发串行化锁、`_claim_one` 无 CAS。经核查确认前两点低成本且今天就有真实收益，第三点（完整原子 claim）依赖 graceful-restart 阶段 1 的 execution/attempt/fencing schema，孤立做会返工，故本轮只做前两点。
+  - **连接池调优**：`engine.py` 生产路径从裸 `create_async_engine(url)`（吃默认池、无探活）改为显式 `pool_size`/`max_overflow`/`pool_timeout`/`pool_recycle` + `pool_pre_ping`。`pre_ping` 借出前探活，扛 PG 重启/网络抖动/idle 断连；`recycle` 防 PG 侧 idle 超时踢连接。容量默认 5+5，按单进程 `MAX_CONCURRENCY` 规模取值（非照搬 Multica 的 MaxConns=25），全部 `config.py` 可配、环境变量覆盖。`AKIVILI_TEST_NULLPOOL=1` 测试分支不变（NullPool 不接受这些参数）。
+  - **迁移 advisory lock**：`db_migrate.run_migrations()` 全程持一把 PostgreSQL session 级 `pg_advisory_lock`（key 固定协议常量），多实例并发启动时只有一个能跑 `command.upgrade`，其余轮询等锁；`AKIVILI_MIGRATION_LOCK_TIMEOUT`（默认 30s）内拿不到锁则 **fail-closed** 拒绝无锁裸迁移（宁可启动失败，绝不并发损坏 `alembic_version`）。针对记忆 backend-restart-single-instance 曾出现的多实例并存踩坑上一道 DB 级安全带。
+  - 验证：真实 PG 探针——迁移 `noop` + 锁正确释放（重抢=True）+ 新池 `AsyncAdaptedQueuePool size=5 pre_ping=True` + `ping()=1`；串行化探针——实例 A 持锁时 B 精确 3.0s fail-closed、A 释放后 B 重试成功；QA 全量 **29/29**（隔离库经 advisory-lock 路径跑通 001→002→003 真实 DDL）。
 
 ### 数据底座对标 Multica · S4 双引擎 SQLite⇄PostgreSQL — 2026-07-28
 - 🔧 **引擎抽象 + SQLite/PostgreSQL 双跑（能力 `foundation-data-layer`，OpenSpec change `2026-07-24-foundation-db-alignment`，回滚锚点 D）**
