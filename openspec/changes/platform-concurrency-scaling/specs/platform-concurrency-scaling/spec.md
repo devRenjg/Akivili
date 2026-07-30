@@ -1,5 +1,7 @@
 # platform-concurrency-scaling (delta)
 
+> **⚠️ 数据底座已切 PostgreSQL 单引擎（foundation-db S5，2026-07-24）**：本规格正文中「阶段 0 对 SQLite 启用 WAL/busy_timeout 过渡」「阶段 1 迁移到 Postgres」等表述均为**制定期历史设计背景**——底座现为 PostgreSQL 单引擎（无 SQLite、无降级、无双引擎兼容），原「SQLite 过渡桥 + 迁移 PG」两阶段已被 S5 直接落地取代。凡出现「SQLite 当前落地路径 vs 未来 PostgreSQL」双真相源对照的条款，**目标真相源恒为 PostgreSQL**（SQLite 侧描述仅作反例/历史语境，帮助理解为何选 PG 原生能力），落地一律以 PG 单引擎为准。
+
 ## ADDED Requirements
 
 ### Requirement: 数据层并发写正确性

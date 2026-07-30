@@ -1,5 +1,7 @@
 # agent-session-resume (delta)
 
+> **⚠️ 数据底座已切 PostgreSQL 单引擎（foundation-db S5，2026-07-24）**：本规格正文中涉及 SQLite（`database.py` 建表/单写事务/全局 `messages.id` 恰好单调等）的表述均为**制定期历史设计背景与反例语境**——底座现为 PostgreSQL 单引擎（无 SQLite、无降级、无双引擎兼容），建表与结构演进唯一走 Alembic 迁移 + ORM。凡出现「SQLite 当前落地路径 vs 未来 PostgreSQL」双真相源对照的条款，**目标真相源恒为 PostgreSQL**（SQLite 侧描述保留以说明为何选 PG 原生能力，如 conversation 行锁分配 `message_seq` 而非全局 `messages.id`），落地一律以 PG 单引擎为准。
+
 ## ADDED Requirements
 
 ### Requirement: per-(conversation, agent) CLI 会话复用与串行
