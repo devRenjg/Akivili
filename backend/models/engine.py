@@ -34,15 +34,29 @@ def _build_engine() -> AsyncEngine:
     db_url 恒为 postgresql+asyncpg://…（config 保证：AKIVILI_DB_URL 优先，否则默认 PG 串）。
     不再有 SQLite 分支/PRAGMA 监听。
 
-    连接池：生产默认用 SQLAlchemy 的连接池（单 uvicorn 事件循环，长驻复用）。
+    连接池（S5b 调优，参数全部来自 config，可环境变量覆盖，不硬编码）：生产用 SQLAlchemy
+    QueuePool，显式设 pool_size/max_overflow/pool_timeout/pool_recycle + pool_pre_ping——
+    pre_ping 借出前探活，扛 PG 重启/网络抖动/idle 断连；recycle 防 PG 侧 idle 超时踢连接。
+    容量按本平台单进程 MAX_CONCURRENCY 规模取值（默认 5+5），非照搬 Multica 的 MaxConns=25。
+
     **测试**（AKIVILI_TEST_NULLPOOL=1）用 NullPool——探针常在一进程内多次 asyncio.run()
     跨事件循环，asyncpg 的池连接是 loop 绑定的，跨 loop 复用会 "Event loop is closed"；
-    NullPool 每次现开现关，规避跨 loop 问题。对生产零影响（生产不设该变量）。
+    NullPool 每次现开现关，规避跨 loop 问题。NullPool 不接受 pool_size/overflow/timeout，
+    故此分支不传这些参数。对生产零影响（生产不设该变量）。
     """
-    url = load_settings().db_url
+    settings = load_settings()
+    url = settings.db_url
     if os.environ.get("AKIVILI_TEST_NULLPOOL") == "1":
         return create_async_engine(url, future=True, poolclass=NullPool)
-    return create_async_engine(url, future=True)
+    return create_async_engine(
+        url,
+        future=True,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        pool_timeout=settings.db_pool_timeout_sec,
+        pool_recycle=settings.db_pool_recycle_sec,
+        pool_pre_ping=settings.db_pool_pre_ping,
+    )
 
 
 def get_engine() -> AsyncEngine:
