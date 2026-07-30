@@ -2,14 +2,16 @@
 
 > 规划态。未打勾 = 未实现。规模目标 5×3×2 ≈ 30 并发任务。分阶段推进，每阶段落地前独立探针验证。
 
-## 阶段 0 — 过渡桥（低成本先做，不改架构）
-- [ ] 0.1 SQLite 开 `PRAGMA journal_mode=WAL` + `PRAGMA busy_timeout=5000`（连接建立时设）——消除迁移落地前的写锁真空期
+> **⚠️ 数据底座已切 PostgreSQL 单引擎（foundation-db S5，2026-07-24）**：原「阶段 0 SQLite WAL/busy_timeout 过渡桥」+「阶段 1 迁移 SQLite→Postgres」已被 S5 直接落地取代（底座现为 PG 单引擎，无 SQLite/降级/双引擎）。下列相关任务据此标注作废/已完成，落地以 PG 单引擎为准。
+
+## 阶段 0 — 并发治理基线（不改架构）
+- [x] 0.1 ~~SQLite 开 `PRAGMA journal_mode=WAL` + `PRAGMA busy_timeout`~~ **（S5 已下线 SQLite，本任务作废）**：并发写正确性由 PostgreSQL MVCC 服务端内建保证；连接池调优（pool_pre_ping/size/recycle）已在 S5b 落地
 - [ ] 0.2 `MAX_CONCURRENCY` 改为可配置（Paladin/环境变量），按机器资源调
 - [ ] 0.3 **同 slug 串行**（一致性优先）：`_claim_one` 跳过「该 agent_slug 已在 `_running`」的 run，同一 Agent 全局同一时刻只跑一个
 - [ ] 0.4 并发上限与机器资源（内存/句柄）挂钩并文档化（每 CLI 进程约 X MB → 上限 Z）
 
-## 阶段 1 — 数据层迁移 + 公平背压（近期）
-- [ ] 1.1 迁移 SQLite → **Postgres**：驱动切换、SQL 方言校正（`datetime('now')` 等）、迁移脚本、连接池
+## 阶段 1 — 公平背压（近期，基于 PG 单引擎）
+- [x] 1.1 ~~迁移 SQLite → **Postgres**~~ **（foundation-db S5 已完成：驱动 asyncpg/psycopg、SQL 方言收敛到 dialect.py、Alembic 迁移、真实数据 cutover + 逐行逐列一致性验证）**；连接池调优（S5b）亦已落地
 - [ ] 1.2 全量回归在 Postgres 上跑通（QA/reflect/orphan/concurrency/timeout/memory-hygiene）
 - [ ] 1.3 项目公平调度：`_claim_one` 改 round-robin 或「每项目并发上限 + 全局上限」双层配额，防单项目饿死其他
 - [ ] 1.4 资源准入背压：起新 CLI 进程前检查可用内存/负载，不足则排队

@@ -1,5 +1,7 @@
 # platform-graceful-restart (delta)
 
+> **⚠️ 数据底座已切 PostgreSQL 单引擎（foundation-db S5，2026-07-24）**：本规格正文中涉及 SQLite（WAL/busy_timeout/SQLite ALTER 能力限制/单写事务/全局自增 id 恰好单调等）的表述均为**制定期历史设计背景与反例语境**——底座现为 PostgreSQL 单引擎（无 SQLite、无降级、无双引擎兼容），建表与结构演进唯一走 Alembic 迁移 + ORM。凡出现「SQLite 当前落地路径 vs 未来 PostgreSQL」双真相源对照的条款，**目标真相源恒为 PostgreSQL**（SQLite 侧描述保留以说明为何选 PG 原生能力，如行锁分配 per-execution `event_seq`、`FOR UPDATE`、`execution_edges` 并集唯一约束），落地一律以 PG 单引擎为准。
+
 ## ADDED Requirements
 
 ### Requirement: durable execution 状态机与并发不变量
