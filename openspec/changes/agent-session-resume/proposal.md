@@ -1,3 +1,7 @@
+> **🛑 DEPRECATED / 已废弃（2026-07-24，用户拍板）**：本 change 与 [platform-graceful-restart]、[platform-concurrency-scaling] 同属 21 轮 Review 的「航母级」方案，整体过重，标记废弃。依据见 `Papers/Multica减法校准-restart-resume落地前置结论.md`。**后续以 Multica 生产实现为蓝本、从最小可行重拟**（新 change 待建）。本文件保留作历史参考，不再作为落地依据。
+>
+> **仍成立、可迁移的结论**：session resume 的核心价值（存 `session_id`+`--resume`、增量回灌省 token）成立；但需补三项 Multica 已验证护栏——`retired_session`（poison 会话显式剔除）、Codex rollout 在位校验、resume-unsafe 完整清单；`message_seq` 行锁水位是必需防线。
+
 ## Why
 
 现状：每次 Agent 执行（一次 @ 分派）都**独立建 CLI 会话**,靠把**整个 task 会话历史全量回灌**成一段大 prompt 喂给 CLI 来恢复上下文（`runner.py` + `build_cli_prompt`,`_clip_history` 双限裁剪）。三个真实痛点：
