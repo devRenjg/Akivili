@@ -1,3 +1,7 @@
+> **🛑 DEPRECATED / 已废弃（2026-07-24，用户拍板）**：本 change 与 [platform-graceful-restart]、[agent-session-resume] 共享 21 轮 Review 的统一 DAG 与「航母级」并发/恢复模型，整体过重，标记废弃。依据见 `Papers/Multica减法校准-restart-resume落地前置结论.md`。**后续以 Multica 生产实现为蓝本、从最小可行重拟**（新 change 待建）。本文件保留作历史参考，不再作为落地依据。
+>
+> **仍成立、可迁移的结论**：① 数据层写锁/WAL 风险已由 foundation-db S5（PG 单引擎）根治，本文相关表述作废；② 同 slug 全局串行、项目公平调度是真实需求，可在新方案里用更轻的机制实现；③ 原子 claim CAS 是多 worker 前置，保留。
+
 ## Why
 
 多项目、多 Agent 并行任务规模化后，当前「单机单进程 + SQLite(无 WAL) + 全局 3 槽池」架构会先炸。基于对代码的实地核查（详见 `Papers/多项目多Agent并发-技术保障与架构演进预案.md`），识别出 7 个真实风险，其中最致命的是 SQLite 写锁竞争、并发池无公平、以及**同一 Agent 跨项目并发写坏共享记忆文件**——后者会直接污染 knowhow 血缘、破坏 [agent-self-improvement-metrics] 度量层的地基。

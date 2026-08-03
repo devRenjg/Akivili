@@ -1,3 +1,9 @@
+> **🛑 DEPRECATED / 已废弃（2026-07-24，用户拍板）**：本 change 及其关联的 [agent-session-resume]、[platform-concurrency-scaling] 经 21 轮 Review 堆叠出的「航母级」方案（execution/attempt 一对多 + `execution_edges` 三类边表 + `recovery_budgets`/`recovery_operations`/`recovery_requests` 三张恢复表 + NULL conversation 三态迁移机 + 五重 attempt fencing）**过重、实现成本与本平台规模不成比例**，整体标记废弃。依据见 `Papers/Multica减法校准-restart-resume落地前置结论.md`——对标 Multica 生产实现，我们在 recovery 血缘 / generation 接管 / process_cleanup 上明显过度设计。
+>
+> **后续路线**：不在本方案上做增量，改为**以 Multica 生产实现为蓝本、从最小可行起步重新逐步拟定**（新 change 待建）。本文件与 design/tasks **保留作历史参考**——21 轮 Review 沉淀的边界情况分析（NULL conversation 迁移、late-commit 水位、跨键并集唯一等真实的坑）仍有价值，重拟方案时可回查，但**不再作为落地依据、不再推进**。
+>
+> **仍然成立、可迁移到新方案的结论**：① attempt 级 fencing 与 message_seq 行锁水位是必需防线（不能砍）；② Worker 剥离（进程隔离 + containment）应先行，是简化 fencing/recovery 的前提；③ 三项 Multica 已验证护栏（retired_session、Codex rollout 校验、resume-unsafe 完整清单）是真缺口，需补。
+
 ## Why
 
 当前后端是「单进程」架构：HTTP/SSE、业务路由、多 Agent 协同调度（`_loop` 并发池）、CLI 子进程,全部绑在同一个 Python 进程里。因此**每次改代码/优化都要重启整个进程**,而重启会：
