@@ -17,6 +17,11 @@ repo runs PG-only:
             backing INSERT ... ON CONFLICT DO NOTHING. The DB index makes the
             TOCTOU race impossible under real concurrency, so this is a hard
             "exactly 1" guarantee (was "at least 1 + warn" before 003).
+  GROUP 4 — N concurrent `collab._claim_one` over M queued runs: asserts each run
+            is claimed EXACTLY once (no double-execution) with no misses. Guards
+            _claim_one's FOR UPDATE SKIP LOCKED + status='queued' CAS (mirrors
+            Multica ClaimAgentTask) — the safety belt for "new+old worker briefly
+            coexist during graceful restart / future multi-worker".
 
 All concurrency runs on ONE event loop (single asyncio.run). Each get_connection()
 opens its own raw asyncpg connection => independent PG sessions => real
@@ -221,6 +226,85 @@ async def _group3_enqueue_dedup(probe: Probe) -> None:
         count == 1, f"run_queue rows={count} for {N} concurrent calls（期望 1）")
 
 
+async def _group4_claim_no_double(probe: Probe) -> None:
+    """GROUP 4 — N concurrent _claim_one over M queued runs => 每行恰好被领一次。
+
+    验证 _claim_one 的并发领取安全（FOR UPDATE SKIP LOCKED + CAS，对标 Multica
+    ClaimAgentTask）：多个并发领取者同时抢队列，绝不能把同一个 run 领两次（双执行），
+    也不能漏领（本可领的 run 没被领走）。
+
+    造 M 个不同 (task) 的 queued run（不同 task 规避 uq_run_queue_active 的同 task,agent
+    活跃唯一约束——我们要测的是「领取」并发，不是「入队」去重，后者已由 G3 覆盖）。
+    起 N=M+K 个并发 _claim_one：M 个应各领到一个不同 run，多出的 K 个应领到 None（队列空）。
+    断言：领到的 run_queue id 集合大小 == M（无重复）、且 == 全部入队 id（无遗漏）。
+    """
+    import collab  # noqa: PLC0415
+    from database import get_connection  # noqa: PLC0415
+
+    M = 8           # queued run 数
+    K = 4           # 多余的领取者（应领到 None）
+    agent_slug = "qa-backend-developer"
+
+    c = await get_connection()
+    try:
+        pid = (await c.execute(
+            "INSERT INTO projects(title, local_path, description) VALUES (?,?,?)",
+            ("__pgclaim_proj__", str(Path(tempfile.gettempdir()) / "pgclaim"),
+             "pg claim race probe"))).lastrowid
+        await c.commit()
+        qids: list[int] = []
+        for i in range(M):
+            tid = (await c.execute(
+                "INSERT INTO tasks(project_id, title, description) VALUES (?,?,?)",
+                (pid, f"__pgclaim_task_{i}__", "claim race probe"))).lastrowid
+            await c.commit()
+            # 直接插 run_queue（绕过 enqueue_run 的 mention/dedup 逻辑，隔离领取路径）
+            qid = (await c.execute(
+                "INSERT INTO run_queue(task_id, agent_slug, trigger, prompt, status) "
+                "VALUES (?,?,?,?,'queued')",
+                (tid, agent_slug, "assign", f"prompt {i}"))).lastrowid
+            await c.commit()
+            qids.append(qid)
+    finally:
+        await c.close()
+
+    # 领取前 run_queue 里已有的 queued 行（前序 group 可能遗留，如 G3 的 1 条）——
+    # 这些也会被 _claim_one 领走，纳入基线，断言才对「队列非空起点」鲁棒。
+    c = await get_connection()
+    try:
+        pre = (await (await c.execute(
+            "SELECT id FROM run_queue WHERE status='queued'")).fetchall())
+    finally:
+        await c.close()
+    pre_queued = {r[0] for r in pre}           # 含我造的 M 条 + 任何遗留
+    expected = pre_queued                       # 全部 queued 都应恰好被领一次
+    K_eff = (M + K) - len(expected)            # 扣除后真正「多余」的领取者数
+
+    async def claim() -> int | None:
+        item = await collab._claim_one()
+        return item["id"] if item else None
+
+    claimed = await asyncio.gather(*[claim() for _ in range(M + K)])
+    got = [x for x in claimed if x is not None]
+    got_set = set(got)
+
+    # 无重复：领到的 id 无重复（同一 run 未被领两次 = 无双执行）——CAS 的核心保证
+    probe.check(
+        "G4 并发 _claim_one 无重复领取（无双执行）",
+        len(got) == len(got_set),
+        f"claimed={sorted(got)}（{M + K} 个并发领取者，期望互不重复）")
+    # 我造的 M 条必须全部被领走（无遗漏）；并与运行前所有 queued 一致
+    probe.check(
+        "G4 并发 _claim_one 无遗漏（所有 queued 全部领走，含我造的 M 条）",
+        got_set == expected and set(qids) <= got_set,
+        f"got={sorted(got_set)} expected={sorted(expected)} mine={sorted(qids)}")
+    # 领到的总数 == 运行前 queued 总数；多余领取者领到 None（非报错/非重复）
+    probe.check(
+        "G4 领取数==队列非空起点数，多余领取者领到 None",
+        len(got) == len(expected),
+        f"non-None claims={len(got)}（期望={len(expected)}，多余 K_eff={K_eff} 应领到 None）")
+
+
 async def run_probe(paths: dict, keep: bool) -> Probe:
     probe = Probe()
     from db_migrate import run_migrations  # noqa: PLC0415
@@ -232,6 +316,7 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
     await _group1_diff_rows(probe)
     await _group2_same_row(probe)
     await _group3_enqueue_dedup(probe)
+    await _group4_claim_no_double(probe)
 
     return probe
 

@@ -826,6 +826,16 @@ async def _claim_one() -> dict | None:
     领取顺序：任务优先级（high>medium>其它）降序 → 同优先级按入队 id 升序（FIFO）。
     退避过滤：仅领取 next_retry_at 为空或已到点的行（失败重试的行在退避窗口内不被领取）。
     优先级取自 run_queue 所属 task 的 priority；LEFT JOIN 容错（task 理论上必存在）。
+
+    并发领取安全（对标 Multica ClaimAgentTask，agent.sql:519-546/980-990）——两层防护，
+    为「平滑重启时新旧 worker 短暂并存 / 未来多 worker」防双执行：
+      ① FOR UPDATE SKIP LOCKED（of=RunQueue）：选行即锁定 run_queue 那一行，别的领取者
+         撞到已锁的行直接跳过选下一行——零锁竞争，两个 worker 各领各的（of= 限定只锁
+         run_queue，不连带锁 outerjoin 的 Task）。
+      ② CAS：UPDATE 带 AND status='queued'，rowcount=0 视为「已被抢」返回 None（走与
+         「队列空」同一分支；两个调用方 _tick/_loop 均已处理 None）。①②同一事务内完成
+         （SELECT 的行锁攥到本块末尾 commit 才释放），SKIP LOCKED 方才生效。
+    单 worker（当前架构）下：永远选到未锁行、rowcount 恒为 1 → 零行为变化。
     """
     prio = case((Task.priority == "high", 0), (Task.priority == "medium", 1), else_=2)
     async with get_session_factory()() as session:
@@ -835,12 +845,20 @@ async def _claim_one() -> dict | None:
             .where(RunQueue.status == "queued",
                    (RunQueue.next_retry_at.is_(None)) | (RunQueue.next_retry_at <= now_expr()))
             .order_by(prio.asc(), RunQueue.id.asc())
-            .limit(1))).scalar_one_or_none()
+            .limit(1)
+            .with_for_update(of=RunQueue, skip_locked=True))).scalar_one_or_none()
         if not rq:
             return None
         item = {c: getattr(rq, c) for c in _RQ_COLS}
-        await session.execute(
-            sa_update(RunQueue).where(RunQueue.id == item["id"]).values(status="running"))
+        res = await session.execute(
+            sa_update(RunQueue)
+            .where(RunQueue.id == item["id"], RunQueue.status == "queued")
+            .values(status="running"))
+        if res.rowcount == 0:
+            # CAS 落空：SELECT 与 UPDATE 之间该行已被他方领走（正常应被 ① 挡住，此为②冗余兜底）。
+            # 视为「没领到」，与队列空同路径返回 None。
+            await session.rollback()
+            return None
         await session.commit()
     if item is not None:
         await log_run_event("claimed", run_queue_id=item["id"], task_id=item["task_id"],
