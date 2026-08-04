@@ -2,14 +2,21 @@
 
 ## ADDED Requirements
 
-### Requirement: 执行层与 API 层进程分离
+### Requirement: 执行层与 API 层进程分离（队列路径）
 
-系统 SHALL 把 Agent 执行层（run 领取、并发池、CLI 子进程管理、收尾）运行在**独立于 API 进程的 worker 进程**中。API 进程 SHALL 只负责 HTTP/SSE、业务路由与入队（写 `run_queue`），SHALL NOT 在自身进程内运行执行循环。二者 SHALL 能各自独立重启。
+系统 SHALL 把**队列路径**的 Agent 执行层（run 领取、并发池、CLI 子进程管理、收尾）运行在**独立于 API 进程的 worker 进程**中。API 进程 SHALL 只负责 HTTP/SSE、业务路由与入队（写 `run_queue`），SHALL NOT 在自身进程内运行**队列执行循环**（`_loop`）。二者 SHALL 能各自独立重启。
 
-#### Scenario: API 重启不打断在跑执行
+> **做法 A 边界**：`routes/runs.py` 的 SSE 直连对话路径（HTTP 请求协程内直接 `execute_dispatch` 起 CLI）**本 change 不迁移**，仍驻留 API 进程。因此「重启 API 不打断执行」的保证**仅覆盖队列路径**；直连对话正在进行的那一次仍会被 API 重启打断。直连路径的迁移（做法 B：入队 + SSE 从 `run_logs` 回放）归后续独立 change。
 
-- **WHEN** worker 进程正在执行一个 run，此时 API 进程被重启
+#### Scenario: API 重启不打断在跑的队列路径执行
+
+- **WHEN** worker 进程正在执行一个**队列路径**的 run，此时 API 进程被重启
 - **THEN** worker 进程不受影响，该 run 继续执行至收尾，其结果正常落库；API 重启完成后可查询到该 run 的最终状态
+
+#### Scenario: 直连对话路径不在本 change 的保证范围内（做法 A 已知边界）
+
+- **WHEN** 用户经 SSE 直连对话触发的 CLI 执行正在进行，此时 API 进程被重启
+- **THEN** 该次直连执行会被打断（本 change 不保证其存续）——这是做法 A 的有意折中，直连路径的存续保证归后续做法 B change
 
 #### Scenario: worker 独立领取
 
