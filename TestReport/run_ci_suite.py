@@ -30,7 +30,8 @@ except Exception:
 HERE = Path(__file__).resolve().parent
 BACKEND = HERE.parent / "backend"
 
-# —— 门禁清单：39 项（38 隔离 probe + QA 主套件）。注释标注覆盖域，与 TestReport/README.md 对齐。——
+# —— 门禁清单：40 项（39 隔离 probe + QA 主套件）。注释标注覆盖域，与 TestReport/README.md 对齐。——
+# worker-split-minimal 组1：+run_kill_signal_probe（跨进程 kill 信号 D 类）。39→40。
 # S5 全仓零 sqlite：退役 run_wal_concurrency_probe（WAL 语义随 sqlite 消亡）→ 补 run_pg_concurrency_probe；
 #                    退役 run_orm_engine_probe（测 PRAGMA/busy_timeout，PG 无对应物）。净 40→39。
 # 排除（真实 CLI，非隔离桩）：run_collab_scenario.py / run_codex_cli_smoke.py
@@ -61,8 +62,9 @@ GATE = [
     "run_scheduling_probe.py",            # 调度/优先级/退避
     "run_scheduling_events_probe.py",     # run_events 调度流水
     "run_rate_limit_probe.py",            # 限流/429 归因
-    "run_orphan_reclaim_probe.py",        # 启动孤儿回收
+    "run_orphan_reclaim_probe.py",        # 启动孤儿回收（含 scope=queue 路径切分）
     "run_orphan_leak_probe.py",           # 孤儿泄漏兜底
+    "run_kill_signal_probe.py",           # worker-split 组1：跨进程 kill 信号（D 类）
     "run_reactivate_probe.py",            # 重派状态流转
     "run_task_gates_probe.py",            # 任务状态闸
     "run_subtask_autocomplete_probe.py",  # 子任务全完成→父推进

@@ -691,6 +691,20 @@ async def _run_one(item: dict) -> None:
                 produced_since_wall = True   # 收到事件 = 活着且在产出
                 if ev.type == "system" and ev.meta.get("run_id"):
                     run_id_box["id"] = ev.meta["run_id"]
+                    # 🔴 立即回填 run_queue.task_run_id（execute_dispatch 的首个 system 事件即带
+                    # run_id，此刻执行刚开始）。必须在此刻建两表关联，而非等 _run_one 末尾——否则
+                    # worker 执行中途被杀（正是平滑重启的核心场景），run_queue.task_run_id 仍为 NULL，
+                    # worker 重启的 reclaim(scope="queue") 靠 task_run_id 认队列路径孤儿，会漏掉这条
+                    # task_runs，使其残留假 running 直到 30 分钟 idle sweep 才清（详情页右侧持续显示
+                    # 执行中）。提前回填根治该窗口。末尾（run 收尾处）的回填保留为幂等双保险。
+                    try:
+                        async with get_session_factory()() as _s:
+                            await _s.execute(
+                                sa_update(RunQueue).where(RunQueue.id == item.get("id"))
+                                .values(task_run_id=ev.meta["run_id"]))
+                            await _s.commit()
+                    except Exception:  # noqa: BLE001 — 回填失败不阻断执行；末尾回填兜底
+                        pass
                 elif ev.type == "text":
                     collected.append(ev.text)
                 elif ev.type == "error":
@@ -736,6 +750,8 @@ async def _run_one(item: dict) -> None:
     rid = run_id_box.get("id")
     # P1-1 可观测性：把本队列项实际产生的 task_run.id 回填到 run_queue，打通两表关联
     # （此前两表无关联列，排查只能靠 task+slug+时间就近猜配对——task82 事故根因之一）。
+    # 注：正常路径下这条关联已在 _drive 收到首个 system 事件时提前建立（见上方 run_id_box 回填），
+    # 此处为幂等双保险——覆盖「首事件回填失败」等极端情形（值相同，重复写无害）。
     if rid:
         async with get_session_factory()() as session:
             await session.execute(
@@ -970,7 +986,7 @@ async def _loop():
         await asyncio.sleep(1.0)             # 队列空或池满：轮询间隔
 
 
-async def reclaim_orphan_runs() -> int:
+async def reclaim_orphan_runs(scope: str = "all") -> int:
     """启动时回收孤儿 running —— 两层都要清：run_queue 与 task_runs。
 
     执行状态由本进程内存态（run_queue 靠 _running 集合 + _process_one 协程；task_runs 靠
@@ -981,17 +997,31 @@ async def reclaim_orphan_runs() -> int:
     两层数据源不同、必须一起回收，否则一层清了另一层仍露馅（曾只清 run_queue，task_runs 残留
     导致详情页右侧持续显示执行中）。
 
-    只在 start_loop 之前调用（此刻 _running / _RUN_PIDS 必为空、_loop 尚未领新活），故所有
-    running 皆为无主孤儿。run_queue 落 failed；task_runs 落 killed（被中断，非正常失败）。"""
+    只在 start_loop 之前调用（此刻本进程 _running / _RUN_PIDS 必为空、_loop 尚未领新活），故本
+    进程负责路径下的 running 皆为无主孤儿。run_queue 落 failed；task_runs 落 killed（被中断）。
+
+    **scope（worker-split-minimal 组 1 按路径切分）**：拆进程后「所有 running=孤儿」的旧假设
+    失效——worker 重启不能误杀 API 进程直连路径正在跑的 run，反之亦然。故按路径限定回收范围：
+      - "queue"（worker 启动用）：只清**队列路径**孤儿。run_queue 层天然全是队列路径，全清；
+        task_runs 层只清「有 run_queue 行指向的」（task_run_id 被 run_queue 引用）。API 死掉的
+        直连路径孤儿（无 run_queue 行）**不碰**，交给周期 sweep（idle-based，不误杀在产出的）兜底。
+      - "all"（默认，向后兼容单进程/全新启动）：两层全清，行为与拆分前完全一致。
+    """
     from executor import runner  # noqa: PLC0415
     affected_tasks: set[int] = set()
+    # 队列路径的 task_runs 子集：被某条 run_queue 行引用的 task_run_id。
+    queue_backed = (select(RunQueue.task_run_id)
+                    .where(RunQueue.task_run_id.is_not(None)))
     async with get_session_factory()() as session:
-        # 1) run_queue 层
+        # 1) run_queue 层（两种 scope 都全清——run_queue 本就只承载队列路径）
         q_rows = (await session.execute(
             select(RunQueue.id, RunQueue.task_id).where(RunQueue.status == "running"))).all()
-        # 2) task_runs 层
+        # 2) task_runs 层：scope="queue" 只取队列路径子集；"all" 取全部
+        tr_where = [TaskRun.status == "running"]
+        if scope == "queue":
+            tr_where.append(TaskRun.id.in_(queue_backed))
         r_rows = (await session.execute(
-            select(TaskRun.id, TaskRun.task_id).where(TaskRun.status == "running"))).all()
+            select(TaskRun.id, TaskRun.task_id).where(*tr_where))).all()
         if not q_rows and not r_rows:
             return 0
         if q_rows:
@@ -1002,13 +1032,18 @@ async def reclaim_orphan_runs() -> int:
             #  - 任务已 done/reviewing → 这条 run 正是任务成功的产出，落 succeeded（否则会把
             #    已完成任务的成果 run 误标 killed，污染卡片「执行完成」显示与 solved_tasks 计数）；
             #  - 任务未收尾 → 确是被中断的孤儿，落 killed。
+            # scope="queue" 时两条 UPDATE 都叠加「仅队列路径」过滤，绝不碰直连路径的 running。
             done_tasks = select(Task.id).where(Task.status.in_(("done", "reviewing")))
+            succ_where = [TaskRun.status == "running", TaskRun.task_id.in_(done_tasks)]
+            kill_where = [TaskRun.status == "running"]
+            if scope == "queue":
+                succ_where.append(TaskRun.id.in_(queue_backed))
+                kill_where.append(TaskRun.id.in_(queue_backed))
             await session.execute(
-                sa_update(TaskRun)
-                .where(TaskRun.status == "running", TaskRun.task_id.in_(done_tasks))
+                sa_update(TaskRun).where(*succ_where)
                 .values(status="succeeded", ended_at=now_expr()))
             await session.execute(
-                sa_update(TaskRun).where(TaskRun.status == "running")
+                sa_update(TaskRun).where(*kill_where)
                 .values(status="killed", ended_at=now_expr()))
         await session.commit()
         for row in q_rows:
@@ -1117,7 +1152,55 @@ async def sweep_orphan_task_runs(idle_sec: int | None = None) -> int:
     return len([r for r in orphans])
 
 
+# 跨进程 kill 信号轮询间隔（秒）。远短于孤儿巡检（那是分钟级兜底），因为它服务「用户点终止」
+# 的实时诉求——用户点了「终止运行」，worker 要尽快在其进程内杀掉 CLI 子进程。
+KILL_SIGNAL_POLL_SEC = 2
+
+
+async def consume_kill_signals() -> int:
+    """worker 侧消费 API 落的跨进程 kill 信号（worker-split-minimal 组 1 · D 类）。
+
+    API 的 /runs/kill 对「不在本 API 进程 _RUN_PIDS 里」的 run（即队列路径、跑在本 worker 进程）
+    落 task_runs.kill_requested_at 信号。本函数扫这些信号，只处理「**本 worker 进程 _RUN_PIDS 里
+    确有此 run**」的——在本进程 kill_run（杀 CLI 进程树）+ finalize_run 落 killed 终态。
+
+    只认本进程 _RUN_PIDS 的原因：kill 必须发生在**持有该 CLI 子进程的那个进程**里（taskkill /T
+    杀的是本进程派生的进程树）。不在本进程 _RUN_PIDS 的信号本函数不动——留给信号真正的宿主进程
+    处理；若该 run 其实已结束（无宿主），其 task_runs 已是终态，finalize 幂等不覆盖，信号自然失效。
+    清信号：处理后把 kill_requested_at 置回 NULL，避免重复消费。返回本轮实际 kill 的条数。"""
+    from executor import runner  # noqa: PLC0415
+    # 扫所有带 kill 信号的行（含已终态的——它们可能是自然收尾/被别处处理后遗留的陈旧信号，一并清）。
+    async with get_session_factory()() as session:
+        rows = (await session.execute(
+            select(TaskRun.id, TaskRun.status).where(
+                TaskRun.kill_requested_at.is_not(None)))).all()
+    if not rows:
+        return 0
+    killed = 0
+    for rid, status in rows:
+        # 只对「仍 running 且本进程持有」的 run 执行 kill——kill 必须发生在持有该 CLI 子进程的进程里
+        # （taskkill /T 杀本进程派生的进程树）。_RUN_PIDS 是进程内状态，跨进程天然隔离。
+        if status == "running" and rid in runner._RUN_PIDS:
+            try:
+                runner.kill_run(rid)                       # 杀本进程 CLI 进程树
+                await runner.finalize_run(rid, "killed")   # 落终态（幂等）
+                killed += 1
+            except Exception:  # noqa: BLE001 — 单条失败不阻断整轮
+                pass
+    # 清信号，避免重复消费：清「已终态的」（含本轮刚 kill 的 + 自然收尾遗留陈旧信号）。
+    # 仍 running 且非本进程持有的行**保留信号**——留给其真正的宿主进程消费（多 worker/重启重叠期）。
+    clear_ids = [rid for rid, _ in rows]
+    async with get_session_factory()() as session:
+        await session.execute(
+            sa_update(TaskRun)
+            .where(TaskRun.id.in_(clear_ids), TaskRun.status != "running")
+            .values(kill_requested_at=None))
+        await session.commit()
+    return killed
+
+
 _sweep_started = False
+_kill_signal_started = False
 
 
 async def _orphan_sweep_loop():
@@ -1132,9 +1215,23 @@ async def _orphan_sweep_loop():
             print(f"[collab] 孤儿巡检异常（不影响循环）：{type(e).__name__}: {e}", flush=True)
 
 
+async def _kill_signal_loop():
+    """跨进程 kill 信号消费循环（worker-split-minimal 组 1 · D 类）。间隔 KILL_SIGNAL_POLL_SEC
+    （秒级，服务用户点「终止」的实时性）；单轮异常不终止循环。仅在 worker 进程有效——只有它持有
+    队列路径的 CLI 子进程 _RUN_PIDS。"""
+    while True:
+        await asyncio.sleep(KILL_SIGNAL_POLL_SEC)
+        try:
+            n = await consume_kill_signals()
+            if n:
+                print(f"[collab] 跨进程 kill 信号：本进程终止 {n} 个 run", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[collab] kill 信号消费异常（不影响循环）：{type(e).__name__}: {e}", flush=True)
+
+
 def start_loop():
     """FastAPI 启动时调用，拉起后台协同循环（幂等）。"""
-    global _loop_started, _sweep_started
+    global _loop_started, _sweep_started, _kill_signal_started
     if _loop_started:
         return
     _loop_started = True
@@ -1145,5 +1242,8 @@ def start_loop():
     if not _sweep_started:
         _sweep_started = True
         asyncio.create_task(_orphan_sweep_loop())   # 运行期孤儿巡检（不必等重启回收）
+    if not _kill_signal_started:
+        _kill_signal_started = True
+        asyncio.create_task(_kill_signal_loop())    # 跨进程 kill 信号消费（组 1 · D 类）
 
 

@@ -259,6 +259,37 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
                 row and row["status"] == "failed" and row["attempts"] == 1,
                 f"status={row['status']} attempts={row['attempts']}（期望 failed/1）")
 
+    # ---- Test F: task_run_id 在执行「开始」即回填（worker-split 组1 · BUG C 修复守卫）----
+    # 修复前 run_queue.task_run_id 只在 _run_one 末尾回填；worker 执行中途被杀（平滑重启核心场景），
+    # 该字段仍 NULL → reclaim(scope="queue") 靠它认队列孤儿会漏掉，task_runs 残留假 running。
+    # 修复后：收到 execute_dispatch 首个 system 事件即回填。本测试在执行**进行中**（首事件已产出、
+    # run 尚未结束）断言 task_run_id 已非空——证明关联在执行开始时即建立，而非等收尾。
+    hold = asyncio.Event()
+    seen_system = asyncio.Event()
+
+    async def midflight_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
+        run_seq["n"] += 1
+        yield ExecEvent("system", "", {"run_id": run_seq["n"]})  # 首事件带 run_id → 触发提前回填
+        seen_system.set()          # 通知主测：首事件已产出
+        await hold.wait()          # 卡在执行中（未收尾），让主测在此刻检查 DB
+        yield ExecEvent("text", "done", {})   # 释放后正常收尾
+
+    runner.execute_dispatch = midflight_dispatch
+    t_mid = await make_task(pid, "__midflight_backfill__", "none")
+    q_mid = await collab.enqueue_run(t_mid, "qa-tester", "", "assign", is_leader=False)
+    it = await collab._claim_one()
+    collab._running.add(it["id"])
+    proc_task = asyncio.create_task(collab._process_one(it))
+    await asyncio.wait_for(seen_system.wait(), timeout=10)  # 等首个 system 事件产出
+    await asyncio.sleep(0.1)   # 让提前回填的 UPDATE 落库
+    mid_row = await _rq_row(q_mid)
+    backfilled_midflight = mid_row and mid_row["task_run_id"] is not None
+    probe.check("执行进行中 task_run_id 已回填（BUG C：关联在执行开始即建立，非等收尾）",
+                backfilled_midflight,
+                f"task_run_id={mid_row and mid_row['task_run_id']}（进行中即应非空）")
+    hold.set()                 # 释放，让 run 正常收尾
+    await asyncio.wait_for(proc_task, timeout=10)
+
     return probe
 
 

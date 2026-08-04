@@ -105,7 +105,8 @@ async def dispatch(task_id: int, req: DispatchRequest, request: Request,
             task_id, task["project_id"], req.prompt, primary_slug, leader_slug)
     except Exception:  # noqa: BLE001
         pass  # @ 解析失败不阻断主受理人执行
-    collab.start_loop()  # 确保协同后台循环在跑，能领取上面入队的成员 run（幂等）
+    # worker-split-minimal 组 1：入队即可，队列由独立 worker 进程的 _loop 领取执行。
+    # API 进程不再 start_loop（执行面已剥离到 worker.py）——上面 @ 入队的成员 run 由 worker 领。
 
     async def event_stream():
         # 显式持有底层生成器：客户端断连时 aclose() 它，触发 execute_dispatch 的中断兜底
@@ -244,8 +245,31 @@ class KillRequest(BaseModel):
 
 @router.post("/runs/kill", dependencies=[Depends(require_admin)])
 async def kill(req: KillRequest):
-    ok = runner.kill_run(req.run_id)
-    return {"ok": ok}
+    """终止一个 run。worker-split-minimal 组 1 · D 类跨进程 kill：
+
+    执行面剥离后，run 的 CLI 子进程可能在两个不同进程名下：
+      - **直连路径**（做法 A，仍在本 API 进程）：run_id 在本进程 runner._RUN_PIDS 里 →
+        kill_run 直接杀，立即生效。
+      - **队列路径**（在独立 worker 进程）：本进程 _RUN_PIDS 无此 run，kill_run 返回 False →
+        落 DB 信号 task_runs.kill_requested_at（对标 Multica「状态即信号」），worker 周期 sweep
+        扫到后在其进程内 kill_run + finalize。前端收到 accepted=True 表示信号已投递（异步生效）。
+    """
+    # ① 先试本进程（直连路径的 run 能立即杀）
+    killed_local = runner.kill_run(req.run_id)
+    if killed_local:
+        return {"ok": True, "mode": "local"}
+    # ② 本进程没有 → 落 DB 信号，交给 worker 进程消费（队列路径）。
+    #    仅对仍 running 的 run 落信号；已终态的 run 无需 kill（幂等、避免给历史 run 打标记）。
+    async with get_session_factory()() as session:
+        res = await session.execute(
+            sa_update(TaskRun)
+            .where(TaskRun.id == req.run_id, TaskRun.status == "running")
+            .values(kill_requested_at=now_expr()))
+        await session.commit()
+    signaled = res.rowcount > 0
+    # ok=True 表示「已受理」：本进程直杀成功，或已给在跑的 run 投递跨进程 kill 信号。
+    # signaled=False（且非本地杀）通常是 run 已不在 running（早已结束）——对前端等价于「已终止」。
+    return {"ok": True, "mode": "signal" if signaled else "noop", "signaled": signaled}
 
 
 @router.get("/tasks/{task_id}/messages")

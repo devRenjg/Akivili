@@ -259,6 +259,11 @@ class TaskRun(Base):
     started_at: Mapped[str] = mapped_column(Text, nullable=True, server_default=_NOW)
     ended_at: Mapped[str | None] = mapped_column(Text, nullable=True)
     fail_reason: Mapped[str] = mapped_column(Text, nullable=True, server_default=text("''"))
+    # worker-split-minimal 组 1 · D 类跨进程 kill 信号（对标 Multica「状态即信号」）。
+    # kill 请求从 API 进程进来，但队列路径的 CLI 子进程在 worker 进程名下、API 的 _RUN_PIDS 是空的，
+    # 无法直接 kill。故 API 收到 kill 落此信号列（now_expr() 时间戳），worker 周期 sweep 扫到
+    # kill_requested_at IS NOT NULL 且本进程 _RUN_PIDS 有此 run → kill_run + finalize。NULL=无请求。
+    kill_requested_at: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class RunLog(Base):

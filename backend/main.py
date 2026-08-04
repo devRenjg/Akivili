@@ -30,7 +30,6 @@ import agents as agents_mod
 import memory as memory_mod
 import skills as skills_mod
 import auth as auth_mod
-import collab as collab_mod
 
 app = FastAPI(title="Akivili", version="0.4.0")
 
@@ -99,8 +98,12 @@ async def _startup():
         await agents_mod.rescan()
     if await skills_mod.count_skills() == 0:
         await skills_mod.rescan()
-    await collab_mod.reclaim_orphan_runs()  # 回收重启前遗留的孤儿 running（消除「假执行中」）
-    collab_mod.start_loop()   # 启动多 Agent 协同后台循环
+    # worker-split-minimal 组 1：执行面（队列 _loop + 孤儿回收/巡检 + CLI 子进程）已剥离到
+    # 独立 worker 进程（backend/worker.py）。API 进程只负责 HTTP/SSE + 入队 + 查询，**不再**
+    # reclaim / start_loop——否则会与 worker 争抢领取、且 API 重启会误杀 worker 在跑的队列 run。
+    # 队列路径孤儿回收在 worker 启动做（scope="queue"）；直连路径（做法 A，仍在本进程）的孤儿
+    # 由 worker 的周期 sweep（idle-based）兜底。启动顺序：API 与 worker 各自独立起，谁先起都行
+    # （run_migrations 有 pg advisory lock 串行化，见 db_migrate）。
 
 
 @app.get("/api/health")

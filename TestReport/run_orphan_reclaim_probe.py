@@ -168,7 +168,72 @@ async def run(paths: dict) -> Probe:
     n2 = await collab.reclaim_orphan_runs()
     p.check("idempotent: second call reclaims nothing", n2 == 0, f"returned={n2}")
 
+    # —— worker-split-minimal 组 1：scope="queue" 按路径切分回收 ——
+    await _run_scope_split(paths, p)
+
     return p
+
+
+async def _seed_scope(paths: dict) -> dict:
+    """为 scope 切分造两类 running 孤儿（同一新任务下）：
+      队列路径：run_queue 行 #Q(running) + 其 task_run #TQ(running)，且 run_queue.task_run_id=TQ
+      直连路径：task_run #TD(running)，**无任何 run_queue 行指向它**（模拟 API 侧 SSE 直连）
+    scope="queue" 应只清 Q/TQ，绝不碰 TD（那是 API 进程的活，误清=误杀）。
+    """
+    from database import get_connection  # noqa: PLC0415
+    db = await get_connection()
+    try:
+        cur = await db.execute(
+            "INSERT INTO projects (title, local_path, description) VALUES (?,?,?)",
+            ("__scope_probe_project__", str(paths["project"]), "scope split probe"))
+        pid = cur.lastrowid
+        cur = await db.execute(
+            "INSERT INTO tasks (title, status, project_id) VALUES (?,?,?)",
+            ("__scope_task__", "in_progress", pid))
+        tid = cur.lastrowid
+        # 直连路径 task_run（先建，拿到 id 供对照）
+        cur = await db.execute(
+            "INSERT INTO task_runs (task_id, agent_slug, status) VALUES (?,?,?)",
+            (tid, "direct-agent", "running"))
+        td = cur.lastrowid
+        # 队列路径 task_run
+        cur = await db.execute(
+            "INSERT INTO task_runs (task_id, agent_slug, status) VALUES (?,?,?)",
+            (tid, "queue-agent", "running"))
+        tq = cur.lastrowid
+        # 队列路径 run_queue 行，task_run_id 指向 TQ（这就是「队列路径」的 DB 标记）
+        cur = await db.execute(
+            "INSERT INTO run_queue (task_id, agent_slug, trigger, is_leader, prompt, status, task_run_id) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (tid, "queue-agent", "collaborate", 0, "", "running", tq))
+        q = cur.lastrowid
+        await db.commit()
+        return {"tid": tid, "q": q, "tq": tq, "td": td}
+    finally:
+        await db.close()
+
+
+async def _run_scope_split(paths: dict, p: "Probe") -> None:
+    import collab  # noqa: PLC0415
+    s = await _seed_scope(paths)
+
+    n = await collab.reclaim_orphan_runs(scope="queue")
+    q_after = await _statuses({"Q": s["q"]}, "run_queue")
+    tr_after = await _statuses({"TQ": s["tq"], "TD": s["td"]}, "task_runs")
+
+    # 队列路径：run_queue #Q → failed，task_run #TQ → killed（任务未收尾）
+    p.check("scope=queue: 队列路径 run_queue Q → failed",
+            q_after["Q"] == "failed", f"Q={q_after['Q']}")
+    p.check("scope=queue: 队列路径 task_run TQ → killed",
+            tr_after["TQ"] == "killed", f"TQ={tr_after['TQ']}")
+    # 直连路径：task_run #TD 必须**原样 running**，未被误清（这是切分的核心保证）
+    p.check("scope=queue: 直连路径 task_run TD 保持 running（未误杀 API 进程的 run）",
+            tr_after["TD"] == "running", f"TD={tr_after['TD']}")
+    # 对照：scope="all" 才会把直连 TD 也清掉（证明差异确实由 scope 造成，而非 TD 本就漏清）
+    await collab.reclaim_orphan_runs(scope="all")
+    td_all = (await _statuses({"TD": s["td"]}, "task_runs"))["TD"]
+    p.check("对照 scope=all: 直连路径 TD 这次被清（killed，证明切分生效非漏清）",
+            td_all == "killed", f"TD_after_all={td_all}")
 
 
 async def amain() -> int:
