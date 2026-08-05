@@ -46,6 +46,23 @@
 - [x] 4.1 全量 QA 门禁跑通（剥离后执行链路不回归）：门禁 39→40 项、40/40、601 断言、0 失败（含新增 kill_signal 探针 + orphan scope 切分 + scheduling Test F）。
 - [x] 4.2 单实例重启纪律核对（组1 已实测）：API（56752）与 worker（28632）各自单实例、非 reload；重启杀净对应进程、无 orphan reload worker。**待补记忆**：`backend-restart-single-instance` 需从「单进程」更新为「双进程」（API + worker 各杀各起）。
 
+## 5 — 做法 B：SSE 直连路径也剥离（彻底零打断）⏸️ DEFERRED（2026-07-24 决策）
+> **对应场景**：任务详情页对话框里，用户手动输入、@ 第一个成员、点发送、看其**实时流式回复**的那一次
+> （`POST /tasks/{task_id}/dispatch` → `event_stream` 在 API 进程内直接 `execute_dispatch` 起 CLI）。
+> 其余被 @ 的成员 + 所有后台协同 Agent 已走队列路径、由 worker 执行（组1 已保护）。
+>
+> **为何 defer**：做法 B 要把这条直连路径也改为「入队 → worker 执行 → SSE 从 run_logs 回放」，实现
+> 「重启 API 连这次实时对话都不断」。但该场景是**人机实时交互**——用户必须在场盯着屏幕看流式输出，
+> 而重启服务通常是用户自己的动作，撞上「正盯着直连对话」的概率很低；且组1 已保护了「数量最多、跑最久、
+> 用户不盯着的后台协同 Agent」。做法 B 的收益（保护这一小段在场交互）远低于其复杂度（SSE 从 DB 回放、
+> 写放大、回放游标、实时性从毫秒直连退化到秒级轮询）。相比之下 **Session Resume（被打断的长任务能续跑）
+> 业务价值大得多**。故做法 B 先 defer。
+>
+> **触发再做的条件**：① 出现「用户在场直连对话被重启打断」的实际痛点反馈；② 或需要「API 彻底无执行、
+> 可无脑滚动重启」的运维诉求。届时按 proposal 里做法 B 的设计（入队 + run_logs 回放）落地。
+- [ ] 5.1 （deferred）`/tasks/{id}/dispatch` 直连路径改为入队，不在 API 进程起 CLI。
+- [ ] 5.2 （deferred）SSE `event_stream` 改为从 `run_logs` 回放执行事件（游标推进），而非直连 execute_dispatch 生成器。
+
 ## 设计原则（贯穿全 change）
 - **状态经 DB 交接优先**：搬迁/新增代码时，run 生命周期状态优先落 `run_queue`/`task_runs`，减少对进程内共享内存（`_running` 集合）的跨进程依赖。`_RUN_PIDS`（pid+创建时间双因子防误杀）为 worker 进程内 kill 机制、天然进程内，本版保持不动。
-- **做法 A 是阶段终点，非最终态**：SSE 直连路径留在 API 是有意的折中（对标 Multica 单实例、避免滑向 WS+Stream relay 航母）；「彻底零打断」的做法 B 归后续独立 change。
+- **做法 A 是阶段终点，非最终态**：SSE 直连路径留在 API 是有意的折中（对标 Multica 单实例、避免滑向 WS+Stream relay 航母）；「彻底零打断」的做法 B（组 5）已 **DEFERRED**——原始目标平滑重启已由组 0+1+2 达成，做法 B 收益低于复杂度，让位给 Session Resume。
