@@ -96,6 +96,14 @@ class ClaudeCodeBackend(ExecutorBackend):
                 return
             if on_pid:
                 loop.call_soon_threadsafe(on_pid, proc.pid)
+            # 组 2 containment：把 CLI 子进程加入 worker 的 Job Object，worker 死则 OS 连带清理。
+            # Job 未就绪（API 进程内的直连路径 / 初始化失败）时 contain 返回 False、静默降级，
+            # 该进程仍由 kill_run 的 taskkill /T 兜底，功能不回退。
+            try:
+                from executor.containment import contain  # noqa: PLC0415
+                contain(proc.pid)
+            except Exception:  # noqa: BLE001 — containment 是增强，绝不阻断执行
+                pass
             # prompt 通过 stdin 传入（避免超长 prompt 作为 Windows 命令行参数被截断）
             try:
                 proc.stdin.write(cli_prompt)
