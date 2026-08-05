@@ -24,9 +24,23 @@
 - [x] 2.1 新增 `executor/containment.py`（纯 ctypes，不引 pywin32）：worker 启动 `init_containment()` 建 Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）；两处 CLI 起进程点（claude_code.py/codex.py）起进程后 `contain(pid)` 加入 Job。worker 死（含强杀/崩溃）→ 最后一个 Job 句柄关闭 → OS 连带终止全部 CLI 子进程。Job 未就绪（API 直连路径/初始化失败）静默降级、退回 kill_run 兜底，功能不回退。POSIX 走进程组（接口占位）。
 - [x] 2.2 探针 `run_containment_probe`：强杀迷你 worker（taskkill /F，**不带 /T**，验证 OS 靠 Job 自动清而非递归杀树）后，其 contain 的 sleeper 子进程在约定时间内退出。3/3 通过。
 
-## 3 — 重启整批 orphan 判死（对标 Multica RecoverOrphanedTasksForRuntime）
-- [ ] 3.1 worker 启动时，把非本代遗留的在跑 run（`run_queue.status='running'` 且非本代）整批判死重投——一条 UPDATE 标终态 + 重入队（不逐个精细接管、不做 generation 交棒）。**沿用现有 `reclaim_orphan_runs`（collab.py:955）的两层清理（run_queue + task_runs）语义**，迁移到 worker 启动路径。
-- [ ] 3.2 探针 `orphan_batch_recovery_probe`：模拟上一代 worker 残留在跑 run，新 worker 启动后整批判死、任务可被重新领取，无双执行。
+## 3 — runtime_id 代际 orphan 回收（对标 Multica RecoverOrphanedTasksForRuntime）⏸️ DEFERRED（2026-07-24 决策）
+> **为何 defer**：组 3 的核心价值是**解锁多 worker**（每个 worker 一个 `runtime_id`，reclaim 只回收
+> 「上一代我的 runtime_id」的在途 run，避免多 worker 互相误杀 —— 对标 Multica `WHERE runtime_id=$1`）。
+> 但多 worker 的收益（执行吞吐水平扩展 / 执行层高可用 / 滚动升级）**在当前单 worker + 单机场景下
+> 兑现不了**，且本平台执行瓶颈通常在**大模型 provider 额度/限流**（见任务273 的 403 预算耗尽），
+> 而非本地算力——多 worker 解决不了额度瓶颈。组 1 的「按路径切分 reclaim（scope=queue）」对**单
+> worker 已完全够用**（防住了唯一真实风险：worker 误杀 API 直连 run）。故组 3 = 纯为未来投资，先 defer。
+>
+> **触发再做的条件**（满足其一）：① 出现「单 worker MAX_CONCURRENCY=3 并发不够、队列长期堆积」且瓶颈
+> 确在本地算力（非大模型额度）；② 要多机部署 worker（此时还需共享项目文件系统等额外基建，runtime_id
+> 只是第一块砖）。届时建议先做**最小版（做法 α：稳定 runtime_id，不上心跳表）**，心跳/活跃集合判定
+> （做法 β，Multica 完整体 `agent_runtime`+`last_seen_at`）留到真需要精确快速回收时再补。
+>
+> **worker-split-minimal 的原始目标（平滑重启：改代码重启 API 不打断在跑 Agent）已由组 0+1+2 达成。**
+> 组 3 属「多 worker 横向扩展」话题，与「平滑重启 + Session Resume」是两条线，不阻塞后者。
+- [ ] 3.1 （deferred）worker 每次启动生成 runtime_id；`_claim_one` 领取时写入 run 行；reclaim 改为按 runtime_id 回收「上一代我的」在途 run。
+- [ ] 3.2 （deferred）探针 `orphan_runtime_recovery_probe`：多 worker 场景下 worker-B 启动不误杀 worker-A 正在跑的 run，只回收自己上一代的孤儿。
 
 ## 4 — 回归
 - [x] 4.1 全量 QA 门禁跑通（剥离后执行链路不回归）：门禁 39→40 项、40/40、601 断言、0 失败（含新增 kill_signal 探针 + orphan scope 切分 + scheduling Test F）。
