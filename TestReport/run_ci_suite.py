@@ -30,8 +30,9 @@ except Exception:
 HERE = Path(__file__).resolve().parent
 BACKEND = HERE.parent / "backend"
 
-# —— 门禁清单：40 项（39 隔离 probe + QA 主套件）。注释标注覆盖域，与 TestReport/README.md 对齐。——
+# —— 门禁清单：41 项（40 隔离 probe + QA 主套件）。注释标注覆盖域，与 TestReport/README.md 对齐。——
 # worker-split-minimal 组1：+run_kill_signal_probe（跨进程 kill 信号 D 类）。39→40。
+# worker-split-minimal 组2：+run_containment_probe（进程树 containment）。40→41。
 # S5 全仓零 sqlite：退役 run_wal_concurrency_probe（WAL 语义随 sqlite 消亡）→ 补 run_pg_concurrency_probe；
 #                    退役 run_orm_engine_probe（测 PRAGMA/busy_timeout，PG 无对应物）。净 40→39。
 # 排除（真实 CLI，非隔离桩）：run_collab_scenario.py / run_codex_cli_smoke.py
@@ -79,6 +80,7 @@ GATE = [
     "run_memory_hygiene_probe.py",        # 记忆卫生
     "run_skill_downloadable_probe.py",    # 技能可下载标记
     "run_stale_pid_kill_probe.py",        # 陈旧 pid 防误杀
+    "run_containment_probe.py",           # worker-split 组2：进程树 containment(强杀 worker→CLI 连带清理)
     "run_pipe_deadlock_probe.py",         # 管道死锁兜底
     "run_concurrency_probe.py",           # 并发池（较慢）
 ]

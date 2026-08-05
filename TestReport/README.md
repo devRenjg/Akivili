@@ -32,7 +32,7 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 ### CI 门禁（一键全量）
 
 ```bash
-# 跑全部 40 项门禁（39 隔离 probe + QA 主套件），任一失败即非零退出
+# 跑全部 41 项门禁（40 隔离 probe + QA 主套件），任一失败即非零退出
 python TestReport/run_ci_suite.py
 python TestReport/run_ci_suite.py --list          # 只列清单不跑
 python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
@@ -48,7 +48,7 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
   > 问题 runner-images#13040，若启动失败按日志调整服务发现/PGDATA 定位）。
 - probe 清单只在 `run_ci_suite.py` 的 `GATE` 里维护一处——新增 probe 时同步加入。
 - 门禁**不含**需真实 CLI 的 `run_collab_scenario.py` / `run_codex_cli_smoke.py`（人工按需单跑）。
-- 实测：**40/40 项、598 断言、~105s 全绿**（跑在 PostgreSQL 单引擎；worker-split-minimal 组1 +kill_signal 探针）。
+- 实测：**41/41 项、604 断言、~103s 全绿**（跑在 PostgreSQL 单引擎；worker-split-minimal 组1 +kill_signal、组2 +containment 探针）。
 
 ## 全套测试 vs CI 门禁
 
@@ -56,9 +56,9 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 干净环境自动复现、被挑进 CI 每次自动跑的那批。
 
 ```
-全套 45 个 run_*.py
-├── run_ci_suite.py            ← 不是测试，是「调度器」(按 GATE 清单跑其余 40 个、收退出码)
-├── 40 个 → 进 CI 门禁 ✅       (39 隔离 probe + run_qa_suite 主套件)
+全套 46 个 run_*.py
+├── run_ci_suite.py            ← 不是测试，是「调度器」(按 GATE 清单跑其余 41 个、收退出码)
+├── 41 个 → 进 CI 门禁 ✅       (40 隔离 probe + run_qa_suite 主套件)
 └── 4 个 → 不进门禁 ❌
       ├── run_collab_scenario.py   (需真实 claude/codex CLI + LLM)
       ├── run_codex_cli_smoke.py   (需真实 Codex CLI)
@@ -66,9 +66,9 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
       └── run_pg_sqlite_consistency_probe.py  (需真实 PostgreSQL；数据底座 S4.5，一次性迁移一致性核验)
 ```
 
-|  | 全套测试集合 | CI 40 门禁 |
+|  | 全套测试集合 | CI 41 门禁 |
 |---|---|---|
-| **范围** | 所有 `run_*.py`（45 个） | 其中挑进 `GATE` 的 40 个 |
+| **范围** | 所有 `run_*.py`（46 个） | 其中挑进 `GATE` 的 41 个 |
 | **触发** | 人工挑着单跑 / 本地 `run_ci_suite` 一键 | GitHub 每次 push/PR **自动** |
 | **含真实外部依赖测试** | 含（4 个：2 CLI + 2 PG 专项） | 全部需 PG（S5 起门禁探针跑在 PostgreSQL 单引擎） |
 | **保障对象** | 逻辑正确 + 与真实外部世界的集成 | 逻辑正确（鉴权/CRUD/ORM 等价/调度/回收…） |

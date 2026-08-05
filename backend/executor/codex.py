@@ -78,6 +78,14 @@ class CodexBackend(ExecutorBackend):
                 return
             if on_pid:
                 loop.call_soon_threadsafe(on_pid, proc.pid)
+            # 组 2 containment：把 CLI 子进程加入 worker 的 Job Object，worker 死则 OS 连带清理。
+            # Job 未就绪（直连路径 / 初始化失败）时 contain 返回 False、静默降级，该进程仍由
+            # kill_run 的 taskkill /T 兜底，功能不回退。
+            try:
+                from executor.containment import contain  # noqa: PLC0415
+                contain(proc.pid)
+            except Exception:  # noqa: BLE001 — containment 是增强，绝不阻断执行
+                pass
             # stderr 并发抽干（防双管道死锁）：codex --json 会把大量日志打到 stderr，
             # 若不并发读、等 stdout 读完才读 stderr，stderr 缓冲写满会把子进程憋死在写 stderr、
             # 不再吐 stdout → 主线程读 stdout 死等到超时被误杀（run#243 事故根因）。

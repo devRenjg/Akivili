@@ -29,6 +29,12 @@ async def _amain() -> None:
     action = await asyncio.to_thread(run_migrations)
     print(f"[worker] alembic upgrade head done (action={action})", flush=True)
 
+    # 组 2 进程树 containment：创建 Job Object（KILL_ON_JOB_CLOSE）。此后本进程起的 CLI 子进程
+    # 都会被 contain() 加入该 Job——worker 进程一死（含强杀/崩溃），OS 连带清理全部 CLI 子进程，
+    # 保证「死 worker 不会再有子进程写库/写文件」。失败自动降级（依赖 kill_run 兜底），不阻断启动。
+    from executor.containment import init_containment  # noqa: PLC0415
+    init_containment()
+
     # 回收上一代 worker 遗留的**队列路径**孤儿 running（仅本进程负责的路径）。
     # 只在 start_loop 之前调用，此刻本进程 _running/_RUN_PIDS 必为空、_loop 尚未领新活。
     n = await collab_mod.reclaim_orphan_runs(scope="queue")
