@@ -454,6 +454,11 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     # 命令带 --resume；否则全量首建（现状）。backend/workdir 一致性由 S4 降级链兜底（miss→全量）。
     _cli_backend = provider is not None and provider.type in ("claude-cli", "codex-cli")
     resume_hit = bool(resume_session_id) and _cli_backend
+    # S3.4：codex 额外校验 rollout 在位——不在则降级全量（对标 Multica gateCodexResumeToRolloutPresence）。
+    if resume_hit and provider.type == "codex-cli":
+        from executor.codex import codex_rollout_present
+        if not codex_rollout_present(resume_session_id):
+            resume_hit = False
     # 快照终点：本次构建 prompt 那刻的 MAX(message id)，供成功收尾推进 committed（S2.2）
     snapshot_end = 0
 

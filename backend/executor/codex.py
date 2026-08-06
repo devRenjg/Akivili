@@ -30,16 +30,33 @@ class CodexBackend(ExecutorBackend):
             parts.append(f"# 你的角色设定（背景参考）\n{ctx.system_prompt}")
         prompt = "\n\n---\n\n".join(parts)
 
-        cmd = [
-            exe, "exec", "--json",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--skip-git-repo-check",
-            "--cd", ctx.project_dir,
-            "--add-dir", ctx.project_dir,
-        ]
-        if ctx.model:
-            cmd += ["-m", ctx.model]
-        cmd += ["-"]   # prompt 从 stdin 读入（避免命令行参数过长/被截断/转义问题）
+        # agent-session-resume-minimal S3：resume 命中（ctx.cli_session_id 非空）→ 走 `exec resume`
+        #   子命令续接上次 thread。实测（Papers/CLI-resume能力实测 2.3）：resume 子命令**不接受 --cd**
+        #   （它从 session 自身恢复 cwd），OPTIONS 须放 <SESSION_ID> 之前。stream schema 与首轮一致，
+        #   _parse_line 原样复用。首建（cli_session_id 空）→ 现状 `exec --json`，thread_id 由 CLI 自生、
+        #   从 thread.started 事件抓取回传。
+        resume = bool(ctx.cli_session_id)
+        if resume:
+            cmd = [
+                exe, "exec", "resume",
+                "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--skip-git-repo-check",
+            ]
+            if ctx.model:
+                cmd += ["-m", ctx.model]
+            cmd += [ctx.cli_session_id, "-"]   # <SESSION_ID> [PROMPT(-=stdin)]
+        else:
+            cmd = [
+                exe, "exec", "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--skip-git-repo-check",
+                "--cd", ctx.project_dir,
+                "--add-dir", ctx.project_dir,
+            ]
+            if ctx.model:
+                cmd += ["-m", ctx.model]
+            cmd += ["-"]   # prompt 从 stdin 读入（避免命令行参数过长/被截断/转义问题）
 
         queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
@@ -91,10 +108,19 @@ class CodexBackend(ExecutorBackend):
             # 若不并发读、等 stdout 读完才读 stderr，stderr 缓冲写满会把子进程憋死在写 stderr、
             # 不再吐 stdout → 主线程读 stdout 死等到超时被误杀（run#243 事故根因）。
             stderr_drainer = _StderrDrainer(proc.stderr)
+            _sid_seen = False   # thread_id 只回传一次（首个 thread.started）
             for line in proc.stdout:
                 line = line.strip()
                 if not line:
                     continue
+                # S3：从 thread.started 事件抓 codex 原生会话 id（thread_id），经 on_session 回传给
+                # runner 写库（task_runs + run_queue，供下次 attempt --resume）。回调须在主 loop 线程调，
+                # 用 call_soon_threadsafe（同 on_pid）。resume 时也会再吐 thread.started（同一 id，不 fork）。
+                if on_session and not _sid_seen:
+                    tid = _extract_thread_id(line)
+                    if tid:
+                        _sid_seen = True
+                        loop.call_soon_threadsafe(on_session, tid)
                 ev = _parse_line(line)
                 if ev:
                     loop.call_soon_threadsafe(queue.put_nowait, ev)
@@ -113,6 +139,38 @@ class CodexBackend(ExecutorBackend):
                 break
             yield ev
         yield ExecEvent("done")
+
+
+def codex_rollout_present(thread_id: str) -> bool:
+    """S3.4：resume 前校验 codex thread 的 rollout 文件在位（对标 Multica
+    gateCodexResumeToRolloutPresence）。rollout 存于 ~/.codex/sessions/YYYY/MM/DD/
+    rollout-<ts>-<thread_id>.jsonl，文件名尾部即 thread_id。不在位说明 CLI 无法续接该 thread，
+    应降级全量而非假装续上（否则 codex 会静默从头开始、丢上下文）。
+    CODEX_HOME 环境变量可覆盖默认 ~/.codex。"""
+    import os as _os
+    import glob as _glob
+    if not thread_id:
+        return False
+    home = _os.environ.get("CODEX_HOME") or _os.path.join(_os.path.expanduser("~"), ".codex")
+    sessions_dir = _os.path.join(home, "sessions")
+    if not _os.path.isdir(sessions_dir):
+        return False
+    # 文件名含 thread_id 即在位；递归匹配（按年月日分层）
+    hits = _glob.glob(_os.path.join(sessions_dir, "**", f"*{thread_id}*.jsonl"), recursive=True)
+    return bool(hits)
+
+
+def _extract_thread_id(line: str) -> str | None:
+    """S3：从 codex 事件行提取 thread_id（会话 id）。首轮 `thread.started` 事件带 thread_id
+    （实测 Papers/CLI-resume能力实测 2.4）。非该事件/非 JSON → None。"""
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if obj.get("type") == "thread.started":
+        tid = obj.get("thread_id")
+        return tid if isinstance(tid, str) and tid else None
+    return None
 
 
 def _parse_line(line: str) -> ExecEvent | None:

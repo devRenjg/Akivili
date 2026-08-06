@@ -68,6 +68,7 @@ GATE = [
     "run_kill_signal_probe.py",           # worker-split 组1：跨进程 kill 信号（D 类）
     "run_session_capture_probe.py",       # session-resume S1.4：claude 预分配 session_id 捕获链路
     "run_claude_resume_incremental_probe.py",  # session-resume S2.7：claude resume 命令分支 + 增量回灌 SQL
+    "run_codex_resume_incremental_probe.py",    # session-resume S3.5：codex exec resume + thread_id 抓取 + rollout 校验
     "run_reactivate_probe.py",            # 重派状态流转
     "run_task_gates_probe.py",            # 任务状态闸
     "run_subtask_autocomplete_probe.py",  # 子任务全完成→父推进

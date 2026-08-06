@@ -32,11 +32,11 @@
 - [x] 2.7 探针 `run_claude_resume_incremental_probe.py`：命令分支（首建--session-id/续跑--resume）+ 增量 SQL（含队友+用户、排除本 agent 自产）。〔已验证全过；纳入 CI suite〕〔并发/token 对比属真起 CLI 的集成验证，留待联调〕
 
 ### S3. codex 线（thread_id 抓取 + exec resume，与 claude 并行）
-- [ ] 3.1 `codex.py::_parse_line`：补一个分支，顶层 `type == "thread.started"` 时提取 `thread_id`，经 `ExecEvent`（如 `ExecEvent("system", ..., meta={"session_id": thread_id})`）冒泡回 runner。当前该事件走兜底返回 None（CLI 实测 Paper 2.4）。
-- [ ] 3.2 `runner.py`：codex run 从冒泡事件捕获 thread_id，写入 `task_runs.cli_session_id`（backend=codex）。
-- [ ] 3.3 `codex.py`：命中 session 时命令改为 `codex exec resume <flags> <thread_id> -`（OPTIONS 放 id 前、**去掉 `--cd`**，resume 从 session 自身恢复 cwd，CLI 实测 Paper 2.3）；`_parse_line` 的 item.* 分支原样复用。
-- [ ] 3.4 **codex rollout 在位校验**（对标 Multica `gateCodexResumeToRolloutPresence`）：resume 前查 `~/.codex/sessions` 下对应 thread 的 rollout 文件存在，不在 → 不 resume、降级全量。
-- [ ] 3.5 探针 `run_codex_resume_incremental_probe.py`：codex 二次执行 `exec resume` 续接、prompt 只含增量；rollout 不存在时降级全量不报错。
+- [x] 3.1 `codex.py`：`_extract_thread_id` 从顶层 `type == "thread.started"` 事件提取 `thread_id`；在 `_reader` 解析循环里检测（只回传一次），经 `on_session` 用 `call_soon_threadsafe` 回传（同 on_pid，非塞进 _parse_line 改其返回契约）。当前该事件走兜底返回 None（CLI 实测 Paper 2.4）。〔S3.5 探针验证抓取正确〕
+- [x] 3.2 `runner.py`：codex run 从 `on_session` 回调捕获 thread_id，`_record_session` 写入 `task_runs.cli_session_id` + `run_queue.cli_session_id`（backend=codex，S2.6 已统一）。〔复用 S1.3/S2.6 的 _on_session 链路，codex/claude 同机制〕
+- [x] 3.3 `codex.py`：命中 session（ctx.cli_session_id 非空）→ 命令改为 `codex exec resume <flags> <thread_id> -`（OPTIONS 放 id 前、**去掉 `--cd`**，resume 从 session 自身恢复 cwd，CLI 实测 Paper 2.3）；`_parse_line` 的 item.* 分支原样复用。〔S3.5 探针验证命令分支互斥、无 --cd、id 在 resume 后〕
+- [x] 3.4 **codex rollout 在位校验**（对标 Multica `gateCodexResumeToRolloutPresence`）：`codex_rollout_present` 查 `~/.codex/sessions/**/*<thread_id>*.jsonl` 存在（CODEX_HOME 可覆盖）；runner resume_hit 判定对 codex 额外调它，不在 → resume_hit=False 降级全量。〔S3.5 验证真实命中/不存在·空→降级〕
+- [x] 3.5 探针 `run_codex_resume_incremental_probe.py`：codex 命令分支（首建 exec --json / 续跑 exec resume）+ thread_id 抓取 + rollout 校验降级。〔已验证全过；纳入 CI suite〕〔真起 codex 续接/token 属集成验证，留待联调〕
 
 ### S4. 降级链（保证不劣于现状）
 - [ ] 4.1 首次执行（无 session）→ 全量回灌（现状路径，不变）。

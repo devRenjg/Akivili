@@ -65,13 +65,18 @@ def _run_case(preassigned: str) -> dict:
 
     evs = asyncio.run(_drive())
     cmd = _FakePopen.last_cmd or []
-    # 取 --session-id 的值
-    flag_val = None
-    if "--session-id" in cmd:
-        i = cmd.index("--session-id")
-        if i + 1 < len(cmd):
-            flag_val = cmd[i + 1]
-    return {"captured": captured["session"], "cmd": cmd, "flag_val": flag_val, "events": evs}
+
+    def _val_after(flag):
+        if flag in cmd:
+            i = cmd.index(flag)
+            if i + 1 < len(cmd):
+                return cmd[i + 1]
+        return None
+
+    # S2.4：首建走 --session-id、续跑（预分配非空）走 --resume。两者取值都拿。
+    return {"captured": captured["session"], "cmd": cmd,
+            "session_id_val": _val_after("--session-id"),
+            "resume_val": _val_after("--resume"), "events": evs}
 
 
 def main():
@@ -83,23 +88,26 @@ def main():
     print("\n[A] 首建（不预分配）：run 自生成 UUID")
     a = _run_case(preassigned="")
     a_captured_is_uuid = _is_uuid(a["captured"])
-    a_flag_match = a["captured"] == a["flag_val"] and a["flag_val"] is not None
+    # 首建：命令走 --session-id，值 == 回传（无 --resume）
+    a_flag_match = a["captured"] == a["session_id_val"] and a["session_id_val"] is not None
+    a_no_resume = a["resume_val"] is None
     print(f"    on_session 回传 = {a['captured']}")
-    print(f"    命令 --session-id 值 = {a['flag_val']}")
+    print(f"    命令 --session-id 值 = {a['session_id_val']}")
     print(f"    [1] 回传值是合法 UUID: {'OK' if a_captured_is_uuid else 'FAIL'}")
-    print(f"    [2] 命令注入值 == 回传值: {'OK' if a_flag_match else 'FAIL'}")
+    print(f"    [2] 命令 --session-id==回传、无 --resume: {'OK' if a_flag_match and a_no_resume else 'FAIL'}")
 
-    # 用例 B：预分配指定 UUID（resume 场景）→ run 用传入的，不另生成
-    print("\n[B] 预分配（resume 预留）：run 用传入 UUID")
+    # 用例 B：预分配非空 = resume 场景（S2.4）→ 命令走 --resume <id>，无 --session-id
+    print("\n[B] 预分配非空（resume 命中，S2.4）：命令走 --resume")
     fixed = str(uuidmod.uuid4())
     b = _run_case(preassigned=fixed)
-    b_use_given = b["captured"] == fixed and b["flag_val"] == fixed
+    # S2.4：预分配非空 → 命令走 --resume <id>（不再是 --session-id）；回传值仍 == 传入
+    b_resume = b["resume_val"] == fixed and b["session_id_val"] is None and b["captured"] == fixed
     print(f"    传入 = {fixed}")
     print(f"    on_session 回传 = {b['captured']}")
-    print(f"    命令 --session-id 值 = {b['flag_val']}")
-    print(f"    [3] 用传入 UUID（回传+命令均== 传入）: {'OK' if b_use_given else 'FAIL'}")
+    print(f"    命令 --resume 值 = {b['resume_val']}  (--session-id 值 = {b['session_id_val']})")
+    print(f"    [3] 命令 --resume==传入、无 --session-id、回传==传入: {'OK' if b_resume else 'FAIL'}")
 
-    all_ok = a_captured_is_uuid and a_flag_match and b_use_given
+    all_ok = a_captured_is_uuid and a_flag_match and a_no_resume and b_resume
     print("\n" + "=" * 60)
     print(f"结论：{'✅ 全部通过 —— 预分配捕获链路正确' if all_ok else '❌ 有失败项'}")
     print("=" * 60)
