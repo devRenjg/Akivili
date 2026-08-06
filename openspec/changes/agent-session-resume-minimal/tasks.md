@@ -39,11 +39,11 @@
 - [x] 3.5 探针 `run_codex_resume_incremental_probe.py`：codex 命令分支（首建 exec --json / 续跑 exec resume）+ thread_id 抓取 + rollout 校验降级。〔已验证全过；纳入 CI suite〕〔真起 codex 续接/token 属集成验证，留待联调〕
 
 ### S4. 降级链（保证不劣于现状）
-- [ ] 4.1 首次执行（无 session）→ 全量回灌（现状路径，不变）。
-- [ ] 4.2 resume 未落地判定：`失败 && (stderr "no conversation found" / rollout 缺失 / session 记录丢失)` → 清 `cli_session_id` + 本次降级全量 + 成功后重建。（实测两线 id 不 fork，故无「成功但 id 变」的 mismatch 分支——比废弃版 S2.6 简化。）
-- [ ] 4.3 **resume-unsafe（poisoned）丢 session**：定义 poisoned 集（迭代上限 / 模型 400 / codex 语义静默 / 上下文溢出），命中 → 主动丢弃 prior session、下次从头重建（不 resume 坏状态）。复用现有 `retriable_fail` 分类扩展。
-- [ ] 4.4 provider/backend 变更、workdir 变更 → 弃旧 session、全量重建。
-- [ ] 4.5 探针 `run_session_fallback_probe.py`：模拟 ① no conversation found ② rollout 缺失 ③ poisoned 失败 ④ 换 provider ⑤ 换 workdir，均正确降级全量、不报错、结果不劣于现状。
+- [x] 4.1 首次执行（无 session）→ 全量回灌（现状路径，不变）。〔resume_hit 判定：无 session_id → False → 全量〕
+- [x] 4.2 resume 未落地判定：`_should_drop_session` 的 `_RESUME_MISS_RE`（no conversation found / session·thread not found / rollout not present / resume fail 等）→ 清 `run_queue.cli_session_id`+`session_committed_msg_id` → 下次 attempt 全量重建。（实测两线 id 不 fork，无「成功但 id 变」mismatch 分支——比废弃版 S2.6 简化。）〔S4.5 验证〕
+- [x] 4.3 **resume-unsafe（poisoned）丢 session**：`_POISONED_RE`（迭代上限 / 模型 400 invalid_request / 上下文溢出 / codex 语义静默，对标 Multica resume-unsafe 清单）命中 → 清 session、下次从头重建。限流(429)**不丢**（会话仍有效，走重试）。〔S4.5 验证 10 类分类〕
+- [x] 4.4 provider/backend 变更 → 弃旧 session、全量重建。〔resume_hit 判定：非 CLI backend(api)→False；backend 类型不符→走首建〕workdir 变更：**阶段一 attempt 间续跑 workdir 天然不变**（同 task 同 project_dir），workdir 一致性校验留待阶段二跨 task（届时 workdir 可能变）。
+- [x] 4.5 探针 `run_session_fallback_probe.py`：① _should_drop_session 分类(resume_miss/poisoned/不丢) ② resume_hit 各降级入口(无session/api/rollout缺) ③ 清 session 的 DB 效果。〔已验证全过；纳入 CI suite〕
 
 ## 阶段二 —— 跨 task 续接（best-effort 缓存，省 token）
 
