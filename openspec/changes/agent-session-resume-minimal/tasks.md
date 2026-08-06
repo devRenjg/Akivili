@@ -11,7 +11,7 @@
 ## 阶段一 —— 同 run 续跑地基（claude 线先行）
 
 ### S1. 存储 + claude 预分配
-- [ ] 1.1 `task_runs` 加列：`cli_session_id TEXT`（claude=预分配 UUID / codex=抓来的 thread_id）、`session_backend TEXT`（claude/codex）、`session_workdir TEXT`、`session_committed_msg_id INTEGER`（成功才推进的增量水位）。走 Alembic 迁移（对齐现有 001-004 链，PG 单引擎）。
+- [x] 1.1 `task_runs` 加列：`cli_session_id TEXT`（claude=预分配 UUID / codex=抓来的 thread_id）、`session_backend TEXT`（claude/codex）、`session_workdir TEXT`、`session_committed_msg_id INTEGER`（成功才推进的增量水位）。走 Alembic 迁移（对齐现有 001-004 链，PG 单引擎）。〔迁移 005 + TaskRun model，已验证 004→005 upgrade、DB revision=005、ORM 15 列与 DB 完全对齐〕
 - [ ] 1.2 `claude_code.py`：执行前生成 UUID（`uuid.uuid4()`），命令加 `--session-id <uuid>`，把该 UUID 通过 `ExecContext` 或 `on_pid` 同机制回传给 runner 记录。实测确认 CLI 回显同一 UUID（CLI 实测 Paper 2.1），故无需从输出解析。
 - [ ] 1.3 `runner.py`：run 启动时把预分配 UUID + backend + workdir 写入 `task_runs.cli_session_id` 等列（run 开始即落，不等收尾——保证打断后能查到）。
 - [ ] 1.4 探针 `run_session_capture_probe.py`：claude run 执行后 `task_runs.cli_session_id` == 传入 UUID、backend/workdir 正确落库；run 中途查库能查到 session_id（不等收尾）。
