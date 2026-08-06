@@ -97,7 +97,8 @@ async def run_probe(paths):
     # 假执行器：不调真实模型，成功时 yield 一段文本；hang_slugs 里的返回错误
     behavior = {"fail_slugs": set()}
 
-    async def fake_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
+    async def fake_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name="",
+                            resume_session_id="", committed_msg_id=0, queue_item_id=0):
         slug = agent_obj["slug"]
         # run_id = task_runs.id（INTEGER），与生产一致；此处每次 _run_one 针对不同 task，
         # task_obj['id'] 即唯一整数。PG 严格类型下字符串 run_id 会触发 DataError。

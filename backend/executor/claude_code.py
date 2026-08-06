@@ -23,10 +23,13 @@ class ClaudeCodeBackend(ExecutorBackend):
     async def run(self, ctx: ExecContext, on_pid=None, on_session=None):
         exe = shutil.which("claude") or "claude"
         cli_prompt = build_cli_prompt(ctx)
-        # agent-session-resume-minimal 阶段一：预分配会话 id。claude 支持 --session-id <uuid>
-        # 由我们指定（实测 CLI 回显同一 UUID，见 Papers/CLI-resume能力实测 2.1），故无需从输出解析。
-        # 命中已有 session 时改带 --resume（见 S2.4，本步只做首建预分配）。执行前即回传 on_session，
-        # 使 run 一启动 DB 就有 session 指针——被打断也能查到、可续跑（S1.3）。
+        # agent-session-resume-minimal 阶段一：会话 id 两种模式——
+        #   首建（ctx.cli_session_id 空）：预分配新 UUID，命令带 --session-id <uuid>（我们指定、
+        #     CLI 回显同一值，见 Papers/CLI-resume能力实测 2.1，无需解析输出）。
+        #   续跑（ctx.cli_session_id 非空，S2.4 resume 命中）：命令带 --resume <uuid> 续上次会话
+        #     （实测 resume 后 id 不 fork、stream schema 不变，_parse_line 原样复用）。
+        # 两种模式都执行前即回传 on_session，使 run 一启动 DB 就有 session 指针（S1.3/S2.6）。
+        resume = bool(ctx.cli_session_id)
         session_id = ctx.cli_session_id or str(uuid.uuid4())
         if on_session:
             on_session(session_id)
@@ -34,7 +37,7 @@ class ClaudeCodeBackend(ExecutorBackend):
             exe, "-p",                       # prompt 走 stdin（不作为命令行参数）
             "--output-format", "stream-json",
             "--verbose",
-            "--session-id", session_id,
+            *(["--resume", session_id] if resume else ["--session-id", session_id]),
             "--add-dir", ctx.project_dir,
             "--permission-mode", "bypassPermissions",
             "--dangerously-skip-permissions",

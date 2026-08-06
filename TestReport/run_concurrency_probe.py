@@ -112,7 +112,8 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
     # Per-slug behavior: hang forever, or sleep N seconds then emit text.
     behavior = {"hang_slugs": set(), "sleep_sec": 0.0}
 
-    async def fake_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
+    async def fake_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name="",
+                            resume_session_id="", committed_msg_id=0, queue_item_id=0):
         slug = agent_obj["slug"]
         run_id_seq["n"] += 1
         # run_id = task_runs.id（INTEGER），与生产一致。整数计数器本身即唯一，
@@ -235,7 +236,8 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
         # 即便 backend 先被 claim，1.5s 执行也必然晚于 0.05s 的快 Agent 完成。
         delays = {"qa-backend-developer": 1.5, "qa-frontend-developer": 0.05, "qa-tester": 0.05}
 
-        async def mixed_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
+        async def mixed_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name="",
+                            resume_session_id="", committed_msg_id=0, queue_item_id=0):
             slug = agent_obj["slug"]
             run_id_seq["n"] += 1
             # run_id = task_runs.id（INTEGER），与生产一致；PG 下字符串会 DataError。

@@ -82,7 +82,8 @@ async def run_probe(paths, keep):
     # 假 dispatch：产出 system(run_id) + 一段 text（api 后端会落 assistant 消息，带 run_id）
     seq = {"n": 100}
 
-    async def fake_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
+    async def fake_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name="",
+                            resume_session_id="", committed_msg_id=0, queue_item_id=0):
         seq["n"] += 1
         # 真建一个 task_runs 行（模拟 execute_dispatch 内部行为），yield 其 id
         db = await get_connection()

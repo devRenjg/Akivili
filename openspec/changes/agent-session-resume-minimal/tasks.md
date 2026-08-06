@@ -16,13 +16,20 @@
 - [x] 1.3 `runner.py`：run 启动时把预分配 UUID + backend + workdir 写入 `task_runs.cli_session_id` 等列（run 开始即落，不等收尾——保证打断后能查到）。〔`_on_session` 回调 + `_record_session` 异步写库；已端到端验证三件套落库、committed 保持 NULL〕
 - [x] 1.4 探针 `run_session_capture_probe.py`：claude run 执行后 `task_runs.cli_session_id` == 传入 UUID、backend/workdir 正确落库；run 中途查库能查到 session_id（不等收尾）。〔已验证：自生成/预分配两用例回传值==命令注入值；纳入 CI suite〕
 
-### S2. claude resume + 增量回灌
-- [ ] 2.1 `runner.py`：执行前查本 run（或其恢复来源 run）的 `cli_session_id`；命中且 backend/workdir 一致 → 走「resume + 增量」；否则走「全量首建」（现状）。
-- [ ] 2.2 增量水位：`session_committed_msg_id`（上次成功已消费到的 message id）+ 本次快照终点（构建 prompt 那刻的 `MAX(messages.id)`，本 run 内临时算）。增量 = `messages WHERE conversation_id=? AND id > committed AND id <= snapshot_end AND 作者非本 agent ORDER BY id`（参数化）。成功收尾才把 committed 推进到快照终点；崩溃/中断 committed 未推进 → 续跑从同一起点重取 → **重复但不漏**（at-least-once）。
-- [ ] 2.3 `executor/base.py::build_cli_prompt`：输入从「全量历史」改为「增量历史」（格式复用【用户】/【队友】，仅数据源变）；增量为空时 prompt 仅本轮指令。
-- [ ] 2.4 `claude_code.py`：命中 session 时 `cmd += ["--resume", session_id]`（`_parse_line` 原样复用，实测 schema 不变）。
-- [ ] 2.5 **前置：固定 CLAUDE_CONFIG_DIR**。确认 `claude_code.py:76` 的 `%TEMP%/akivili_claude_cfg` 在 worker 进程内稳定（同一 worker 两次执行命中同目录）。目录丢失 → resume miss → 降级全量（见 S3.1）。
-- [ ] 2.6 探针 `run_claude_resume_incremental_probe.py`：二次执行带 `--resume`、prompt 只含增量、token/长度较全量下降；并发场景（A 跑期间 B 发言）下次触发 A 不漏 B 的话；committed 崩溃未推进时续跑不漏。
+### S2. claude resume + 增量回灌（attempt 间续跑）
+
+> **数据流**（架构现实修正见 proposal）：run_queue.cli_session_id 是 attempt 间传递载体。
+> 第 1 次 attempt 无 → 全量首建 → claude 生成 UUID → on_session 同时写 task_runs + run_queue；
+> 失败重试（同 item，attempts+1）读 run_queue.cli_session_id → 传入 execute_dispatch → resume + 增量。
+
+- [x] 2.0 迁移 006：`run_queue` 加 `cli_session_id TEXT` + `session_committed_msg_id INTEGER`（attempt 间传递 session 指针 + 增量水位）。走 Alembic（Revises 005）。model 同步。〔已验证 005→006 upgrade、run_queue 2 列建成、ORM parity 75/0〕
+- [x] 2.1 `collab.py::_run_one`：把 item 的 `cli_session_id` / `session_committed_msg_id` 传入 `execute_dispatch`（新参数 `resume_session_id` / `committed_msg_id` / `queue_item_id`）；`execute_dispatch` 命中且 backend 是 CLI（claude/codex）→ 走「resume + 增量」，否则「全量首建」（现状）。〔`_RQ_COLS` 加 2 列使 item 自动带上；调用侧传参〕
+- [x] 2.2 增量水位：`session_committed_msg_id`（上次成功已消费到的 message id）+ 本次快照终点（构建 prompt 那刻的 `MAX(messages.id)`，本 attempt 内临时算）。增量 = `messages WHERE conversation_id=? AND id > committed AND id <= snapshot_end AND 作者非本 agent ORDER BY id`（参数化）。成功收尾才把 committed 推进到快照终点并写回 run_queue；崩溃/中断 committed 未推进 → 下次 attempt 从同一起点重取 → **重复但不漏**（at-least-once）。〔`_advance_committed` 仅 status==succeeded 调用，写 run_queue+task_runs〕
+- [x] 2.3 `executor/base.py::build_cli_prompt`：**无需改**——已是「本轮指令最前 + history 附后」结构，history 为空只返回本轮指令。只要上游把 `ctx.history` 从全量换成增量即可（数据源变、函数不变）。本任务 = 在 `execute_dispatch` 按 resume 命中与否切换 history 数据源。〔execute_dispatch 按 resume_hit 分叉 history 取法，build_cli_prompt 未改〕
+- [x] 2.4 `claude_code.py`：`ctx.cli_session_id` 非空（resume 命中）→ 命令用 `--resume <id>`（而非首建的 `--session-id`）；`_parse_line` 原样复用（实测 schema 不变）。〔S2.7 探针验证首建/续跑命令分支互斥正确〕
+- [x] 2.5 **前置：固定 CLAUDE_CONFIG_DIR**。确认 `claude_code.py:76` 的 `%TEMP%/akivili_claude_cfg` 在 worker 进程内稳定（同一 worker 两次执行命中同目录）。目录丢失 → resume miss → 降级全量（见 S4.2）。〔现有代码已用固定路径、非随机；符合前置〕
+- [x] 2.6 `runner.py::_on_session`：session_id 回写时**同时**更新 `run_queue.cli_session_id`（attempt 间传递），不只 task_runs。〔`_record_session` 加 queue_item_id 参数，同事务写 task_runs + run_queue〕
+- [x] 2.7 探针 `run_claude_resume_incremental_probe.py`：命令分支（首建--session-id/续跑--resume）+ 增量 SQL（含队友+用户、排除本 agent 自产）。〔已验证全过；纳入 CI suite〕〔并发/token 对比属真起 CLI 的集成验证，留待联调〕
 
 ### S3. codex 线（thread_id 抓取 + exec resume，与 claude 并行）
 - [ ] 3.1 `codex.py::_parse_line`：补一个分支，顶层 `type == "thread.started"` 时提取 `thread_id`，经 `ExecEvent`（如 `ExecEvent("system", ..., meta={"session_id": thread_id})`）冒泡回 runner。当前该事件走兜底返回 None（CLI 实测 Paper 2.4）。

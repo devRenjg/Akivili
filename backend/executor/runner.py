@@ -10,7 +10,7 @@ from sqlalchemy import func, select, update as sa_update
 
 from config import load_settings
 from models import (get_session_factory, now_expr,
-                    Activity, AgentSkill, Message, RunLog, Skill, TaskRun)
+                    Activity, AgentSkill, Message, RunLog, RunQueue, Skill, TaskRun)
 from memory import read_memory, append_memory, select_relevant_knowhow, _managed_body
 from executor.base import ExecContext
 from executor.claude_code import ClaudeCodeBackend
@@ -428,7 +428,9 @@ async def run_oneshot(provider_id: str, system_prompt: str, prompt: str,
 
 
 async def execute_dispatch(task: dict, agent: dict, prompt: str,
-                           persist_user_msg: bool = True, user_name: str = ""):
+                           persist_user_msg: bool = True, user_name: str = "",
+                           resume_session_id: str = "", committed_msg_id: int = 0,
+                           queue_item_id: int = 0):
     """完整执行闭环，异步生成器逐个 yield ExecEvent。
 
     task: tasks 行；agent: project_agents 行（含 slug/persona/provider 解析）。
@@ -447,6 +449,13 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     slug = agent["slug"]
     provider = _provider_by_id(agent.get("provider_id_effective", ""))
     backend = _pick_backend(provider)
+    # agent-session-resume-minimal S2.1：resume 命中判定——上次 attempt 存了 session_id、
+    # 且本 backend 是支持 resume 的 CLI（claude/codex，非 api）。命中则 history 只取增量、
+    # 命令带 --resume；否则全量首建（现状）。backend/workdir 一致性由 S4 降级链兜底（miss→全量）。
+    _cli_backend = provider is not None and provider.type in ("claude-cli", "codex-cli")
+    resume_hit = bool(resume_session_id) and _cli_backend
+    # 快照终点：本次构建 prompt 那刻的 MAX(message id)，供成功收尾推进 committed（S2.2）
+    snapshot_end = 0
 
     async with get_session_factory()() as session:
         if persist_user_msg:
@@ -456,21 +465,34 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
             session.add(umsg)
             await session.flush()
             user_msg_id = umsg.id   # 本轮起点：之后该 Agent 的发言才算本轮产出
-            # 取会话历史（回灌，恢复上下文），不含刚插入的本轮
-            rows = (await session.execute(
-                select(Message.role, Message.content)
-                .where(Message.conversation_id == conv_id).order_by(Message.id))).all()
-            history = _clip_history([{"role": r.role, "content": r.content} for r in rows[:-1]])
         else:
             # 机器合成的派活指令：不落 user 消息（否则时间线会以「我」名义重复复述任务）。
             # 本轮起点取当前最大消息 id，之后该 Agent 的发言才算本轮产出。
-            rows = (await session.execute(
-                select(Message.role, Message.content)
-                .where(Message.conversation_id == conv_id).order_by(Message.id))).all()
-            history = _clip_history([{"role": r.role, "content": r.content} for r in rows])
             user_msg_id = (await session.execute(
                 select(func.coalesce(func.max(Message.id), 0))
                 .where(Message.conversation_id == conv_id))).scalar_one()
+        # 快照终点 = 当前会话最大 message id（resume 增量的上界、committed 推进目标）
+        snapshot_end = (await session.execute(
+            select(func.coalesce(func.max(Message.id), 0))
+            .where(Message.conversation_id == conv_id))).scalar_one()
+        # 取会话历史：resume 命中 → 只取增量（committed < id <= snapshot_end 且非本 agent 自产）；
+        # 否则 → 全量回灌（现状，_clip_history 双限裁剪）。
+        if resume_hit:
+            inc_rows = (await session.execute(
+                select(Message.role, Message.content)
+                .where(Message.conversation_id == conv_id,
+                       Message.id > committed_msg_id,
+                       Message.id <= snapshot_end,
+                       Message.author_slug != slug)
+                .order_by(Message.id))).all()
+            history = [{"role": r.role, "content": r.content} for r in inc_rows]
+        else:
+            rows = (await session.execute(
+                select(Message.role, Message.content)
+                .where(Message.conversation_id == conv_id).order_by(Message.id))).all()
+            # persist_user_msg 时刚插入的本轮 user 消息在末尾，全量回灌不含它
+            src = rows[:-1] if persist_user_msg else rows
+            history = _clip_history([{"role": r.role, "content": r.content} for r in src])
         # 建 run
         run = TaskRun(task_id=task["id"], conversation_id=conv_id, agent_slug=slug,
                       provider_id=provider.id if provider else "", status="running")
@@ -505,6 +527,10 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     ctx = await build_context(slug, persona, project_dir, provider, prompt, history,
                               is_leader=bool(agent.get("is_leader_run")),
                               project_id=task.get("project_id", 0), task_id=task.get("id", 0))
+    # S2.1：resume 命中 → 把待续接的 session_id 塞进 ctx，claude/codex backend 据此走 --resume。
+    # 未命中 ctx.cli_session_id 保持空，backend 走首建（claude 预分配新 UUID）。
+    if resume_hit:
+        ctx.cli_session_id = resume_session_id
 
     collected: list[str] = []
     had_error = False
@@ -516,11 +542,12 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
         "codex" if provider and provider.type == "codex-cli" else "")
 
     def _on_session(sid: str):
-        # agent-session-resume-minimal S1.3：拿到 CLI 会话 id 即写库（run 开始即落、不等收尾，
-        # 保证被打断也能查到用于续跑）。回调在主 loop 线程内触发，用 create_task 异步写库。
+        # S1.3：拿到 CLI 会话 id 即写库（run 开始即落、不等收尾，保证被打断也能查到用于续跑）。
+        # S2.6：同时写 run_queue.cli_session_id（attempt 间传递载体，下次 attempt 读它 resume）。
+        # 回调在主 loop 线程内触发，用 create_task 异步写库。
         if sid:
             __import__("asyncio").create_task(
-                _record_session(run_id, sid, _session_backend, project_dir))
+                _record_session(run_id, sid, _session_backend, project_dir, queue_item_id))
 
     try:
         async for ev in backend.run(ctx, on_pid=_on_pid, on_session=_on_session):
@@ -580,6 +607,11 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
         _RUN_CTX[run_id]["stream_text"] = final_text
     # run 的成败以此处 task_runs 落库为准（run_id 已有明确 status）。
     await _finish_run(run_id, status)
+    # S2.2：仅成功收尾才把 committed 水位推进到本次快照终点，写回 run_queue（attempt 间传递）
+    #   + task_runs（本 attempt 审计）。崩溃/kill/失败都不推进 → 下次 attempt 从同一起点重取增量
+    #   → 重复但不漏（at-least-once）。session 复用是优化，水位写失败不阻断（容错吞异常）。
+    if status == "succeeded":
+        await _advance_committed(run_id, queue_item_id, snapshot_end)
     # 🔴 pid 清理必须在善后 try 之前、无条件执行：进程此刻已退出，注册表须立即清掉，
     #   否则一旦下面 _persist_memory 抛异常被 except 吞掉，陈旧 pid 就残留在 _RUN_PIDS，
     #   日后 kill_run 会拿被 OS 复用的同号 pid 去 taskkill /F /T 误杀无辜进程（task140 事故根因）。
@@ -708,18 +740,42 @@ async def _save_assistant(conv_id: int, content: str, author_slug: str = "", run
         await session.commit()
 
 
-async def _record_session(run_id: int, session_id: str, backend: str, workdir: str) -> None:
-    """agent-session-resume-minimal S1.3：把 CLI 会话指针写入 task_runs（run 开始即落）。
-    仅写 session 三件套（id/backend/workdir），不碰 status/水位——水位 committed 只在成功收尾推进（S2.2）。
-    容错：写库失败不得影响执行（session 复用是优化，落不了库最坏是下次 resume miss 降级全量）。"""
+async def _record_session(run_id: int, session_id: str, backend: str, workdir: str,
+                          queue_item_id: int = 0) -> None:
+    """S1.3：把 CLI 会话指针写入 task_runs（run 开始即落，供审计/本 attempt 追溯）。
+    S2.6：同时写 run_queue.cli_session_id（queue_item_id 给定时）——attempt 间传递载体，
+    下次 attempt 读它 --resume 续跑。仅写 session 三件套（id/backend/workdir），不碰水位——
+    committed 只在成功收尾推进（S2.2）。容错：写库失败不阻断执行（session 复用是优化，
+    落不了库最坏是下次 resume miss 降级全量）。"""
     try:
         async with get_session_factory()() as session:
             await session.execute(
                 sa_update(TaskRun).where(TaskRun.id == run_id)
                 .values(cli_session_id=session_id, session_backend=backend,
                         session_workdir=workdir))
+            if queue_item_id:
+                await session.execute(
+                    sa_update(RunQueue).where(RunQueue.id == queue_item_id)
+                    .values(cli_session_id=session_id))
             await session.commit()
     except Exception:  # noqa: BLE001 — session 落库失败不阻断执行
+        pass
+
+
+async def _advance_committed(run_id: int, queue_item_id: int, snapshot_end: int) -> None:
+    """S2.2：成功收尾推进增量水位 committed → snapshot_end。写 run_queue（attempt 间传递，
+    下次 attempt 据此只取增量）+ task_runs（本 attempt 审计）。仅成功调用；容错吞异常不阻断。"""
+    try:
+        async with get_session_factory()() as session:
+            await session.execute(
+                sa_update(TaskRun).where(TaskRun.id == run_id)
+                .values(session_committed_msg_id=snapshot_end))
+            if queue_item_id:
+                await session.execute(
+                    sa_update(RunQueue).where(RunQueue.id == queue_item_id)
+                    .values(session_committed_msg_id=snapshot_end))
+            await session.commit()
+    except Exception:  # noqa: BLE001 — 水位写失败不阻断执行
         pass
 
 

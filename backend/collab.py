@@ -28,6 +28,8 @@ _PA_COLS = (
 _RQ_COLS = (
     "id", "task_id", "agent_slug", "trigger", "is_leader", "prompt", "status",
     "created_at", "attempts", "next_retry_at", "task_run_id", "source_run_id", "source_message_id",
+    # agent-session-resume-minimal 阶段一：attempt 间续跑传递载体（迁移 006）
+    "cli_session_id", "session_committed_msg_id",
 )
 
 # 单任务累计 run 总量闸（绝对失控的最后兜底）。start_loop 时从 Settings 覆盖，见 _apply_settings。
@@ -663,7 +665,13 @@ async def _run_one(item: dict) -> None:
         start = _time.monotonic()
         produced_since_wall = False   # 本个硬墙钟周期内是否有产出（活性标志）
         extensions = 0
-        agen = runner.execute_dispatch(task, agent, prompt, persist_user_msg=False)
+        # S2.1：把本 queue item 上次 attempt 存的 session 指针 + committed 水位传入，
+        # execute_dispatch 命中则走 --resume + 增量回灌；首次 attempt 这俩为空 → 全量首建。
+        agen = runner.execute_dispatch(
+            task, agent, prompt, persist_user_msg=False,
+            resume_session_id=item.get("cli_session_id") or "",
+            committed_msg_id=int(item.get("session_committed_msg_id") or 0),
+            queue_item_id=item.get("id") or 0)
         try:
             while True:
                 if _time.monotonic() - start > hard:

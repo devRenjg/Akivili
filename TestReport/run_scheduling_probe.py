@@ -150,7 +150,8 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
     run_seq = {"n": 0}
     fail_times = {"n": 0}
 
-    async def fail_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
+    async def fail_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name="",
+                            resume_session_id="", committed_msg_id=0, queue_item_id=0):
         run_seq["n"] += 1
         fail_times["n"] += 1
         raise RuntimeError("模拟 CLI 冷启动失败")
@@ -215,7 +216,8 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
                 f"status={row['status']} attempts={row['attempts']}（期望 failed/3）")
 
     # ---- Test D: error 事件无产出（CLI/LLM 瞬时报错）属可重试类 ----
-    async def err_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
+    async def err_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name="",
+                            resume_session_id="", committed_msg_id=0, queue_item_id=0):
         run_seq["n"] += 1
         # run_id 对齐生产语义：等于 task_runs.id（INTEGER）。PG 严格类型下字符串会 DataError。
         yield ExecEvent("system", "", {"run_id": run_seq["n"]})
@@ -240,7 +242,8 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
     orig_kill = runner.kill_run
     runner.kill_run = lambda run_id: None
 
-    async def hang_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
+    async def hang_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name="",
+                            resume_session_id="", committed_msg_id=0, queue_item_id=0):
         run_seq["n"] += 1
         # run_id = task_runs.id（INTEGER），与生产一致；PG 下字符串 run_id 会触发 DataError。
         yield ExecEvent("system", "", {"run_id": run_seq["n"]})
@@ -267,7 +270,8 @@ async def run_probe(paths: dict, keep: bool) -> Probe:
     hold = asyncio.Event()
     seen_system = asyncio.Event()
 
-    async def midflight_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
+    async def midflight_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name="",
+                            resume_session_id="", committed_msg_id=0, queue_item_id=0):
         run_seq["n"] += 1
         yield ExecEvent("system", "", {"run_id": run_seq["n"]})  # 首事件带 run_id → 触发提前回填
         seen_system.set()          # 通知主测：首事件已产出

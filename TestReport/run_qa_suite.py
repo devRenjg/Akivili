@@ -494,7 +494,8 @@ async def run_suite(paths: dict[str, Path], include_live: bool) -> QaState:
         original_execute = runner.execute_dispatch
 
         async def fake_execute_dispatch(task_obj, agent_obj, prompt,
-                                        persist_user_msg=True, user_name=""):
+                                        persist_user_msg=True, user_name="",
+                                        resume_session_id="", committed_msg_id=0, queue_item_id=0):
             start = time.perf_counter()
             await asyncio.sleep(0.02)
             slug = agent_obj["slug"]

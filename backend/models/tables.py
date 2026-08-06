@@ -336,3 +336,7 @@ class RunQueue(Base):
     task_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # agent-session-resume-minimal 阶段一：同一 queue item 跨 attempt 续跑的传递载体。见迁移 006。
+    # 第 N 次 attempt 起会话后把 session id + committed 水位写回这里，第 N+1 次 attempt 读它 → --resume。
+    cli_session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    session_committed_msg_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
