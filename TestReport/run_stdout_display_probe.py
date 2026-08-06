@@ -104,7 +104,7 @@ class FakeBackend:
     def __init__(self, stdout_text):
         self._text = stdout_text
 
-    async def run(self, ctx, on_pid=None):
+    async def run(self, ctx, on_pid=None, on_session=None):
         from executor.base import ExecEvent
         if on_pid:
             on_pid(0)
@@ -120,7 +120,7 @@ class FakeBackendWithJian:
         self._slug = slug
         self._body = body
 
-    async def run(self, ctx, on_pid=None):
+    async def run(self, ctx, on_pid=None, on_session=None):
         from executor.base import ExecEvent
         from routes import agent_cli
         if on_pid:
