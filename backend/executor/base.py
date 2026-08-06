@@ -40,14 +40,21 @@ class ExecContext:
     api_format: str = "openai"
     history: list = field(default_factory=list)  # [{role, content}] 会话历史回灌
     env_extra: dict = field(default_factory=dict)  # 注入子进程的额外环境变量（jian CLI 身份等）
+    # agent-session-resume-minimal 阶段一：命中已有会话时传入待 resume 的 CLI session id
+    # （claude=UUID / codex=thread_id）；为空则首建（claude 预分配新 UUID、codex 让 CLI 自生）。
+    cli_session_id: str = ""
 
 
 class ExecutorBackend:
     """执行后端接口。run() 是异步生成器，逐个 yield ExecEvent。
 
     on_pid: 可选回调，子进程启动后回传 PID（用于 kill）。
+    on_session: 可选回调，拿到 CLI 原生会话 id 后回传（用于 --resume 续跑）。
+        claude 执行前预分配 UUID 即回传；codex 从首轮 thread.started 事件抓 thread_id 后回传。
+        回调在主事件循环线程内调用（同 on_pid），签名 on_session(session_id: str)。
+        agent-session-resume-minimal 阶段一。
     """
-    async def run(self, ctx: ExecContext, on_pid=None):
+    async def run(self, ctx: ExecContext, on_pid=None, on_session=None):
         raise NotImplementedError
         yield  # pragma: no cover
 

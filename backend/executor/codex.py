@@ -17,7 +17,8 @@ from .base import ExecutorBackend, ExecContext, ExecEvent, build_cli_prompt, _St
 
 
 class CodexBackend(ExecutorBackend):
-    async def run(self, ctx: ExecContext, on_pid=None):
+    async def run(self, ctx: ExecContext, on_pid=None, on_session=None):
+        # on_session：S3 会在此从 thread.started 事件抓 thread_id 后回传；本步先接受参数不使用。
         exe = shutil.which("codex") or "codex"
         # codex exec 把 prompt 首段当作主任务，若把长系统提示放前面它会去复述人格而非执行。
         # 因此：本轮指令放最前（codex 优先执行），角色设定/历史作为背景附在后面。

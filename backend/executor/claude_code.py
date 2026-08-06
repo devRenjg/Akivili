@@ -14,18 +14,27 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import uuid
 
 from .base import ExecutorBackend, ExecContext, ExecEvent, build_cli_prompt, _StderrDrainer
 
 
 class ClaudeCodeBackend(ExecutorBackend):
-    async def run(self, ctx: ExecContext, on_pid=None):
+    async def run(self, ctx: ExecContext, on_pid=None, on_session=None):
         exe = shutil.which("claude") or "claude"
         cli_prompt = build_cli_prompt(ctx)
+        # agent-session-resume-minimal 阶段一：预分配会话 id。claude 支持 --session-id <uuid>
+        # 由我们指定（实测 CLI 回显同一 UUID，见 Papers/CLI-resume能力实测 2.1），故无需从输出解析。
+        # 命中已有 session 时改带 --resume（见 S2.4，本步只做首建预分配）。执行前即回传 on_session，
+        # 使 run 一启动 DB 就有 session 指针——被打断也能查到、可续跑（S1.3）。
+        session_id = ctx.cli_session_id or str(uuid.uuid4())
+        if on_session:
+            on_session(session_id)
         cmd = [
             exe, "-p",                       # prompt 走 stdin（不作为命令行参数）
             "--output-format", "stream-json",
             "--verbose",
+            "--session-id", session_id,
             "--add-dir", ctx.project_dir,
             "--permission-mode", "bypassPermissions",
             "--dangerously-skip-permissions",

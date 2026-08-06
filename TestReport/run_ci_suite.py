@@ -66,6 +66,7 @@ GATE = [
     "run_orphan_reclaim_probe.py",        # 启动孤儿回收（含 scope=queue 路径切分）
     "run_orphan_leak_probe.py",           # 孤儿泄漏兜底
     "run_kill_signal_probe.py",           # worker-split 组1：跨进程 kill 信号（D 类）
+    "run_session_capture_probe.py",       # session-resume S1.4：claude 预分配 session_id 捕获链路
     "run_reactivate_probe.py",            # 重派状态流转
     "run_task_gates_probe.py",            # 任务状态闸
     "run_subtask_autocomplete_probe.py",  # 子任务全完成→父推进

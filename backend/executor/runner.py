@@ -512,8 +512,18 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     def _on_pid(pid):
         register_pid(run_id, pid)
 
+    _session_backend = "claude" if provider and provider.type == "claude-cli" else (
+        "codex" if provider and provider.type == "codex-cli" else "")
+
+    def _on_session(sid: str):
+        # agent-session-resume-minimal S1.3：拿到 CLI 会话 id 即写库（run 开始即落、不等收尾，
+        # 保证被打断也能查到用于续跑）。回调在主 loop 线程内触发，用 create_task 异步写库。
+        if sid:
+            __import__("asyncio").create_task(
+                _record_session(run_id, sid, _session_backend, project_dir))
+
     try:
-        async for ev in backend.run(ctx, on_pid=_on_pid):
+        async for ev in backend.run(ctx, on_pid=_on_pid, on_session=_on_session):
             if ev.type == "text":
                 collected.append(ev.text)
                 await _log(run_id, "stdout", ev.text)
@@ -696,6 +706,21 @@ async def _save_assistant(conv_id: int, content: str, author_slug: str = "", run
         session.add(Message(conversation_id=conv_id, role="assistant", content=content,
                             author_slug=author_slug, run_id=run_id))
         await session.commit()
+
+
+async def _record_session(run_id: int, session_id: str, backend: str, workdir: str) -> None:
+    """agent-session-resume-minimal S1.3：把 CLI 会话指针写入 task_runs（run 开始即落）。
+    仅写 session 三件套（id/backend/workdir），不碰 status/水位——水位 committed 只在成功收尾推进（S2.2）。
+    容错：写库失败不得影响执行（session 复用是优化，落不了库最坏是下次 resume miss 降级全量）。"""
+    try:
+        async with get_session_factory()() as session:
+            await session.execute(
+                sa_update(TaskRun).where(TaskRun.id == run_id)
+                .values(cli_session_id=session_id, session_backend=backend,
+                        session_workdir=workdir))
+            await session.commit()
+    except Exception:  # noqa: BLE001 — session 落库失败不阻断执行
+        pass
 
 
 async def _finish_run(run_id: int, status: str):
