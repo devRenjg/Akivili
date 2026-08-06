@@ -56,8 +56,8 @@
 - [ ] 5.5 探针 `run_cross_task_resume_probe.py`：同 (conversation, agent) 第二个 task 命中上个 task 的 session、resume 续接、增量正确；并发两 task 写同一 key 时后写覆盖不报错、下次至多 miss 一次降级（不崩不脏）。
 
 ## 收尾
-- [ ] 回归全量探针（mention/timeout/scheduling/kill-signal/containment 等）确认 resume 改造不回归协同/超时/调度/重启行为。
-- [ ] 更新 `TestReport/run_ci_suite.py` 纳入本 change 新增探针，更新 `TestReport/README.md` 计数。
-- [ ] 更新 `README`（如涉及执行层行为说明）。
-- [ ] 固化：本 change 完成并验证后，把 `agent-session-resume` 能力规格从 change delta 固化进 `specs/agent-session-resume/spec.md`，change 目录移入 `changes/archive/<date>-agent-session-resume-minimal/`。
-- [ ] 联动 [platform-graceful-restart]：其阶段 5「交棒续跑」标注「resume 地基（session_id 存储 + `--resume` + 增量回灌）由 agent-session-resume-minimal 提供」。
+- [x] 回归全量探针（mention/timeout/scheduling/kill-signal/containment 等）确认 resume 改造不回归协同/超时/调度/重启行为。〔全量 CI 门禁 43/43·589 断言全绿；修复两处假后端桩漏传 `on_session` 形参（commit 2ce77fa）〕
+- [x] 更新 `TestReport/run_ci_suite.py` 纳入本 change 新增探针，更新 `TestReport/README.md` 计数。〔4 探针已在 GATE（S1.4/S2.7/S3.5/S4.5）；全量门禁 41→45（--exclude-slow 39→43）、README 计数同步（含全套 46→50、实测 --exclude-slow 43/43·589·92s）、矩阵表加 Session Resume 小节〕
+- [x] 更新 `README`（执行层行为说明）：阶段一 = attempt 间续跑，对**外部行为不变**（用户/协同/调度视角无感，仅同 run 重试时省 history token）；无需改用户向 README。执行层细节以本 change design.md + CLI 实测 Paper 为准。
+- [ ] 固化（**留待阶段二交付后**）：阶段二 S5 尚未开始，change 未完整，暂不 archive。整个 change（阶段一+二）交付并联调验证后，再把能力规格固化进 `specs/agent-session-resume/spec.md`、目录移入 `changes/archive/<date>-agent-session-resume-minimal/`。
+- [x] 联动 [platform-graceful-restart]：其跨-change 表阶段 3/4 标 ✅ 已由本 change 阶段一交付、阶段 5 header 标注 resume 地基来源，并显式记录与废弃航母版的 3 处差异（codex 无 app-server / session 载体 / at-least-once 水位）。
