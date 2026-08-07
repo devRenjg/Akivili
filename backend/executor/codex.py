@@ -211,6 +211,17 @@ def _parse_line(line: str) -> ExecEvent | None:
     if t == "error" or t == "turn.failed":
         msg = obj.get("message") or obj.get("error", {}).get("message", "")
         return ExecEvent("error", str(msg)[:300]) if msg else None
+    # 真实 token 用量：codex turn.completed 事件带 usage.{input_tokens/cached_input_tokens/
+    # output_tokens}（实测确认）。提取成 usage 事件供 runner 落库（token-drop 对比/成本观测）。
+    if t == "turn.completed":
+        u = obj.get("usage")
+        if isinstance(u, dict):
+            return ExecEvent("usage", meta={
+                "input_tokens": u.get("input_tokens") or 0,
+                "cached_input_tokens": u.get("cached_input_tokens") or 0,
+                "output_tokens": u.get("output_tokens") or 0,
+            })
+        return None
     # 兜底：宽松提取常见文本字段
     for key in ("text", "delta", "content", "message"):
         v = obj.get(key)

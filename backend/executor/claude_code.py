@@ -210,6 +210,21 @@ def _parse_line(line: str, tool_names: dict | None = None) -> list[ExecEvent]:
                         events.append(ExecEvent("tool_result", "", tool=name, tool_output=out))
     elif t == "result":
         events.append(ExecEvent("system", "执行完成"))
+        # 真实 token 用量：claude result 事件带 usage.{input_tokens/cache_creation_input_tokens/
+        # cache_read_input_tokens/output_tokens}（实测确认）。input_tokens 只是「非缓存新输入」，
+        # resume 省的历史重放大头在 cache_creation（首建把整段历史写进缓存）。故 input_tokens 记为
+        # **总输入 = input + cache_creation + cache_read**（可比指标：全量首建 >> resume 增量）；
+        # cached 单列记命中缓存的复用部分（cache_read）。供 runner 落库（token-drop 对比/成本观测）。
+        u = obj.get("usage")
+        if isinstance(u, dict):
+            _in = u.get("input_tokens") or 0
+            _cc = u.get("cache_creation_input_tokens") or 0
+            _cr = u.get("cache_read_input_tokens") or 0
+            events.append(ExecEvent("usage", meta={
+                "input_tokens": _in + _cc + _cr,   # 总输入（含缓存写/读），resume 省 token 的可比口径
+                "cached_input_tokens": _cr,        # 命中缓存复用部分
+                "output_tokens": u.get("output_tokens") or 0,
+            }))
     return events
 
 

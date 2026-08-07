@@ -563,6 +563,9 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     # S5.2：本 run 实际使用的 CLI 会话 id 的持有者，供成功收尾 upsert 到 agent_sessions（跨 task 缓存）。
     #   resume 命中 → 就是续接的那个 id；首建 → _on_session 回调把新 id 填进来。
     _session_used = {"id": resume_session_id if resume_hit else ""}
+    # 真实 token 用量持有者：CLI 流 usage 事件（claude result / codex turn.completed）末次值。
+    #   收尾落 task_runs 三列，供 resume 省 token 对比（全量 run vs resume run）与成本观测。
+    _usage_seen = {}
 
     def _on_session(sid: str):
         # S1.3：拿到 CLI 会话 id 即写库（run 开始即落、不等收尾，保证被打断也能查到用于续跑）。
@@ -590,6 +593,12 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
             elif ev.type == "error":
                 had_error = True
                 await _log(run_id, "stderr", ev.text)
+            elif ev.type == "usage":
+                # 真实 token 用量：取末次（claude/codex 都在 turn 末给本轮累计总量）。
+                #   不 yield 给下游 SSE（内部指标，避免污染前端事件流），仅落库。
+                if isinstance(ev.meta, dict):
+                    _usage_seen.update(ev.meta)
+                continue
             yield ev
     except (GeneratorExit, __import__("asyncio").CancelledError):
         # 🔴 生成器被中断/取消：客户端断连（event_stream 里 break→aclose）或 asyncio 任务被取消，
@@ -631,6 +640,10 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
         _RUN_CTX[run_id]["stream_text"] = final_text
     # run 的成败以此处 task_runs 落库为准（run_id 已有明确 status）。
     await _finish_run(run_id, status)
+    # 真实 token 用量落库（不分成败——失败 run 的用量同样值得记录）。仅捕获到 usage 时写；
+    #   容错吞异常不阻断。供 resume 省 token 对比（全量 run vs resume run）与长期成本可观测。
+    if _usage_seen:
+        await _record_usage(run_id, _usage_seen)
     # S2.2：仅成功收尾才把 committed 水位推进到本次快照终点，写回 run_queue（attempt 间传递）
     #   + task_runs（本 attempt 审计）。崩溃/kill/失败都不推进 → 下次 attempt 从同一起点重取增量
     #   → 重复但不漏（at-least-once）。session 复用是优化，水位写失败不阻断（容错吞异常）。
@@ -807,6 +820,22 @@ async def _advance_committed(run_id: int, queue_item_id: int, snapshot_end: int)
                     .values(session_committed_msg_id=snapshot_end))
             await session.commit()
     except Exception:  # noqa: BLE001 — 水位写失败不阻断执行
+        pass
+
+
+async def _record_usage(run_id: int, usage: dict) -> None:
+    """把本 run 的真实 token 用量写入 task_runs 三列（迁移 008）。claude=result /
+    codex=turn.completed 事件提取的 {input_tokens, cached_input_tokens, output_tokens}。
+    容错吞异常不阻断（token 落库是观测，写失败不影响 run 成败）。"""
+    try:
+        async with get_session_factory()() as session:
+            await session.execute(
+                sa_update(TaskRun).where(TaskRun.id == run_id)
+                .values(usage_input_tokens=int(usage.get("input_tokens") or 0),
+                        usage_cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+                        usage_output_tokens=int(usage.get("output_tokens") or 0)))
+            await session.commit()
+    except Exception:  # noqa: BLE001 — token 落库失败不阻断执行
         pass
 
 

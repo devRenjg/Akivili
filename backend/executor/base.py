@@ -8,14 +8,16 @@
 - system:系统提示（启动、结束原因等）
 - error: 错误
 - done:  结束（带最终文本）
+- usage: 本轮真实 token 用量（meta 承载 {input_tokens, cached_input_tokens, output_tokens}）；
+         claude=result 事件 / codex=turn.completed 事件提取。供 token 落库与 resume 省 token 对比。
 
 tool/tool_input/tool_output 用于「日志详情」还原每条命令与运行时详情；
-text/system/error 走 text 字段。所有字段可选，按 type 取用。
+text/system/error 走 text 字段；usage 走 meta 字段。所有字段可选，按 type 取用。
 """
 from dataclasses import dataclass, field
 from typing import Literal
 
-EventType = Literal["text", "thinking", "tool", "tool_result", "system", "error", "done"]
+EventType = Literal["text", "thinking", "tool", "tool_result", "system", "error", "done", "usage"]
 
 
 @dataclass
@@ -53,6 +55,9 @@ class ExecutorBackend:
         claude 执行前预分配 UUID 即回传；codex 从首轮 thread.started 事件抓 thread_id 后回传。
         回调在主事件循环线程内调用（同 on_pid），签名 on_session(session_id: str)。
         agent-session-resume-minimal 阶段一。
+    usage 用量不走回调：claude=result / codex=turn.completed 事件由 _parse_line 转成
+        `ExecEvent("usage", meta={...})` 随事件流 yield，runner 在 async for 循环里直接消费落库
+        （无需新增回调，避免所有后端/测试桩签名连锁改动）。
     """
     async def run(self, ctx: ExecContext, on_pid=None, on_session=None):
         raise NotImplementedError
