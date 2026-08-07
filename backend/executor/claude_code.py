@@ -210,6 +210,15 @@ def _parse_line(line: str, tool_names: dict | None = None) -> list[ExecEvent]:
                         events.append(ExecEvent("tool_result", "", tool=name, tool_output=out))
     elif t == "result":
         events.append(ExecEvent("system", "执行完成"))
+        # 真实 token 用量：claude result 事件带 usage.{input_tokens/cache_read_input_tokens/
+        # output_tokens}（实测确认）。提取成 usage 事件供 runner 落库（token-drop 对比/成本观测）。
+        u = obj.get("usage")
+        if isinstance(u, dict):
+            events.append(ExecEvent("usage", meta={
+                "input_tokens": u.get("input_tokens") or 0,
+                "cached_input_tokens": u.get("cache_read_input_tokens") or 0,
+                "output_tokens": u.get("output_tokens") or 0,
+            }))
     return events
 
 

@@ -38,8 +38,8 @@ from run_qa_suite import BACKEND, isolated_pg_db_url  # noqa: E402
 sys.path.insert(0, str(BACKEND))
 
 # 期望的基线业务表数量（models/tables.py 的 19 张，不含 alembic_version）。
-EXPECTED_TABLES = 19   # 005/006 加列不加表；007 加 agent_sessions 表，18→19
-HEAD_REV = "007"
+EXPECTED_TABLES = 19   # 005/006 加列不加表；007 加 agent_sessions 表，18→19；008 加列不加表
+HEAD_REV = "008"
 
 # 统计基线表数：public schema 下的 BASE TABLE，排除 alembic_version。
 _COUNT_SQL = (

@@ -273,6 +273,12 @@ class TaskRun(Base):
     session_backend: Mapped[str | None] = mapped_column(Text, nullable=True)
     session_workdir: Mapped[str | None] = mapped_column(Text, nullable=True)
     session_committed_msg_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 真实 token 用量（从 CLI 流 usage 事件提取，见迁移 008）。claude=result 事件 /
+    # codex=turn.completed 事件的 usage。供 Session Resume token-drop 对比（全量 vs resume run）
+    # 与长期成本可观测。NULL=该 run 未捕获到 usage（API 后端 / 老数据 / 未收尾）。
+    usage_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    usage_cached_input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    usage_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class RunLog(Base):
