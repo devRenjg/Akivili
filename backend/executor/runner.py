@@ -9,8 +9,8 @@ import signal
 from sqlalchemy import func, select, update as sa_update
 
 from config import load_settings
-from models import (get_session_factory, now_expr,
-                    Activity, AgentSkill, Message, RunLog, RunQueue, Skill, TaskRun)
+from models import (get_session_factory, now_expr, upsert,
+                    Activity, AgentSession, AgentSkill, Message, RunLog, RunQueue, Skill, TaskRun)
 from memory import read_memory, append_memory, select_relevant_knowhow, _managed_body
 from executor.base import ExecContext
 from executor.claude_code import ClaudeCodeBackend
@@ -453,8 +453,23 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     # 且本 backend 是支持 resume 的 CLI（claude/codex，非 api）。命中则 history 只取增量、
     # 命令带 --resume；否则全量首建（现状）。backend/workdir 一致性由 S4 降级链兜底（miss→全量）。
     _cli_backend = provider is not None and provider.type in ("claude-cli", "codex-cli")
+    # S5.3：两段 session 查找（design.md 抉择三）。传入的 resume_session_id 来自 run_queue
+    #   （阶段一：同 run/attempt 续跑，连续性最强）。若为空且是 CLI backend → 查 agent_sessions
+    #   缓存该 (conversation, agent) 上个 task 留下的会话（阶段二：跨 task 续接）。都没有走全量首建。
+    #   三级递降，每级 miss 平滑降到下一级，最终降到现状不劣化。session_source 供日志/探针观测。
+    session_source = "run" if resume_session_id else ""
+    if not resume_session_id and _cli_backend:
+        cached = await _lookup_agent_session(conv_id, slug)
+        if cached and cached.get("cli_session_id"):
+            resume_session_id = cached["cli_session_id"]
+            committed_msg_id = cached.get("session_committed_msg_id") or 0
+            session_source = "cross_task"
+    # agent-session-resume-minimal S2.1：resume 命中判定——存了 session_id（本 run 或跨 task 缓存）、
+    # 且本 backend 是支持 resume 的 CLI（claude/codex，非 api）。命中则 history 只取增量、
+    # 命令带 --resume；否则全量首建（现状）。backend/workdir 一致性由 S4 降级链兜底（miss→全量）。
     resume_hit = bool(resume_session_id) and _cli_backend
     # S3.4：codex 额外校验 rollout 在位——不在则降级全量（对标 Multica gateCodexResumeToRolloutPresence）。
+    #   跨 task 续接同样校验：缓存里的 thread_id 若 rollout 已被清理 → 降级全量。
     if resume_hit and provider.type == "codex-cli":
         from executor.codex import codex_rollout_present
         if not codex_rollout_present(resume_session_id):
@@ -545,12 +560,16 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
 
     _session_backend = "claude" if provider and provider.type == "claude-cli" else (
         "codex" if provider and provider.type == "codex-cli" else "")
+    # S5.2：本 run 实际使用的 CLI 会话 id 的持有者，供成功收尾 upsert 到 agent_sessions（跨 task 缓存）。
+    #   resume 命中 → 就是续接的那个 id；首建 → _on_session 回调把新 id 填进来。
+    _session_used = {"id": resume_session_id if resume_hit else ""}
 
     def _on_session(sid: str):
         # S1.3：拿到 CLI 会话 id 即写库（run 开始即落、不等收尾，保证被打断也能查到用于续跑）。
         # S2.6：同时写 run_queue.cli_session_id（attempt 间传递载体，下次 attempt 读它 resume）。
         # 回调在主 loop 线程内触发，用 create_task 异步写库。
         if sid:
+            _session_used["id"] = sid
             __import__("asyncio").create_task(
                 _record_session(run_id, sid, _session_backend, project_dir, queue_item_id))
 
@@ -617,6 +636,13 @@ async def execute_dispatch(task: dict, agent: dict, prompt: str,
     #   → 重复但不漏（at-least-once）。session 复用是优化，水位写失败不阻断（容错吞异常）。
     if status == "succeeded":
         await _advance_committed(run_id, queue_item_id, snapshot_end)
+        # S5.2：成功收尾把会话指针 + committed 水位 upsert 到 agent_sessions（跨 task 缓存）。
+        #   best-effort：仅 CLI backend 且本 run 确有会话 id 时写；后写覆盖、不加锁不校验 owner。
+        #   并发写互盖最坏 miss 一次 → 降级全量（S4），无数据损坏。写失败不阻断（容错吞异常）。
+        if _cli_backend and _session_used["id"]:
+            await _upsert_agent_session(
+                conv_id, slug, _session_used["id"], snapshot_end,
+                provider.id if provider else "", _session_backend, project_dir)
     # 🔴 pid 清理必须在善后 try 之前、无条件执行：进程此刻已退出，注册表须立即清掉，
     #   否则一旦下面 _persist_memory 抛异常被 except 吞掉，陈旧 pid 就残留在 _RUN_PIDS，
     #   日后 kill_run 会拿被 OS 复用的同号 pid 去 taskkill /F /T 误杀无辜进程（task140 事故根因）。
@@ -781,6 +807,50 @@ async def _advance_committed(run_id: int, queue_item_id: int, snapshot_end: int)
                     .values(session_committed_msg_id=snapshot_end))
             await session.commit()
     except Exception:  # noqa: BLE001 — 水位写失败不阻断执行
+        pass
+
+
+async def _lookup_agent_session(conv_id: int, slug: str) -> dict | None:
+    """S5.3：查 agent_sessions 缓存的 (conversation, agent) 上次会话指针 + committed 水位
+    （跨 task 续接来源）。查不到/出错返回 None → 上游走全量首建。查询失败不阻断执行。"""
+    try:
+        async with get_session_factory()() as session:
+            row = (await session.execute(
+                select(AgentSession.cli_session_id, AgentSession.session_committed_msg_id)
+                .where(AgentSession.conversation_id == conv_id,
+                       AgentSession.agent_slug == slug))).first()
+            if row is None:
+                return None
+            return {"cli_session_id": row.cli_session_id,
+                    "session_committed_msg_id": row.session_committed_msg_id}
+    except Exception:  # noqa: BLE001 — 缓存查询失败降级全量，不阻断执行
+        return None
+
+
+async def _upsert_agent_session(conv_id: int, slug: str, session_id: str, committed: int,
+                                provider_id: str, backend: str, workdir: str) -> None:
+    """S5.2：成功收尾把会话指针 + committed 水位 upsert 到 agent_sessions（跨 task 缓存）。
+    ON CONFLICT (conversation_id, agent_slug) DO UPDATE——后写覆盖，不加锁不校验 owner
+    （best-effort，design.md 抉择二）。updated_at 用 now_expr() 刷新。写失败不阻断执行。"""
+    try:
+        async with get_session_factory()() as session:
+            await session.execute(upsert(
+                AgentSession,
+                index_elements=["conversation_id", "agent_slug"],
+                insert_values={
+                    "conversation_id": conv_id, "agent_slug": slug,
+                    "cli_session_id": session_id, "session_committed_msg_id": committed,
+                    "provider_id": provider_id, "backend": backend, "workdir": workdir,
+                    "updated_at": now_expr(),
+                },
+                update_values={
+                    "cli_session_id": session_id, "session_committed_msg_id": committed,
+                    "provider_id": provider_id, "backend": backend, "workdir": workdir,
+                    "updated_at": now_expr(),
+                },
+            ))
+            await session.commit()
+    except Exception:  # noqa: BLE001 — 缓存 upsert 失败不阻断执行（复用是优化非正确性）
         pass
 
 
