@@ -30,7 +30,7 @@ except Exception:
 HERE = Path(__file__).resolve().parent
 BACKEND = HERE.parent / "backend"
 
-# —— 门禁清单：45 项（44 隔离 probe + QA 主套件）；--exclude-slow 跳过 2 个 SLOW 后跑 43 项。
+# —— 门禁清单：46 项（45 隔离 probe + QA 主套件）；--exclude-slow 跳过 2 个 SLOW 后跑 44 项。
 #    注释标注覆盖域，与 TestReport/README.md 对齐。——
 # worker-split-minimal 组1：+run_kill_signal_probe（跨进程 kill 信号 D 类）。39→40。
 # worker-split-minimal 组2：+run_containment_probe（进程树 containment）。40→41。
@@ -38,6 +38,7 @@ BACKEND = HERE.parent / "backend"
 #                    退役 run_orm_engine_probe（测 PRAGMA/busy_timeout，PG 无对应物）。净 40→39。
 # session-resume-minimal 阶段一：+4 探针（S1.4 session 捕获 / S2.7 claude resume+增量 /
 #                    S3.5 codex resume+rollout / S4.5 降级链）。41→45（--exclude-slow：39→43）。
+# session-resume-minimal 阶段二：+1 探针（S5.5 跨 task 续接）。45→46（--exclude-slow：43→44）。
 # 排除（真实 CLI，非隔离桩）：run_collab_scenario.py / run_codex_cli_smoke.py
 GATE = [
     # 主套件
@@ -73,6 +74,7 @@ GATE = [
     "run_claude_resume_incremental_probe.py",  # session-resume S2.7：claude resume 命令分支 + 增量回灌 SQL
     "run_codex_resume_incremental_probe.py",    # session-resume S3.5：codex exec resume + thread_id 抓取 + rollout 校验
     "run_session_fallback_probe.py",             # session-resume S4.5：降级链（resume_miss/poisoned 丢 session + 各降级入口）
+    "run_cross_task_resume_probe.py",            # session-resume S5.5：跨 task 续接（agent_sessions upsert/lookup/两段查找/best-effort 并发）
     "run_reactivate_probe.py",            # 重派状态流转
     "run_task_gates_probe.py",            # 任务状态闸
     "run_subtask_autocomplete_probe.py",  # 子任务全完成→父推进

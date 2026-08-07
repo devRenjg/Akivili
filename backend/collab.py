@@ -12,7 +12,7 @@ import re
 from sqlalchemy import case, func, select, text, update as sa_update
 
 from models import (get_session_factory, now_expr, now_offset, elapsed_seconds,
-                    Activity, AgentProfile, AgentSkill, Message, Project,
+                    Activity, AgentProfile, AgentSession, AgentSkill, Message, Project,
                     ProjectAgent, RunEvent, RunLog, RunQueue, Skill, Task, TaskRun)
 
 # tasks / project_agents 物理列序（_load_task_agent 的 SELECT t.* / SELECT * 用，保持 dict 契约）
@@ -819,10 +819,21 @@ async def _run_one(item: dict) -> None:
     if run_status == "failed" and rid:
         drop_reason = _should_drop_session(had_error.get("text", ""))
         if drop_reason:
+            _conv_id = task.get("conversation_id")
             async with get_session_factory()() as session:
                 await session.execute(
                     sa_update(RunQueue).where(RunQueue.id == item.get("id"))
                     .values(cli_session_id=None, session_committed_msg_id=None))
+                # S5.4：跨 task 缓存同步失效——本 run 可能用的是 agent_sessions 缓存的会话
+                #   （S5.3），只清 run_queue 不够：下个 task 会再查缓存命中同一坏会话。故同时清
+                #   agent_sessions 里 (conversation, agent) 的缓存行，逼下次全量重建。best-effort
+                #   缓存，清掉只是下次少省 token，不影响正确性。
+                if _conv_id:
+                    await session.execute(
+                        sa_update(AgentSession).where(
+                            AgentSession.conversation_id == _conv_id,
+                            AgentSession.agent_slug == slug)
+                        .values(cli_session_id=None, session_committed_msg_id=None))
                 await session.commit()
             try:
                 from activity import log_activity
