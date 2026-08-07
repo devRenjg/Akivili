@@ -61,7 +61,7 @@ def _fake_dispatch_error(error_text: str):
     from executor.base import ExecEvent
     from database import get_connection
 
-    async def _gen(task, agent, prompt, persist_user_msg=True):
+    async def _gen(task, agent, prompt, persist_user_msg=True, user_name="", resume_session_id="", committed_msg_id=0, queue_item_id=0):
         db = await get_connection()
         try:
             cur = await db.execute(

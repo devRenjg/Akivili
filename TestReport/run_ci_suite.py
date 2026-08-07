@@ -30,11 +30,14 @@ except Exception:
 HERE = Path(__file__).resolve().parent
 BACKEND = HERE.parent / "backend"
 
-# —— 门禁清单：41 项（40 隔离 probe + QA 主套件）。注释标注覆盖域，与 TestReport/README.md 对齐。——
+# —— 门禁清单：45 项（44 隔离 probe + QA 主套件）；--exclude-slow 跳过 2 个 SLOW 后跑 43 项。
+#    注释标注覆盖域，与 TestReport/README.md 对齐。——
 # worker-split-minimal 组1：+run_kill_signal_probe（跨进程 kill 信号 D 类）。39→40。
 # worker-split-minimal 组2：+run_containment_probe（进程树 containment）。40→41。
 # S5 全仓零 sqlite：退役 run_wal_concurrency_probe（WAL 语义随 sqlite 消亡）→ 补 run_pg_concurrency_probe；
 #                    退役 run_orm_engine_probe（测 PRAGMA/busy_timeout，PG 无对应物）。净 40→39。
+# session-resume-minimal 阶段一：+4 探针（S1.4 session 捕获 / S2.7 claude resume+增量 /
+#                    S3.5 codex resume+rollout / S4.5 降级链）。41→45（--exclude-slow：39→43）。
 # 排除（真实 CLI，非隔离桩）：run_collab_scenario.py / run_codex_cli_smoke.py
 GATE = [
     # 主套件
@@ -66,6 +69,10 @@ GATE = [
     "run_orphan_reclaim_probe.py",        # 启动孤儿回收（含 scope=queue 路径切分）
     "run_orphan_leak_probe.py",           # 孤儿泄漏兜底
     "run_kill_signal_probe.py",           # worker-split 组1：跨进程 kill 信号（D 类）
+    "run_session_capture_probe.py",       # session-resume S1.4：claude 预分配 session_id 捕获链路
+    "run_claude_resume_incremental_probe.py",  # session-resume S2.7：claude resume 命令分支 + 增量回灌 SQL
+    "run_codex_resume_incremental_probe.py",    # session-resume S3.5：codex exec resume + thread_id 抓取 + rollout 校验
+    "run_session_fallback_probe.py",             # session-resume S4.5：降级链（resume_miss/poisoned 丢 session + 各降级入口）
     "run_reactivate_probe.py",            # 重派状态流转
     "run_task_gates_probe.py",            # 任务状态闸
     "run_subtask_autocomplete_probe.py",  # 子任务全完成→父推进

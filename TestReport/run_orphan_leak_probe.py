@@ -136,7 +136,7 @@ async def scenario(p: Probe) -> None:
     from executor import base as _base
 
     class _HangingBackend:
-        async def run(self, ctx, on_pid=None):
+        async def run(self, ctx, on_pid=None, on_session=None):
             # 先吐一个事件，再无限挂起（等外部 aclose 抛 GeneratorExit）
             yield _base.ExecEvent("text", "working...")
             while True:

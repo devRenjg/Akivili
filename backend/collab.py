@@ -28,6 +28,8 @@ _PA_COLS = (
 _RQ_COLS = (
     "id", "task_id", "agent_slug", "trigger", "is_leader", "prompt", "status",
     "created_at", "attempts", "next_retry_at", "task_run_id", "source_run_id", "source_message_id",
+    # agent-session-resume-minimal 阶段一：attempt 间续跑传递载体（迁移 006）
+    "cli_session_id", "session_committed_msg_id",
 )
 
 # 单任务累计 run 总量闸（绝对失控的最后兜底）。start_loop 时从 Settings 覆盖，见 _apply_settings。
@@ -46,6 +48,37 @@ _RATE_LIMIT_RE = re.compile(
 def _is_rate_limit_error(text: str) -> bool:
     """错误文本是否为上游限流/429 信号（保守匹配 CLI/LLM 常见措辞）。"""
     return bool(text) and bool(_RATE_LIMIT_RE.search(text))
+
+
+# agent-session-resume-minimal S4.2：resume 未落地信号——CLI 报"找不到会话"，说明存的
+# session_id 已失效（会话记录丢失/config dir 变更/rollout 缺失）。命中 → 清 session、下次全量重建。
+_RESUME_MISS_RE = re.compile(
+    r"no\s+conversation\s+found|session\s+not\s+found|no\s+such\s+session|"
+    r"thread\s+not\s+found|unknown\s+(?:session|thread)|resume.*fail|"
+    r"could\s+not\s+(?:find|resume)|rollout.*(?:not|missing)",
+    re.IGNORECASE)
+
+# S4.3：poisoned 失败——这些坏状态 resume 回去只会立刻再爆一次（对标 Multica resume-unsafe 清单
+# taskfailure/failure.go + poisoned.go，减法 Paper D3）。命中 → 主动丢 session、下次从头重建。
+_POISONED_RE = re.compile(
+    r"iteration\s+limit|max.*iterations|"                       # 迭代上限
+    r"invalid_request_error|\b400\b.*invalid|"                  # 模型 400 无效请求
+    r"context.*(?:overflow|length|window|exceed)|"             # 上下文溢出
+    r"too\s+long|maximum\s+context|"
+    r"semantic\s+inactivity",                                   # codex 语义静默
+    re.IGNORECASE)
+
+
+def _should_drop_session(text: str) -> str:
+    """判定是否应丢弃 prior session（S4.2/4.3）。返回归因：'resume_miss'|'poisoned'|''。
+    命中 → 清 run_queue.cli_session_id，使下次 attempt 走全量重建，不 resume 失效/中毒会话。"""
+    if not text:
+        return ""
+    if _RESUME_MISS_RE.search(text):
+        return "resume_miss"
+    if _POISONED_RE.search(text):
+        return "poisoned"
+    return ""
 
 # —— 执行超时策略（A 静默超时 + B 保成果 + 硬墙钟兜底）——
 #
@@ -663,7 +696,13 @@ async def _run_one(item: dict) -> None:
         start = _time.monotonic()
         produced_since_wall = False   # 本个硬墙钟周期内是否有产出（活性标志）
         extensions = 0
-        agen = runner.execute_dispatch(task, agent, prompt, persist_user_msg=False)
+        # S2.1：把本 queue item 上次 attempt 存的 session 指针 + committed 水位传入，
+        # execute_dispatch 命中则走 --resume + 增量回灌；首次 attempt 这俩为空 → 全量首建。
+        agen = runner.execute_dispatch(
+            task, agent, prompt, persist_user_msg=False,
+            resume_session_id=item.get("cli_session_id") or "",
+            committed_msg_id=int(item.get("session_committed_msg_id") or 0),
+            queue_item_id=item.get("id") or 0)
         try:
             while True:
                 if _time.monotonic() - start > hard:
@@ -772,6 +811,25 @@ async def _run_one(item: dict) -> None:
             await session.execute(
                 sa_update(TaskRun).where(TaskRun.id == rid).values(fail_reason=fail_reason))
             await session.commit()
+
+    # S4.2/4.3 降级链：失败且命中「应丢 session」条件（resume 未落地 / poisoned 中毒会话）→
+    # 清本 queue item 的 session 指针 + committed 水位，使下次 attempt 走全量重建、不 resume 坏会话。
+    # 清空水位=下次全量回灌（committed 归 0 → 增量退化为全量）。session 复用是优化，丢弃只影响下次
+    # 少省 token，不影响正确性；不丢反而会让下次 attempt 反复 resume 失效/中毒会话。
+    if run_status == "failed" and rid:
+        drop_reason = _should_drop_session(had_error.get("text", ""))
+        if drop_reason:
+            async with get_session_factory()() as session:
+                await session.execute(
+                    sa_update(RunQueue).where(RunQueue.id == item.get("id"))
+                    .values(cli_session_id=None, session_committed_msg_id=None))
+                await session.commit()
+            try:
+                from activity import log_activity
+                await log_activity(item["task_id"], "commented", "system", "",
+                                   {"note": f"🔄 已丢弃 {slug} 的 CLI 会话（{drop_reason}），下次从头重建上下文。"})
+            except Exception:  # noqa: BLE001
+                pass
 
     # 解析该成员发言里的 @，继续协同（因果链：这些下游 run 由本 run 的发言触发）
     if final_text:

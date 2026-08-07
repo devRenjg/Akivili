@@ -32,7 +32,7 @@ PYTHONUTF8=1 py -3.12 ../TestReport/run_qa_suite.py
 ### CI 门禁（一键全量）
 
 ```bash
-# 跑全部 41 项门禁（40 隔离 probe + QA 主套件），任一失败即非零退出
+# 跑全部 45 项门禁（44 隔离 probe + QA 主套件；--exclude-slow 跳 2 个 SLOW 跑 43），任一失败即非零退出
 python TestReport/run_ci_suite.py
 python TestReport/run_ci_suite.py --list          # 只列清单不跑
 python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
@@ -48,7 +48,7 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
   > 问题 runner-images#13040，若启动失败按日志调整服务发现/PGDATA 定位）。
 - probe 清单只在 `run_ci_suite.py` 的 `GATE` 里维护一处——新增 probe 时同步加入。
 - 门禁**不含**需真实 CLI 的 `run_collab_scenario.py` / `run_codex_cli_smoke.py`（人工按需单跑）。
-- 实测：**41/41 项、604 断言、~103s 全绿**（跑在 PostgreSQL 单引擎；worker-split-minimal 组1 +kill_signal、组2 +containment 探针）。
+- 实测：**`--exclude-slow` 43/43 项、589 断言、~92s 全绿**（全量门禁 45 项，另含 2 个 SLOW：concurrency/pg_concurrency）。跑在 PostgreSQL 单引擎；worker-split-minimal 组1 +kill_signal、组2 +containment；session-resume-minimal 阶段一 +4 探针。
 
 ## 全套测试 vs CI 门禁
 
@@ -56,9 +56,9 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 干净环境自动复现、被挑进 CI 每次自动跑的那批。
 
 ```
-全套 46 个 run_*.py
-├── run_ci_suite.py            ← 不是测试，是「调度器」(按 GATE 清单跑其余 41 个、收退出码)
-├── 41 个 → 进 CI 门禁 ✅       (40 隔离 probe + run_qa_suite 主套件)
+全套 50 个 run_*.py
+├── run_ci_suite.py            ← 不是测试，是「调度器」(按 GATE 清单跑其余 45 个、收退出码)
+├── 45 个 → 进 CI 门禁 ✅       (44 隔离 probe + run_qa_suite 主套件；含 2 SLOW)
 └── 4 个 → 不进门禁 ❌
       ├── run_collab_scenario.py   (需真实 claude/codex CLI + LLM)
       ├── run_codex_cli_smoke.py   (需真实 Codex CLI)
@@ -66,16 +66,16 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
       └── run_pg_sqlite_consistency_probe.py  (需真实 PostgreSQL；数据底座 S4.5，一次性迁移一致性核验)
 ```
 
-|  | 全套测试集合 | CI 41 门禁 |
+|  | 全套测试集合 | CI 45 门禁 |
 |---|---|---|
-| **范围** | 所有 `run_*.py`（46 个） | 其中挑进 `GATE` 的 41 个 |
+| **范围** | 所有 `run_*.py`（50 个） | 其中挑进 `GATE` 的 45 个 |
 | **触发** | 人工挑着单跑 / 本地 `run_ci_suite` 一键 | GitHub 每次 push/PR **自动** |
 | **含真实外部依赖测试** | 含（4 个：2 CLI + 2 PG 专项） | 全部需 PG（S5 起门禁探针跑在 PostgreSQL 单引擎） |
 | **保障对象** | 逻辑正确 + 与真实外部世界的集成 | 逻辑正确（鉴权/CRUD/ORM 等价/调度/回收…） |
 
 **为什么分两层**（S5 起分界在「是否确定性可自动跑」——需真实 CLI/LLM 或一次性核验的留人工）：
 
-- **进门禁**的 39 个：确定性桩测试，不接真实 CLI/LLM。S5 全仓零 sqlite 后，这批统一跑在
+- **进门禁**的 44 个：确定性桩测试，不接真实 CLI/LLM。S5 全仓零 sqlite 后，这批统一跑在
   **PostgreSQL 单引擎**上（每个探针用 `isolated_pg_db_url()` 建独立隔离库，跑完 atexit 删库），
   无 sqlite 回退。改一行代码撞坏 → 门禁立刻红。
 - **留门禁外**的 4 个：2 个要真启动 claude/codex CLI、真调 LLM（依赖网络/凭证/CLI 安装，
@@ -88,12 +88,12 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 > **GitHub Actions PG 收口（S5 Phase 3，已改 workflow）**：门禁探针全量依赖 PG。因保 Windows
 > 开发环境一致（`services:` 容器仅 Linux runner 支持），`ci.yml` 改为在 `windows-latest` 上启动
 > runner **预装的 PostgreSQL**：`Start-Service postgresql*` + 改 pg_hba 本地 trust + 建 akivili
-> 超级用户/库 + 隔离库建删自检，再跑 39 门禁。**尚待首次真实 Actions 运行验证**（本地对 PG 容器已 39/39；
+> 超级用户/库 + 隔离库建删自检，再跑 45 门禁。**尚待首次真实 Actions 运行验证**（本地 `--exclude-slow` 对 PG 已 43/43；
 > 预装 PG 在 windows-2025 有已知启动问题 runner-images#13040，首跑看日志确认 provisioning 步骤跑通）。
 
 ## 测试矩阵
 
-> 门禁实测通过数截至 2026-07-24（S5 全仓零 sqlite，39/39 跑在 PG）；部分业务探针计数为历史值。`*` = 需真实 CLI 供应商或一次性核验，非门禁隔离桩。
+> 门禁实测通过数截至 2026-07-24（session-resume-minimal 阶段一，`--exclude-slow` 43/43 跑在 PG；全量门禁 45）；部分业务探针计数为历史值。`*` = 需真实 CLI 供应商或一次性核验，非门禁隔离桩。
 
 ### 端到端主套件
 | 脚本 | 实测 | 覆盖 |
@@ -136,6 +136,14 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 | `run_orphan_leak_probe.py` | 11/11 | 运行期孤儿泄漏防线（run#183/#185 泄漏事故）：`_finalize_if_running` 只在仍 running 时落终态（幂等，绝不覆盖 succeeded/killed）、execute_dispatch 生成器被中断兜底（客户端断连 aclose→抛 GeneratorExit 时补落终态再传播，不留 running 孤儿 + 清 pid）、运行期巡检 `sweep_orphan_task_runs`（扫 running 且最后日志静默超阈值的孤儿主动回收：未收尾任务→killed、已 done/reviewing→succeeded 保成果、新鲜在跑的不误杀、重复巡检幂等） |
 | `run_stdout_display_probe.py` | 8/8 | CLI stdout 不落会话正文但进日志、无 jian 打标记、API 后端照落 |
 | `run_pipe_deadlock_probe.py` | 5/5 | CLI 双管道死锁防护（run#243 事故根因）：`_StderrDrainer` 并发抽干 stderr——真实子进程狂写 stderr(~200KB 撑爆管道缓冲)+ 吐 stdout 时，用 drainer 后 stdout 完整读到/stderr 完整抽干/进程正常退出全程不挂起；对照组「读完 stdout 才读 stderr」在同负载下如期死锁（超时未完成，反证 bug 真实） |
+
+### Session Resume（阶段一：同 run/attempt 间续跑）
+| 脚本 | 实测 | 覆盖 |
+|---|---|---|
+| `run_session_capture_probe.py` | S1.4：claude 预分配 UUID 经 `on_session` 回传落 `task_runs.cli_session_id`/backend/workdir（run 开始即落、不等收尾）、自生成与预分配两用例回传值==命令注入值 |
+| `run_claude_resume_incremental_probe.py` | S2.7：claude 命令分支（首建 `--session-id` / 续跑 `--resume` 互斥）+ 增量回灌 SQL（含队友+用户发言、排除本 agent 自产、按 committed 水位与 snapshot_end 圈定窗口） |
+| `run_codex_resume_incremental_probe.py` | S3.5：codex 命令分支（首建 `exec --json` / 续跑 `exec resume` 无 `--cd`、id 在 OPTIONS 后）+ `thread.started` 抓 thread_id + rollout 在位校验缺失→降级 |
+| `run_session_fallback_probe.py` | S4.5：降级链——`_should_drop_session` 分类（resume_miss / poisoned / 限流不丢）、`resume_hit` 各降级入口（无 session / 非 CLI 后端 / codex rollout 缺）、丢 session 清 `run_queue` 两列的 DB 效果 |
 
 ### 能力包 / Skills
 | 脚本 | 实测 | 覆盖 |

@@ -9,8 +9,8 @@
 | **0** | 本 change | 补 durable execution 状态机 + 7 不变量 + 修正 3 处事实错误 | — | `--strict` + Review 认可 |
 | **1** | 本 change | DB 协议地基：备份/索引、统一入队、两段式 dispatch、原子 claim(CAS)、触发合并、task_run↔queue 关联、统一 finish_execution 收尾事务 | 0 | `atomic_claim_probe`/`sse_tail_probe`/`dispatch_idempotency_probe`/`trigger_coalesce_probe`/`combined_finish_transaction_probe` |
 | **2** | 本 change | Worker 剥离 + supervisor/heartbeat + generation + 进程 containment + kill request/ack | 1 | `worker_split_probe`/`worker_containment_probe`/`kill_ack_probe` |
-| **3** | [agent-session-resume] | Claude resume（建表/pin/水位/降级/poisoned） | 1 | ASR S1-S3 探针 |
-| **4** | [agent-session-resume] | Codex app-server（每 run 一进程/thread resume） | 1 | ASR S4 探针 |
+| **3** | ✅ [agent-session-resume-minimal] 阶段一已交付 | Claude resume（预分配 session_id/`--resume`/增量水位/降级/poisoned） | 1 | ASR-minimal S1.4/S2.7 探针（已并入门禁） |
+| **4** | ✅ [agent-session-resume-minimal] 阶段一已交付 | Codex resume（`exec resume` 轻路径 + thread_id 抓取 + rollout 校验；**非 app-server**，废弃版 S4 已作废） | 1 | ASR-minimal S3.5 探针（已并入门禁） |
 | **5** | 本 change | 交棒 + 有界恢复：generation/claim barrier/defer 5min/CAS supersede+child 同事务/bounded recovery/fencing/launch 围栏 | 3·4·2 | `worker_handover_probe`/`recovery_budget_probe`/`fencing_probe`/`launch_epoch_barrier_probe` |
 | **6** | 本 change | Nginx 蓝绿 + SSE 主动轮换 + expand/contract | 2 | 手动压测 + `blue_green_probe` |
 
@@ -93,12 +93,17 @@
 - [ ] 2.8 更新启动脚本/文档：分别拉起 API 与 Worker + supervisor
 - [ ] 2.9 回归全量探针在「API+Worker 双进程」下通过
 
-## 阶段 3/4 — resume（归 [agent-session-resume]，本 change 只依赖其产出）
-- [ ] 3.x Claude resume（ASR S1-S3）：`agent_sessions` 表 + 流中 pin + committed/planned 水位 + `--resume` + mismatch/失败降级 + poisoned 分类
-- [ ] 4.x Codex app-server（ASR S4）：每 run 一个 `codex app-server --listen stdio://` + `thread/resume`→`thread/start` + threadId pin + rollout/workdir 检查 + transport fail-fast
-- [ ] 依赖对接：阶段 5 前确认 ASR 已产出可用 `session_id`（含流中途 pin，供中断续跑）
+## 阶段 3/4 — resume（✅ 由 [agent-session-resume-minimal] 阶段一交付，本 change 只依赖其产出）
+> **实际交付 = minimal 版，非本表原引用的废弃航母版 [agent-session-resume]。** 关键差异，阶段 5 实施前务必对齐：
+> - **codex 不走 app-server**：minimal 用 `codex exec resume <flags> <thread_id> -`（OPTIONS 前置、去 `--cd`、cwd 由 session 自恢复），废弃版的「每 run 一个 `codex app-server --listen stdio://`」已作废（实测两线均走轻路径，见 `Papers/CLI-resume能力实测-claude与codex.md`）。
+> - **session_id 载体**：阶段一是「同 run/attempt 间续跑」，session_id 存 `task_runs.cli_session_id` + `run_queue.cli_session_id`（attempt 间传递）；跨 task 的 `agent_sessions` 缓存表属 minimal **阶段二**（尚未交付），阶段 5 交棒若需跨 task 续接须确认阶段二就绪。
+> - **水位语义**：committed 水位仅成功推进、at-least-once 增量回灌（崩溃→重复不漏），无 planned 水位。
+- [x] 3.x Claude resume：预分配 UUID→`--session-id` 首建 / `--resume` 续跑 + committed 增量水位 + resume_miss/poisoned 降级（ASR-minimal S1/S2/S4）
+- [x] 4.x Codex resume：`exec resume` 轻路径 + `thread.started` 抓 thread_id + rollout 在位校验 + 缺失降级全量（ASR-minimal S3）
+- [ ] 依赖对接：阶段 5 前确认 minimal 已产出可用 `session_id`（run 开始即 pin，供中断续跑）；**跨 task 续接需 minimal 阶段二 `agent_sessions` 就绪**
 
 ## 阶段 5 — 交棒 + 有界恢复（改执行层：能等则零中断，超时 resume 续跑）
+> **resume 地基（session_id 存储 + `--resume`/`exec resume` + 增量回灌 + 降级链）由 [agent-session-resume-minimal] 阶段一提供，已并入 CI 门禁。** 5.4 的「resume 路径起 CLI」直接复用其 `execute_dispatch(resume_session_id=...)` 入口；同 run/attempt 续跑无需额外建表，跨 task 续接依赖 minimal 阶段二。
 - [ ] 5.1 **温和重启 defer 窗口**：重启意图→停领新活→轮询 `activeTasks`,全部收尾即零中断;等待上限 **5 分钟**（参数化）内未清零才转交棒
 - [ ] 5.2 **generation + claim barrier（Review P0-D/P1-1/P1-6）**：`worker_state` 单行表(current_generation/**owner_instance_id**/state/heartbeat_at/**lease_expires_at**/**protocol_version**)+`task_runs.worker_generation`+`task_runs.worker_instance_id`;两类接管——① 优雅交棒 3 态 `running→draining→done`（有 ack）② **硬崩溃 lease 过期 CAS 抢占**（`WHERE current_generation=g AND lease_expires_at<now SET generation=g+1,owner_instance_id=new`，并发唯一接管，不干等 done）;protocol_version 与 DB schema 不匹配 fail-closed 不接管
 - [ ] 5.2a **claim 真原子互斥（Review P1-1）**：claim SQL 的 WHERE 同时校验 `worker_state.state='running'`（非 draining/done）+ `claim_generation==当前活跃 generation` + owner_instance 匹配 + lease 未过期，**不只靠本地进程标志**;draining 后该 CAS 天然不命中，关闭「停领与新任务刚进」竞态

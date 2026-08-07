@@ -30,7 +30,7 @@
   - **claude**：不解析、直接**预分配** —— 执行前生成 UUID，`--session-id <uuid>` 传入并记录（实测 CLI 回显同一 UUID，见 CLI 实测 Paper 2.1）。比废弃版 S1.3「从 system/result 行解析」省一步。
   - **codex**：从首轮 `codex exec --json` 的 `thread.started` 事件抓 `thread_id`（`executor/codex.py::_parse_line` 当前忽略该事件，需补一分支），写回存储。
 - **session 存储**：新增列存 CLI session_id（列名 `cli_session_id`）+ workdir + provider/backend + committed 水位。
-  - 阶段一（同 run）：存 `task_runs`（每个 run 一条 session 指针）。
+  - 阶段一（同 run 续跑）：**架构现实修正**——当前 `execute_dispatch` 每次执行（含失败重试）都无条件新建 `task_runs` 行，重试是同一 `run_queue` item 的**下一次 attempt、对应全新 run_id**，并非复用原 run_id。故"同 run 续跑"的真实语义 = **同一 queue item 跨 attempt 续跑**。落地：① `task_runs` 存本 attempt 的 session 指针（每次 attempt 一条，供审计/追溯）；② `run_queue` 加 `cli_session_id` + `session_committed_msg_id`，作为 **attempt 间的传递载体**——第 N 次 attempt 起会话时把 session_id 写回 run_queue，第 N+1 次 attempt 读它 → resume。（原 proposal 只写"存 task_runs"偏简，此处修正。）
   - 阶段二（跨 task）：上浮到轻表 `agent_sessions(conversation_id, agent_slug, session_id, committed_msg_id, provider_id, backend, workdir, updated_at)`，唯一键 `(conversation_id, agent_slug)`。
 - **resume 命令构造（实测校准，两线均轻路径）**：
   - **claude**：命中 session → `-p --resume <uuid>`；`_parse_line` 原样复用（实测 schema 不变）。

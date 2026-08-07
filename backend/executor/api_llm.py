@@ -11,7 +11,8 @@ from .base import ExecutorBackend, ExecContext, ExecEvent
 
 
 class ApiLlmBackend(ExecutorBackend):
-    async def run(self, ctx: ExecContext, on_pid=None):
+    async def run(self, ctx: ExecContext, on_pid=None, on_session=None):
+        # API 后端无 CLI 原生会话，不支持 resume；接受 on_session 仅为接口一致，不回传。
         if not ctx.api_key:
             yield ExecEvent("error", "该供应商缺少 api_key")
             yield ExecEvent("done")

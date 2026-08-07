@@ -92,7 +92,8 @@ async def run_probe(paths, keep):
     pid, task_id, cid = await seed(paths)
 
     # ---- Test 1: 成功 run → enqueued + claimed + succeeded 事件 ----
-    async def ok_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
+    async def ok_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name="",
+                            resume_session_id="", committed_msg_id=0, queue_item_id=0):
         db = await get_connection()
         try:
             c = await db.execute(
@@ -119,7 +120,8 @@ async def run_probe(paths, keep):
 
     # ---- Test 2: 异常 run → retry 事件 + 终态 failed + fail_reason=exception ----
     collab.MAX_RETRY = 1
-    async def boom_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name=""):
+    async def boom_dispatch(task_obj, agent_obj, prompt, persist_user_msg=True, user_name="",
+                            resume_session_id="", committed_msg_id=0, queue_item_id=0):
         raise RuntimeError("boom")
         yield  # noqa
     runner.execute_dispatch = boom_dispatch

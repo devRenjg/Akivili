@@ -264,6 +264,15 @@ class TaskRun(Base):
     # 无法直接 kill。故 API 收到 kill 落此信号列（now_expr() 时间戳），worker 周期 sweep 扫到
     # kill_requested_at IS NOT NULL 且本进程 _RUN_PIDS 有此 run → kill_run + finalize。NULL=无请求。
     kill_requested_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # agent-session-resume-minimal 阶段一（同 run 续跑）：存 CLI 原生会话指针，
+    # run 被打断（worker 重启/kill）后用它 --resume 续跑，不从头重来。见迁移 005。
+    # cli_session_id：claude=预分配 UUID / codex=从 thread.started 抓的 thread_id。
+    # session_backend/session_workdir：resume 前一致性校验（换 CLI 或换目录则旧 session 无意义）。
+    # session_committed_msg_id：增量回灌水位——上次成功已消费到的最高 message id，成功才推进。
+    cli_session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    session_backend: Mapped[str | None] = mapped_column(Text, nullable=True)
+    session_workdir: Mapped[str | None] = mapped_column(Text, nullable=True)
+    session_committed_msg_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class RunLog(Base):
@@ -327,3 +336,7 @@ class RunQueue(Base):
     task_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # agent-session-resume-minimal 阶段一：同一 queue item 跨 attempt 续跑的传递载体。见迁移 006。
+    # 第 N 次 attempt 起会话后把 session id + committed 水位写回这里，第 N+1 次 attempt 读它 → --resume。
+    cli_session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    session_committed_msg_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
