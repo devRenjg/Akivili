@@ -1,10 +1,12 @@
 # Session Resume 端到端实测：token 与记忆连续性
 
 **日期**：2026-07-24　**方式**：真起 claude-cli + codex-cli，隔离 PG 库 + 隔离 config，直接驱动 `runner.execute_dispatch`（不经 HTTP 层）
-**探针**：`TestReport/run_resume_e2e_probe.py`（门禁外 `*`，需真实 CLI + LLM，人工单跑）
-**产物**：`TestReport/resume_e2e_report.txt`（含逐项 PASS/FAIL + 真实 token 数）
+**探针**：`run_resume_e2e_probe.py`（一次性联调探针，**验证完毕后已移除**——本 Paper 即其结论存档）
+**产物**：`resume_e2e_report.txt`（当时逐项 PASS/FAIL + 真实 token 数，见下表）
 
-> 探针脚本随仓（回归资产）。真起 CLI 消耗真实 token（claude opus 单轮 ~0.3 USD），人工按需跑。
+> 该探针是一次性联调工具（真起 CLI 消耗真实 token，claude opus 单轮 ~0.3 USD），非回归资产。
+> 结论已固化于本 Paper；如需复现，按下方「实测场景」重建探针即可（隔离 PG 库 + 注入真实 provider + 驱动
+> `runner.execute_dispatch`）。功能正确性的持续回归由门禁内 `run_cross_task_resume_probe.py`（隔离桩）守护。
 
 ## 实测场景
 
@@ -73,5 +75,5 @@ design.md 抉择二原写「跨 task 续接省历史重放」。实测**推翻�
 迁移 008 起 `task_runs.usage_input_tokens / usage_cached_input_tokens / usage_output_tokens` 落库真实用量，
 不止用于本次实测——是长期**成本可观测**基础设施（每个 CLI run 的真实 token 消耗均可查）。
 
-*附：可复跑——`py -3.12 TestReport/run_resume_e2e_probe.py [--only claude|codex] [--keep]`，
-真起对应 CLI 各两轮，产出 `resume_e2e_report.txt`。*
+*注：联调探针已移除（一次性工具，非回归资产）。token 捕获生产能力（迁移 008 + 后端 usage 提取落库）
+保留在主线。跨 task 续接的持续回归由 `run_cross_task_resume_probe.py`（门禁内隔离桩）守护。*
