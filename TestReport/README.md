@@ -56,21 +56,22 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 干净环境自动复现、被挑进 CI 每次自动跑的那批。
 
 ```
-全套 51 个 run_*.py
+全套 52 个 run_*.py
 ├── run_ci_suite.py            ← 不是测试，是「调度器」(按 GATE 清单跑其余 46 个、收退出码)
 ├── 46 个 → 进 CI 门禁 ✅       (45 隔离 probe + run_qa_suite 主套件；含 2 SLOW)
-└── 4 个 → 不进门禁 ❌
+└── 5 个 → 不进门禁 ❌
       ├── run_collab_scenario.py   (需真实 claude/codex CLI + LLM)
       ├── run_codex_cli_smoke.py   (需真实 Codex CLI)
+      ├── run_resume_e2e_probe.py  (需真实 claude/codex CLI + LLM；Session Resume 两阶段端到端)
       ├── run_pg_e2e_probe.py      (需真实 PostgreSQL；数据底座 S4.6)
       └── run_pg_sqlite_consistency_probe.py  (需真实 PostgreSQL；数据底座 S4.5，一次性迁移一致性核验)
 ```
 
 |  | 全套测试集合 | CI 46 门禁 |
 |---|---|---|
-| **范围** | 所有 `run_*.py`（51 个） | 其中挑进 `GATE` 的 46 个 |
+| **范围** | 所有 `run_*.py`（52 个） | 其中挑进 `GATE` 的 46 个 |
 | **触发** | 人工挑着单跑 / 本地 `run_ci_suite` 一键 | GitHub 每次 push/PR **自动** |
-| **含真实外部依赖测试** | 含（4 个：2 CLI + 2 PG 专项） | 全部需 PG（S5 起门禁探针跑在 PostgreSQL 单引擎） |
+| **含真实外部依赖测试** | 含（5 个：3 CLI + 2 PG 专项） | 全部需 PG（S5 起门禁探针跑在 PostgreSQL 单引擎） |
 | **保障对象** | 逻辑正确 + 与真实外部世界的集成 | 逻辑正确（鉴权/CRUD/ORM 等价/调度/回收…） |
 
 **为什么分两层**（S5 起分界在「是否确定性可自动跑」——需真实 CLI/LLM 或一次性核验的留人工）：
@@ -78,9 +79,10 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 - **进门禁**的 45 个：确定性桩测试，不接真实 CLI/LLM。S5 全仓零 sqlite 后，这批统一跑在
   **PostgreSQL 单引擎**上（每个探针用 `isolated_pg_db_url()` 建独立隔离库，跑完 atexit 删库），
   无 sqlite 回退。改一行代码撞坏 → 门禁立刻红。
-- **留门禁外**的 4 个：2 个要真启动 claude/codex CLI、真调 LLM（依赖网络/凭证/CLI 安装，
-  自动化跑不稳）；2 个是数据底座 S4 的一次性 PG 迁移一致性/端到端核验（`run_pg_e2e` /
-  `run_pg_sqlite_consistency`，迁移窗口人工单跑）。
+- **留门禁外**的 5 个：3 个要真启动 claude/codex CLI、真调 LLM（依赖网络/凭证/CLI 安装，
+  自动化跑不稳——`run_collab_scenario` / `run_codex_cli_smoke` / `run_resume_e2e_probe`）；
+  2 个是数据底座 S4 的一次性 PG 迁移一致性/端到端核验（`run_pg_e2e` / `run_pg_sqlite_consistency`，
+  迁移窗口人工单跑）。
 
 **新增测试时**：确定性桩 → 加进 `run_ci_suite.py` 的 `GATE`（会跑在 PG 隔离库上）；
 依赖真实 CLI/LLM 或一次性核验 → 保持门禁外，并在下方矩阵用 `*` 标注。
@@ -145,6 +147,7 @@ python TestReport/run_ci_suite.py --exclude-slow  # 跳过并发/压力类长跑
 | `run_codex_resume_incremental_probe.py` | S3.5：codex 命令分支（首建 `exec --json` / 续跑 `exec resume` 无 `--cd`、id 在 OPTIONS 后）+ `thread.started` 抓 thread_id + rollout 在位校验缺失→降级 |
 | `run_session_fallback_probe.py` | S4.5：降级链——`_should_drop_session` 分类（resume_miss / poisoned / 限流不丢）、`resume_hit` 各降级入口（无 session / 非 CLI 后端 / codex rollout 缺）、丢 session 清 `run_queue` 两列的 DB 效果 |
 | `run_cross_task_resume_probe.py` | S5.5（阶段二）：跨 task 续接——`agent_sessions` upsert/lookup 往返、同 key 后写覆盖至多一行、并发写同 key 不崩恰一行（best-effort）、两段查找顺序（run_queue→缓存→全量、api 不查缓存）、无缓存 miss 降级全量 |
+| `run_resume_e2e_probe.py` `*` | 17/17（真起 CLI）：端到端两阶段实测——claude+codex 各跑「任务A 记暗号→任务B 跨 task resume 问暗号」，验 session 捕获/agent_sessions 缓存/rollout/**会话记忆连续（答出暗号=会话真续上）**+ 真实 token 落库观测。实测发现短会话 resume 不省反增（见 `Papers/Session-Resume端到端实测-token与记忆.md`）。需真实 CLI+LLM、消耗真实 token，人工单跑 |
 
 ### 能力包 / Skills
 | 脚本 | 实测 | 覆盖 |

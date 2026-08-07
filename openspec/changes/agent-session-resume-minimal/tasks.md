@@ -59,5 +59,12 @@
 - [x] 回归全量探针（mention/timeout/scheduling/kill-signal/containment 等）确认 resume 改造不回归协同/超时/调度/重启行为。〔全量 CI 门禁 43/43·589 断言全绿；修复两处假后端桩漏传 `on_session` 形参（commit 2ce77fa）〕
 - [x] 更新 `TestReport/run_ci_suite.py` 纳入本 change 新增探针，更新 `TestReport/README.md` 计数。〔阶段一 4 探针 + 阶段二 1 探针（S5.5）已在 GATE；全量门禁 41→46（--exclude-slow 39→44）、README 计数同步、矩阵表加 Session Resume 小节（含跨 task）〕
 - [x] 更新 `README`（执行层行为说明）：阶段一 = attempt 间续跑，对**外部行为不变**（用户/协同/调度视角无感，仅同 run 重试时省 history token）；无需改用户向 README。执行层细节以本 change design.md + CLI 实测 Paper 为准。
-- [ ] 固化（**阶段二代码已完整，待合 master + 联调后做**）：阶段一+二代码均已交付、全量门禁绿。待阶段二合入 master 并完成真起 CLI 的端到端 token-drop 联调验证后，把能力规格固化进 `specs/agent-session-resume/spec.md`、目录移入 `changes/archive/<date>-agent-session-resume-minimal/`。（留待联调：真起 claude/codex 验证跨 task 续接实际省 token，非隔离桩可覆盖。）
+- [x] 端到端联调（真起 CLI）：`run_resume_e2e_probe.py` claude+codex 各跑跨 task 续接，17/17 全绿。
+  **功能全部正确**——session 捕获/agent_sessions 缓存/resume 续接/codex rollout/**会话记忆连续（两线都答出只在对话里的暗号）**。
+  **token 反直觉发现**：短会话 resume 不省反增（claude 41041→41156、codex 42452→91440），根因=resume 恢复
+  CLI 完整会话状态 > 平台精简重放 `_clip_history`；省 token 只在长对话成立。已如实沉淀
+  `Papers/Session-Resume端到端实测-token与记忆.md` + design.md 抉择二实测修正块。附带交付 token 捕获永久能力（迁移 008）。
+- [ ] 固化（**待本轮合 master 后做**）：阶段一+二代码 + 联调 + token 捕获均已交付、门禁绿、真实证据落 Paper。
+  待合入 master 后把能力规格固化进 `specs/agent-session-resume/spec.md`、目录移入
+  `changes/archive/<date>-agent-session-resume-minimal/`。（固化时把「短会话 resume 不省 token、价值在连续性」写进规格，不宣称短会话省 token。）
 - [x] 联动 [platform-graceful-restart]：其跨-change 表阶段 3/4 标 ✅ 已由本 change 阶段一交付、阶段 5 header 标注 resume 地基来源，并显式记录与废弃航母版的 3 处差异（codex 无 app-server / session 载体 / at-least-once 水位）。
