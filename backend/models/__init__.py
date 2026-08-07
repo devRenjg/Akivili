@@ -24,6 +24,7 @@ from .engine import (
 from .tables import (
     Activity,
     AgentProfile,
+    AgentSession,
     AgentSkill,
     AgentTemplate,
     Conversation,
@@ -59,6 +60,7 @@ __all__ = [
     # 表模型（S3.1）
     "Activity",
     "AgentProfile",
+    "AgentSession",
     "AgentSkill",
     "AgentTemplate",
     "Conversation",

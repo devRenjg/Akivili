@@ -15,7 +15,7 @@
 
 本文件只声明，不接运行期。见 base.py 说明。
 """
-from sqlalchemy import ForeignKey, Index, Integer, Text, text
+from sqlalchemy import ForeignKey, Index, Integer, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -340,3 +340,33 @@ class RunQueue(Base):
     # 第 N 次 attempt 起会话后把 session id + committed 水位写回这里，第 N+1 次 attempt 读它 → --resume。
     cli_session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     session_committed_msg_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class AgentSession(Base):
+    """agent-session-resume-minimal 阶段二（跨 task 续接）：同一 (conversation, agent) 的
+    CLI 会话缓存。见迁移 007。
+
+    定位 = **best-effort 缓存**（非强一致资源）：run 成功收尾把 session 指针 + committed 水位
+    upsert 到这里（唯一键 (conversation_id, agent_slug)，后写覆盖，不加锁不校验 owner）；
+    同一 (conversation, agent) 的下一个 task 全新起 run 时，本 run 无 session（阶段一 run_queue
+    查不到）→ 查这里命中上个 task 的会话 → resume 续接，省历史重放 token。
+
+    并发写互盖最坏 miss 一次 → 降级全量（S4 降级链兜底），无数据损坏。session 复用是优化、
+    不是正确性，故不需要 owner CAS/串行折叠（那些属于 platform-graceful-restart，见 design.md 抉择二）。
+    """
+    __tablename__ = "agent_sessions"
+    # 唯一键 (conversation_id, agent_slug)：每对至多一条缓存，S5.2 的 ON CONFLICT 依赖它。
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "agent_slug", name="uq_agent_sessions_conv_agent"),
+        _AUTOINC,
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    agent_slug: Mapped[str] = mapped_column(Text, nullable=False)
+    cli_session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    session_committed_msg_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    provider_id: Mapped[str] = mapped_column(Text, nullable=True, server_default=text("''"))
+    backend: Mapped[str] = mapped_column(Text, nullable=True, server_default=text("''"))
+    workdir: Mapped[str] = mapped_column(Text, nullable=True, server_default=text("''"))
+    updated_at: Mapped[str] = mapped_column(Text, nullable=True, server_default=_NOW)

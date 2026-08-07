@@ -10,7 +10,7 @@
 一致。**ORM 模型 = 基准；PG catalog = 实际**。以此守护漂移：有人手改迁移、手改模型，
 或 002 意外改了结构，都会被本探针逐表逐项抓出。
 
-逐表校验（models.Base.metadata 里全部 18 张 ORM 表）：
+逐表校验（models.Base.metadata 里全部 19 张 ORM 表）：
   1. 表集合：ORM 声明的表都在 PG public schema，且无意外多余基表（排除 alembic_version）。
   2. 列名集合：PG 每表列名集合 == ORM 模型列名集合。
   3. 主键：PG 主键列集合 == ORM 主键列集合。
@@ -159,7 +159,7 @@ def main():
     # 1) 表集合：ORM 声明表都在 PG，且无意外多余基表
     orm_tables = set(ref)
     pg_tables = actual["_base_tables"]
-    check("表数量=18(ORM 声明全量)", len(orm_tables) == 18, f"orm={len(orm_tables)}")
+    check("表数量=19(ORM 声明全量)", len(orm_tables) == 19, f"orm={len(orm_tables)}")
     check("表集合一致(ORM==PG，排除 alembic_version)", orm_tables == pg_tables,
           f"orm-only={sorted(orm_tables - pg_tables)}, pg-only={sorted(pg_tables - orm_tables)}")
 

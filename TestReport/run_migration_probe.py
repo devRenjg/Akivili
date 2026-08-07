@@ -5,17 +5,17 @@ migration cannot silently regress it. **S5：PostgreSQL 单引擎**——不再�
 故不再做「逐字节对齐 baseline_schema.sql」「PRAGMA journal_mode=wal」这类 sqlite 专属校验；
 保留迁移的真实价值，改在 PG 上验证：
 
-  1. 空的隔离 PG 库 `run_migrations()` 返回 action=='upgrade'；之后恰好 18 张基线表
-     （不含 alembic_version），且 alembic_version.version_num=='005'（head）。
-  2. 幂等：第二次 `run_migrations()` 返回 action=='noop'；仍 18 张表。
+  1. 空的隔离 PG 库 `run_migrations()` 返回 action=='upgrade'；之后恰好 19 张基线表
+     （不含 alembic_version），且 alembic_version.version_num=='007'（head）。
+  2. 幂等：第二次 `run_migrations()` 返回 action=='noop'；仍 19 张表。
   3. 存量库（已有表、无 alembic_version）→ `run_migrations()` 返回 action=='stamp'，
-     不重建/不删表、保留既有数据，并 stamp 到 '005'。
+     不重建/不删表、保留既有数据，并 stamp 到 '007'。
   4. 002 数据规整：只 upgrade 到 '001'（建表）→ 插 planning/archived/in_progress 三态任务
      → upgrade 到 '002'（跑规整）→ 断言 planning→backlog、archived→done、in_progress 不动。
      （003 run_queue 部分唯一索引 / 004 task_runs.kill_requested_at / 005 task_runs.session 列
-     均与数据规整无关，本子检仍只测到 002。）
+     / 006 run_queue.session 列 / 007 agent_sessions 表 均与数据规整无关，本子检仍只测到 002。）
   5. 往返：upgrade head → downgrade base（0 张基线表、alembic_version 清空）→ upgrade head
-     重建 18 张表。（比对**表数量**，不比对逐字节 schema——PG 无 baseline dump。）
+     重建 19 张表。（比对**表数量**，不比对逐字节 schema——PG 无 baseline dump。）
 
 每个场景各建一个隔离 PG 库（run_qa_suite.isolated_pg_db_url()，进程退出自动删），写一份临时
 config.json 指向它、改 config.CONFIG_FILE，再跑 run_migrations()/alembic 命令。
@@ -37,9 +37,9 @@ from run_qa_suite import BACKEND, isolated_pg_db_url  # noqa: E402
 # 让 backend/ 可 import（db_migrate/config/alembic env）。
 sys.path.insert(0, str(BACKEND))
 
-# 期望的基线业务表数量（models/tables.py 的 18 张，不含 alembic_version）。
-EXPECTED_TABLES = 18   # 005/006 加列不加表，表数不变
-HEAD_REV = "006"
+# 期望的基线业务表数量（models/tables.py 的 19 张，不含 alembic_version）。
+EXPECTED_TABLES = 19   # 005/006 加列不加表；007 加 agent_sessions 表，18→19
+HEAD_REV = "007"
 
 # 统计基线表数：public schema 下的 BASE TABLE，排除 alembic_version。
 _COUNT_SQL = (
