@@ -49,15 +49,15 @@
 
 > 前提：阶段一验证通过。粒度 = **best-effort 缓存**（用户拍板），无 owner CAS/串行折叠，并发写互盖最坏 miss 一次降级。
 
-- [ ] 5.1 新增轻表 `agent_sessions(conversation_id, agent_slug, cli_session_id, session_committed_msg_id, provider_id, backend, workdir, updated_at)`，唯一键 `(conversation_id, agent_slug)`。走 Alembic 迁移。
-- [ ] 5.2 run 成功收尾时把 session 指针 + committed 水位 **upsert** 到 `agent_sessions`（`ON CONFLICT (conversation_id, agent_slug) DO UPDATE`，后写覆盖——best-effort，不加锁不做 owner 校验）。
-- [ ] 5.3 `runner.py` 查 session 顺序：先查本 run（阶段一，同 run 续跑）→ 未命中查 `agent_sessions`（阶段二，跨 task 续接）→ 都没有走全量首建。
-- [ ] 5.4 跨 task 命中时同样走 S2/S3 的 resume + 增量 + 降级链（复用，不新增逻辑）。
-- [ ] 5.5 探针 `run_cross_task_resume_probe.py`：同 (conversation, agent) 第二个 task 命中上个 task 的 session、resume 续接、增量正确；并发两 task 写同一 key 时后写覆盖不报错、下次至多 miss 一次降级（不崩不脏）。
+- [x] 5.1 新增轻表 `agent_sessions(conversation_id, agent_slug, cli_session_id, session_committed_msg_id, provider_id, backend, workdir, updated_at)`，唯一键 `(conversation_id, agent_slug)`。走 Alembic 迁移。〔迁移 007 走 ORM `AgentSession.__table__.create(checkfirst=True)` 保 parity（SERIAL/now() 与模型零漂移）；实测 DB 升级到 007、parity 79/0、migration 15/15（19 表）〕
+- [x] 5.2 run 成功收尾时把 session 指针 + committed 水位 **upsert** 到 `agent_sessions`（`ON CONFLICT (conversation_id, agent_slug) DO UPDATE`，后写覆盖——best-effort，不加锁不做 owner 校验）。〔`runner._upsert_agent_session` 复用 `models.upsert` helper；`_session_used` 持有本 run 实际会话 id；仅 CLI backend 且有 id 时写、容错吞异常〕
+- [x] 5.3 `runner.py` 查 session 顺序：先查本 run（阶段一，同 run 续跑）→ 未命中查 `agent_sessions`（阶段二，跨 task 续接）→ 都没有走全量首建。〔`runner._lookup_agent_session`；`session_source` 标记 run/cross_task；放 runner 内部（用户拍板方案 A），所有 dispatch 入口自动获得跨 task 续接〕
+- [x] 5.4 跨 task 命中时同样走 S2/S3 的 resume + 增量 + 降级链（复用，不新增逻辑）。〔S5.3 设好 resume_session_id/committed 后，既有 resume_hit 路径（ctx.cli_session_id + 增量 SQL + codex rollout + S4 降级）自动生效，零新增；collab 降级路径额外清 agent_sessions 缓存行防下个 task 复命中坏会话〕
+- [x] 5.5 探针 `run_cross_task_resume_probe.py`：同 (conversation, agent) 第二个 task 命中上个 task 的 session、resume 续接、增量正确；并发两 task 写同一 key 时后写覆盖不报错、下次至多 miss 一次降级（不崩不脏）。〔A upsert/lookup 往返 · B 后写覆盖至多一行 · C 并发写同 key 不崩恰一行 · D 两段查找顺序 · E miss 降级，全绿；纳入 GATE（45→46）〕
 
 ## 收尾
 - [x] 回归全量探针（mention/timeout/scheduling/kill-signal/containment 等）确认 resume 改造不回归协同/超时/调度/重启行为。〔全量 CI 门禁 43/43·589 断言全绿；修复两处假后端桩漏传 `on_session` 形参（commit 2ce77fa）〕
-- [x] 更新 `TestReport/run_ci_suite.py` 纳入本 change 新增探针，更新 `TestReport/README.md` 计数。〔4 探针已在 GATE（S1.4/S2.7/S3.5/S4.5）；全量门禁 41→45（--exclude-slow 39→43）、README 计数同步（含全套 46→50、实测 --exclude-slow 43/43·589·92s）、矩阵表加 Session Resume 小节〕
+- [x] 更新 `TestReport/run_ci_suite.py` 纳入本 change 新增探针，更新 `TestReport/README.md` 计数。〔阶段一 4 探针 + 阶段二 1 探针（S5.5）已在 GATE；全量门禁 41→46（--exclude-slow 39→44）、README 计数同步、矩阵表加 Session Resume 小节（含跨 task）〕
 - [x] 更新 `README`（执行层行为说明）：阶段一 = attempt 间续跑，对**外部行为不变**（用户/协同/调度视角无感，仅同 run 重试时省 history token）；无需改用户向 README。执行层细节以本 change design.md + CLI 实测 Paper 为准。
-- [ ] 固化（**留待阶段二交付后**）：阶段二 S5 尚未开始，change 未完整，暂不 archive。整个 change（阶段一+二）交付并联调验证后，再把能力规格固化进 `specs/agent-session-resume/spec.md`、目录移入 `changes/archive/<date>-agent-session-resume-minimal/`。
+- [ ] 固化（**阶段二代码已完整，待合 master + 联调后做**）：阶段一+二代码均已交付、全量门禁绿。待阶段二合入 master 并完成真起 CLI 的端到端 token-drop 联调验证后，把能力规格固化进 `specs/agent-session-resume/spec.md`、目录移入 `changes/archive/<date>-agent-session-resume-minimal/`。（留待联调：真起 claude/codex 验证跨 task 续接实际省 token，非隔离桩可覆盖。）
 - [x] 联动 [platform-graceful-restart]：其跨-change 表阶段 3/4 标 ✅ 已由本 change 阶段一交付、阶段 5 header 标注 resume 地基来源，并显式记录与废弃航母版的 3 处差异（codex 无 app-server / session 载体 / at-least-once 水位）。
